@@ -1,0 +1,28 @@
+{
+    "name": "akujin/navi-brain",
+    "description": "A durable executive spine for a language-model agent",
+    "type": "project",
+    "license": "proprietary",
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../../Divergence/framework",
+            "options": {
+                "symlink": true
+            }
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-pdo": "*",
+        "ext-pdo_sqlite": "*",
+        "divergence/divergence": "dev-develop"
+    },
+    "autoload": {
+        "psr-4": {
+            "NaviBrain\\": "src/"
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}

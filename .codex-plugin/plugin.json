@@ -1,0 +1,23 @@
+{
+  "name": "navi-brain",
+  "version": "0.2.0",
+  "description": "Durable local memory, executive state, and bounded desktop perception for Navi",
+  "author": {
+    "name": "Akujin"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Navi-Brain",
+    "shortDescription": "Durable memory and bounded desktop perception for Navi.",
+    "longDescription": "Navi-Brain gives Navi an inspectable SQLite-backed self-model, memory store, intention ledger, action trace, checkpoint system, and performance-gated KDE desktop perception.",
+    "developerName": "Akujin",
+    "category": "Productivity",
+    "capabilities": ["Memory", "Write", "Vision"],
+    "defaultPrompt": [
+      "Recall the durable context for this task.",
+      "Check whether I am active without taking a screenshot.",
+      "Look at the active window only when visual evidence is necessary."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

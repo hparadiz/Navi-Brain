@@ -1,0 +1,19 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+if (getenv('NAVI_BRAIN_DB') === false || getenv('NAVI_BRAIN_DB') === '') {
+    $stateHome = getenv('XDG_STATE_HOME');
+    if ($stateHome === false || $stateHome === '') {
+        $userHome = getenv('HOME');
+        $stateHome = $userHome !== false && $userHome !== ''
+            ? $userHome . '/.local/state'
+            : dirname(__DIR__) . '/var';
+    }
+    putenv('NAVI_BRAIN_DB=' . $stateHome . '/navi-brain/navi-brain.sqlite');
+}
+
+require dirname(__DIR__) . '/bootstrap/app.php';
+
+exit((new NaviBrain\Mcp\Server())->run());

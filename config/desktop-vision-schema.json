@@ -1,0 +1,55 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "scene": {
+      "type": "string",
+      "enum": ["terminal", "code_editor", "web", "communications", "media", "document", "system", "credential_manager", "unknown"]
+    },
+    "activity": {
+      "type": "string",
+      "enum": ["coding", "writing", "reading", "browsing", "communicating", "media", "system_admin", "authentication", "unknown"]
+    },
+    "sensitivity": {
+      "type": "string",
+      "enum": ["none", "personal", "secret", "unknown"]
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 240
+    },
+    "visible_applications": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "maxLength": 40
+      }
+    },
+    "relevant_to_reason": {
+      "type": "boolean"
+    },
+    "raw_image_safe": {
+      "type": "boolean"
+    },
+    "withheld_categories": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["credentials", "authentication", "private_messages", "financial", "medical", "identity", "personal_files", "other"]
+      }
+    }
+  },
+  "required": [
+    "scene",
+    "activity",
+    "sensitivity",
+    "summary",
+    "visible_applications",
+    "relevant_to_reason",
+    "raw_image_safe",
+    "withheld_categories"
+  ]
+}

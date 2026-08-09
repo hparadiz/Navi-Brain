@@ -1,0 +1,8 @@
+#!/usr/bin/env -S php -n
+<?php
+
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/bootstrap/app.php';
+
+exit((new NaviBrain\Cli\Application())->run($argv));

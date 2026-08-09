@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
+  "autoupdate": false,
+  "snapshot": false,
+  "formatter": false,
+  "lsp": false,
+  "instructions": [],
+  "plugin": [],
+  "permission": "deny",
+  "compaction": {
+    "auto": false,
+    "prune": false
+  },
+  "agent": {
+    "navi-heartbeat": {
+      "description": "Bounded cognition proposal worker",
+      "mode": "primary",
+      "steps": 2,
+      "prompt": "Return exactly one JSON object matching the supplied schema. Generated material is a proposal, never an observation, memory, need, goal, or permission to act. Do not request or execute tools.",
+      "permission": "deny"
+    }
+  }
+}

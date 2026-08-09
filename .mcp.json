@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "navi-brain": {
+      "command": "php",
+      "args": ["./bin/navi-brain-mcp"],
+      "cwd": ".",
+      "env_vars": [
+        "NAVI_BRAIN_DB",
+        "NAVI_BRAIN_IDLE_HELPER",
+        "NAVI_BRAIN_VISION_MODEL",
+        "NAVI_BRAIN_VISION_MMPROJ",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME"
+      ],
+      "tool_timeout_sec": 30
+    }
+  }
+}

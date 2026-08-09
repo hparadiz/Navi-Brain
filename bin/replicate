@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOCAL_BRAIN_DIR="/home/akujin/Sources/Navi-Brain"
+REMOTE_HOST="akuj.in"
+REMOTE_BRAIN_DIR="/home/akujin/navi-brain"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+
+echo "[replicate] Creating local backup..."
+cd "$LOCAL_BRAIN_DIR"
+BACKUP_PATH=$(php bin/navi-brain backup:create --reason="mesh-replication" 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d['result']['path'])
+")
+BACKUP_FILE=$(basename "$BACKUP_PATH")
+echo "[replicate] Backup: $BACKUP_PATH"
+
+echo "[replicate] Syncing to akuj.in..."
+rsync -az -e ssh "$BACKUP_PATH" "$REMOTE_HOST:$REMOTE_BRAIN_DIR/var/backups/$BACKUP_FILE"
+
+echo "[replicate] Restoring on akuj.in and restarting daemon..."
+ssh -o ServerAliveInterval=3 "$REMOTE_HOST" "cd $REMOTE_BRAIN_DIR && \
+    php bin/restore-backup var/backups/$BACKUP_FILE && \
+    systemctl restart navi-brain && \
+    echo 'Daemon restarted via systemd'"
+
+echo "[replicate] Done at $TIMESTAMP"

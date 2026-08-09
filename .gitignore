@@ -1,0 +1,12 @@
+/vendor/
+/build/
+/var/*.sqlite
+/var/*.sqlite-shm
+/var/*.sqlite-wal
+/var/backups/
+/var/opencode-worker/
+/var/*.log
+/var/*.err
+/var/*.pid
+/.phpunit.cache/
+/assets/papers/*.pdf

@@ -1,0 +1,49 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\FreeModelWorker;
+
+require dirname(__DIR__) . '/bootstrap/app.php';
+
+$core = new ExecutiveCore();
+$core->initialize();
+$worker = new FreeModelWorker($core);
+$nodeId = getenv('NAVI_BRAIN_NODE_ID');
+if (!is_string($nodeId) || trim($nodeId) === '') {
+    $nodeId = gethostname() ?: 'local';
+}
+$owner = sprintf('%s:%d', $nodeId, getmypid());
+$running = true;
+
+if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
+    pcntl_async_signals(true);
+    pcntl_signal(SIGTERM, static function () use (&$running): void { $running = false; });
+    pcntl_signal(SIGINT, static function () use (&$running): void { $running = false; });
+}
+
+    while ($running) {
+        $record = ['at' => time(), 'node_id' => $nodeId];
+        try {
+            $record['safety'] = $core->runSafetyCheck();
+            $record['interrupt'] = $core->checkExecutiveInterrupts($nodeId);
+            $record['heartbeats'] = $core->runDueHeartbeats($nodeId);
+            $record['worker'] = $worker->runOnce($owner);
+            $record['ok'] = true;
+        } catch (Throwable $throwable) {
+            $record['ok'] = false;
+            $record['error'] = $throwable->getMessage();
+            $record['type'] = $throwable::class;
+        }
+    fwrite(STDOUT, json_encode(
+        $record,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+    ) . PHP_EOL);
+    fflush(STDOUT);
+
+    for ($seconds = 0; $running && $seconds < 5; $seconds++) {
+        sleep(1);
+    }
+}

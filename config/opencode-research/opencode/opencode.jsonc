@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
+  "autoupdate": false,
+  "snapshot": false,
+  "formatter": false,
+  "lsp": false,
+  "instructions": [],
+  "plugin": [],
+  "permission": {
+    "*": "deny",
+    "websearch": "allow",
+    "webfetch": "allow"
+  },
+  "compaction": {
+    "auto": true,
+    "prune": true
+  },
+  "agent": {
+    "side-research": {
+      "description": "Isolated free-model web researcher for non-critical side projects",
+      "mode": "primary",
+      "steps": 16,
+      "prompt": "Research only through the allowed web tools. Prefer primary sources, papers, standards, manufacturer datasheets, official repositories, and direct product documentation. Separate verified facts, inference, marketing claims, and unknowns. Never request shell, file, MCP, memory, or external-account access. Return a compact sourced report with direct URLs.",
+      "permission": {
+        "*": "deny",
+        "websearch": "allow",
+        "webfetch": "allow"
+      }
+    }
+  }
+}

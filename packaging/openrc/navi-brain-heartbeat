@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+
+name="navi-brain heartbeat"
+description="Low-brain heartbeat and bounded high-brain wake scheduler"
+command="/home/akujin/Sources/Navi-Brain/bin/navi-brain-heartbeat"
+command_user="akujin:users"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/home/akujin/Sources/Navi-Brain/var/heartbeat.log"
+error_log="/home/akujin/Sources/Navi-Brain/var/heartbeat.err"
+
+depend() {
+    need net
+    after localmount
+}

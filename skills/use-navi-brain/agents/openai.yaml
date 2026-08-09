@@ -1,0 +1,12 @@
+interface:
+  display_name: "Use Navi-Brain"
+  short_description: "Retrieve and curate Navi’s durable memory"
+  default_prompt: "Use $use-navi-brain to resume this task with relevant durable context."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "navi-brain"
+      description: "Local evidence-backed memory and self-model"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true
