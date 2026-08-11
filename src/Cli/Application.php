@@ -8,6 +8,8 @@ use InvalidArgumentException;
 use JsonException;
 use NaviBrain\Core\ExecutiveCore;
 use NaviBrain\Core\FreeModelWorker;
+use NaviBrain\Core\LocalModelClient;
+use NaviBrain\Core\LocalModelWorker;
 use Throwable;
 
 final class Application
@@ -44,6 +46,15 @@ final class Application
                 'action:start' => $this->core->startAction(
                     $this->integer($options, 'intention'),
                     $this->string($options, 'description'),
+                    $this->string($options, 'expected'),
+                    $this->optionalString($options, 'kind'),
+                    $this->jsonObject($options, 'arguments', [])
+                ),
+                'action:execute' => $this->core->executeAction(
+                    $this->integer($options, 'intention'),
+                    $this->string($options, 'kind'),
+                    $this->jsonObject($options, 'arguments'),
+                    $this->string($options, 'description'),
                     $this->string($options, 'expected')
                 ),
                 'action:finish' => $this->core->finishAction(
@@ -54,6 +65,57 @@ final class Application
                     $this->string($options, 'repair')
                 ),
                 'action:list' => $this->core->listActions($this->optionalString($options, 'status')),
+                'procedure:list' => $this->core->listProcedures($this->optionalString($options, 'status')),
+                'procedure:adapters' => $this->core->proceduralMemory()->adapters(),
+                'procedure:run' => $this->core->runProcedure(
+                    $this->integer($options, 'id'),
+                    $this->integer($options, 'intention'),
+                    $this->jsonObject($options, 'arguments', [])
+                ),
+                'procedure:compose' => $this->core->composeProcedure(
+                    $this->string($options, 'name'),
+                    $this->string($options, 'description'),
+                    $this->integerList($options, 'procedures'),
+                    $this->string($options, 'authority')
+                ),
+                'decision:start' => $this->core->startDecisionCycle(
+                    $this->integer($options, 'intention'),
+                    $this->string($options, 'trigger'),
+                    $this->optionalInteger($options, 'thread'),
+                    $this->optionalString($options, 'model-hint')
+                ),
+                'decision:list' => $this->core->listDecisionCycles(
+                    $this->optionalString($options, 'status'),
+                    $this->integer($options, 'limit', 20)
+                ),
+                'decision:show' => $this->core->showDecisionCycle($this->integer($options, 'id')),
+                'decision:compare' => $this->core->compareDecisionModels(
+                    $this->integer($options, 'limit', 200)
+                ),
+                'other:status' => $this->core->otherModel()->status(),
+                'other:frame' => $this->core->otherModel()->listFrameFacts(
+                    $this->optionalString($options, 'status'),
+                    $this->integer($options, 'limit', 100)
+                ),
+                'other:hypotheses' => $this->core->otherModel()->listHypotheses(
+                    $this->optionalString($options, 'status'),
+                    $this->integer($options, 'limit', 100)
+                ),
+                'other:predictions' => $this->core->otherModel()->listPredictions(
+                    $this->optionalString($options, 'status'),
+                    $this->integer($options, 'limit', 100)
+                ),
+                'other:cycles' => $this->core->otherModel()->listCycles(
+                    $this->optionalString($options, 'status'),
+                    $this->integer($options, 'limit', 20)
+                ),
+                'other:correct' => $this->core->otherModel()->correctHypothesis(
+                    $this->integer($options, 'hypothesis'),
+                    $this->string($options, 'correction')
+                ),
+                'other:replay' => $this->core->otherModel()->replay(
+                    $this->integer($options, 'limit', 500)
+                ),
                 'memory:add' => $this->addMemory($options),
                 'memory:search' => $this->core->searchMemory(
                     $this->string($options, 'query'),
@@ -89,6 +151,77 @@ final class Application
                     $this->string($options, 'rhythm'),
                     $this->string($options, 'node')
                 ),
+                'thread:self-presence' => $this->core->createSelfPresenceThread(
+                    $this->integer($options, 'intention')
+                ),
+                'thread:stream' => $this->core->createMindStreamThread(
+                    $this->integer($options, 'intention')
+                ),
+                'stream:recent' => $this->core->listInnerMonologue(
+                    $this->integer($options, 'limit', 12)
+                ),
+                'thread:epistemic' => $this->core->createEpistemicAdvanceThread(
+                    $this->integer($options, 'intention')
+                ),
+                'thread:list' => $this->core->listCognitiveThreads(
+                    $this->optionalString($options, 'status')
+                ),
+                'thread:step:list' => $this->core->listThreadSteps(
+                    $this->optionalInteger($options, 'thread')
+                ),
+                'thread:due' => $this->core->runDueCognitiveThreads(
+                    $this->string($options, 'node')
+                ),
+                'sense:status' => $this->core->sensoryCortex()->status(),
+                'sense:events' => $this->core->sensoryCortex()->pendingEvents(
+                    $this->integer($options, 'limit', 10),
+                    $this->optionalString($options, 'min-significance') === null
+                        ? 0.0 : $this->number($options, 'min-significance')
+                ),
+                'sense:define' => $this->core->sensoryCortex()->defineSense(
+                    $this->string($options, 'key'),
+                    $this->string($options, 'source'),
+                    $this->string($options, 'notices'),
+                    $this->string($options, 'detector'),
+                    json_decode($this->optionalString($options, 'config') ?? '{}', true) ?: [],
+                    $this->integer($options, 'refractory', 60),
+                    $this->optionalString($options, 'author') ?? 'agent'
+                ),
+                'sense:tune' => $this->core->sensoryCortex()->tune(),
+                'social:capital' => $this->core->socialFeedback()->descriptorStats(),
+                'percept:compact' => (new \NaviBrain\Perception\PerceptCodec($this->core))->compact(
+                    $this->integer($options, 'older-than', 900)
+                ),
+                'percept:decode' => $this->decodePerceptFrame($options),
+                'social:close' => $this->core->socialFeedback()->closeWindows(),
+                'sense:decay' => $this->core->sensoryCortex()->decay(),
+                'source:authorize' => $this->core->sensoryCortex()->authorizeSource(
+                    $this->string($options, 'key'),
+                    $this->string($options, 'description'),
+                    $this->string($options, 'reveals'),
+                    $this->optionalString($options, 'acquisition') ?? 'continuous',
+                    $this->integer($options, 'interval', 60),
+                    $this->integer($options, 'ttl', 3600)
+                ),
+                'source:status' => $this->core->sensoryCortex()->setSourceStatus(
+                    $this->string($options, 'key'),
+                    $this->string($options, 'status')
+                ),
+                'capsule:list' => $this->core->listContextCapsules(
+                    $this->optionalInteger($options, 'thread'),
+                    $this->integer($options, 'limit', 10)
+                ),
+                'capsule:show' => $this->core->showContextCapsule(
+                    $this->optionalInteger($options, 'id')
+                ),
+                'metrics:snapshot' => $this->core->recordMetricSnapshot(
+                    $this->string($options, 'node'),
+                    $this->optionalString($options, 'scope')
+                ),
+                'metrics:report' => $this->core->metricsReport(
+                    $this->integer($options, 'limit', 10),
+                    $this->optionalString($options, 'scope')
+                ),
                 'interrupt:raise' => $this->core->raiseInterrupt(
                     $this->string($options, 'reason'),
                     $this->optionalString($options, 'severity') ?? 'high',
@@ -116,6 +249,14 @@ final class Application
                 ),
                 'models:discover' => (new FreeModelWorker($this->core))->discoverModels(),
                 'worker:once' => (new FreeModelWorker($this->core))->runOnce(
+                    $this->string($options, 'owner')
+                ),
+                'local:status' => $this->localModelStatus(),
+                'local:reset' => $this->core->resetLocalModelBackoff(
+                    LocalModelWorker::MODEL_ID,
+                    $this->string($options, 'reason')
+                ),
+                'local:once' => (new LocalModelWorker($this->core))->runOnce(
                     $this->string($options, 'owner')
                 ),
                 'backup:create' => $this->core->backupDatabase($this->string($options, 'reason')),
@@ -274,6 +415,47 @@ final class Application
     }
 
     /** @param array<string, string|bool> $options */
+    /** @return array<string, mixed> */
+    private function decodePerceptFrame(array $options): array
+    {
+        $id = $this->optionalInteger($options, 'id');
+        $frames = $id === null
+            ? \NaviBrain\Model\PerceptFrame::getAll(['order' => ['id' => 'DESC'], 'limit' => 1])
+            : [\NaviBrain\Model\PerceptFrame::getByID($id)];
+        $frame = $frames[0] ?? null;
+        if (!$frame instanceof \NaviBrain\Model\PerceptFrame) {
+            throw new InvalidArgumentException('No such percept frame.');
+        }
+        $codec = new \NaviBrain\Perception\PerceptCodec($this->core);
+        return [
+            'frame' => $frame->getData(),
+            'compression' => $frame->packed_bytes > 0
+                ? round($frame->source_bytes / $frame->packed_bytes, 2)
+                : null,
+            'samples' => $codec->unpack($frame),
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    private function localModelStatus(): array
+    {
+        $client = new LocalModelClient();
+        $healthy = $client->isHealthy();
+        $endpoint = null;
+        foreach ($this->core->listModelEndpoints() as $candidate) {
+            if (($candidate['model_id'] ?? null) === LocalModelWorker::MODEL_ID) {
+                $endpoint = $candidate;
+                break;
+            }
+        }
+        return [
+            'model_id' => LocalModelWorker::MODEL_ID,
+            'endpoint' => $client->endpoint(),
+            'healthy' => $healthy,
+            'registered_endpoint' => $endpoint,
+        ];
+    }
+
     private function optionalInteger(array $options, string $name): ?int
     {
         return array_key_exists($name, $options) ? $this->integer($options, $name) : null;
@@ -307,6 +489,41 @@ final class Application
     }
 
     /** @param array<string, string|bool> $options
+     *  @return array<string, mixed>
+     */
+    private function jsonObject(array $options, string $name, ?array $default = null): array
+    {
+        if (!array_key_exists($name, $options) && $default !== null) {
+            return $default;
+        }
+        $raw = $this->string($options, $name);
+        try {
+            $decoded = json_decode($raw, false, 32, JSON_THROW_ON_ERROR);
+        } catch (JsonException $exception) {
+            throw new InvalidArgumentException(sprintf('--%s must be valid JSON: %s', $name, $exception->getMessage()));
+        }
+        if (!is_object($decoded)) {
+            throw new InvalidArgumentException(sprintf('--%s must be a JSON object.', $name));
+        }
+        return get_object_vars($decoded);
+    }
+
+    /** @param array<string, string|bool> $options
+     *  @return list<int>
+     */
+    private function integerList(array $options, string $name): array
+    {
+        $values = [];
+        foreach ($this->commaSeparated($options, $name) as $value) {
+            if (!ctype_digit($value) || (int) $value < 1) {
+                throw new InvalidArgumentException(sprintf('--%s must contain positive integers.', $name));
+            }
+            $values[] = (int) $value;
+        }
+        return $values;
+    }
+
+    /** @param array<string, string|bool> $options
      *  @return list<string>
      */
     private function commaSeparated(array $options, string $name): array
@@ -329,9 +546,25 @@ final class Application
                 'intention:list [--status=active]',
                 'intention:advance --id --next-action [--note]',
                 'intention:close --id --status=blocked|completed|released --note',
-                'action:start --intention --description --expected',
+                'action:start --intention --description --expected [--kind] [--arguments=JSON]',
+                'action:execute --intention --kind --arguments=JSON --description --expected',
                 'action:finish --action --status=succeeded|failed|cancelled --observed --matched=yes|no --repair',
                 'action:list [--status=pending]',
+                'procedure:list [--status=active|invalidated]',
+                'procedure:adapters',
+                'procedure:run --id --intention [--arguments=JSON]',
+                'procedure:compose --name --description --procedures=1,2 --authority=user|developer',
+                'decision:start --intention --trigger [--thread] [--model-hint]',
+                'decision:list [--status=running|waiting|completed|impasse|failed|cancelled] [--limit=20]',
+                'decision:show --id',
+                'decision:compare [--limit=200]',
+                'other:status',
+                'other:frame [--status=active|superseded|corrected|rejected|expired] [--limit=100]',
+                'other:hypotheses [--status=active|rejected|expired|corrected] [--limit=100]',
+                'other:predictions [--status=pending|matched|violated|expired|unresolvable] [--limit=100]',
+                'other:cycles [--status=running|waiting|completed|abstained|failed] [--limit=20]',
+                'other:correct --hypothesis --correction',
+                'other:replay [--limit=500]',
                 'memory:add --tier --content --confidence [--source-event] [--source-memory] [--supersedes] [--expires] [--allow-procedural-write]',
                 'memory:search --query [--limit=20]',
                 'memory:consolidate --episode --content --confidence',
@@ -344,6 +577,28 @@ final class Application
                 'heartbeat:status',
                 'heartbeat:due --node',
                 'heartbeat:tick --rhythm --node',
+                'thread:self-presence --intention',
+                'thread:epistemic --intention',
+                'thread:stream --intention',
+                'stream:recent [--limit=12]',
+                'thread:list [--status=active|waiting|blocked|complete|released]',
+                'thread:step:list [--thread]',
+                'thread:due --node',
+                'sense:status',
+                'sense:events [--limit=10] [--min-significance]',
+                'sense:define --key --source --notices --detector=change|threshold|absence|rate|pattern [--config=JSON] [--refractory=60]',
+                'sense:tune',
+                'social:capital',
+                'percept:compact [--older-than=900]',
+                'percept:decode [--id]',
+                'social:close',
+                'sense:decay',
+                'source:authorize --key --description --reveals [--acquisition] [--interval] [--ttl]',
+                'source:status --key --status=active|paused|revoked',
+                'capsule:list [--thread] [--limit=10]',
+                'capsule:show [--id]',
+                'metrics:snapshot --node [--scope]',
+                'metrics:report [--limit] [--scope]',
                 'interrupt:raise --reason [--severity=critical|high|normal] [--source=external]',
                 'interrupt:list [--status=pending|acknowledged|resolved]',
                 'interrupt:check --node',
@@ -356,6 +611,9 @@ final class Application
                 'models:sync --ids=model-a,model-b',
                 'models:discover',
                 'worker:once --owner',
+                'local:status',
+                'local:reset --reason',
+                'local:once --owner',
                 'backup:create --reason',
                 'self:set --key --value --confidence --evidence',
                 'self:list',

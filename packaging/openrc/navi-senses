@@ -1,0 +1,72 @@
+#!/sbin/openrc-run
+
+name="navi-senses"
+description="Unprivileged looking service: runs commands Navi chooses and returns what they saw"
+
+supervisor="supervise-daemon"
+
+# Installed under /usr/local, not run out of the source tree. The account this
+# runs as must not be able to reach code that the account it is isolating from
+# can rewrite: if akujin could edit the file, then anything that compromised
+# akujin would choose what navi-senses executes, and the separation would be
+# decorative. Root owns it, everyone else reads.
+command="/usr/local/libexec/navi-senses"
+
+# The whole design is this line. The service runs as an account that holds no
+# write permission outside its own runtime directory, so "Navi can only look"
+# is enforced by the kernel rather than by a list of forbidden strings that
+# would have to anticipate every way of spelling a destructive command.
+# Granting a capability later is a change to this account, not to any code.
+#
+# The primary group is `users`, not navi-senses. supervise-daemon sets uid and
+# gid and does not apply supplementary groups, so making `users` primary is what
+# actually lets akujin reach the socket. It grants nothing else: akujin's home is
+# mode 0755, so group `users` carries read and traverse and no write bit.
+command_user="navi-senses:users"
+
+pidfile="/run/navi-senses.pid"
+output_log="/var/log/navi-senses.log"
+error_log="/var/log/navi-senses.err"
+
+# Looking must never outrank the voice path or interactive work.
+SSD_NICELEVEL=10
+SSD_IONICELEVEL="idle"
+
+respawn_delay=5
+respawn_max=5
+respawn_period=120
+
+# Ceilings for the service itself. Individual commands carry their own ulimits,
+# but a service that spawns them needs its own floor under the machine.
+rc_cgroup_mode="unified"
+rc_cgroup_settings="
+memory.max 512M
+memory.high 384M
+pids.max 128
+cpu.max 50000 100000
+"
+
+umask 0077
+
+depend() {
+    after localmount
+    before navi-brain-senses
+}
+
+start_pre() {
+    if [ ! -x "${command}" ]; then
+        eerror "looking service not installed at ${command}"
+        eerror "run the installer: packaging/install-navi-senses.sh"
+        return 1
+    fi
+    if ! getent passwd navi-senses >/dev/null 2>&1; then
+        eerror "the navi-senses account does not exist"
+        eerror "run the installer: packaging/install-navi-senses.sh"
+        return 1
+    fi
+    # The socket lives here. Group users is what lets akujin's brain connect
+    # while the daemon keeps the socket open as navi-senses.
+    checkpath --directory --owner navi-senses:users --mode 0750 /run/navi-senses
+    checkpath --file --owner navi-senses:root --mode 0640 "${output_log}"
+    checkpath --file --owner navi-senses:root --mode 0640 "${error_log}"
+}

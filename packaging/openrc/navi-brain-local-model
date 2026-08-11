@@ -1,0 +1,76 @@
+#!/sbin/openrc-run
+
+name="navi-brain local model"
+description="CPU-only llama.cpp server providing Navi-Brain's baseline cognition"
+
+: ${NAVI_BRAIN_ROOT:=/home/akujin/Sources/Navi-Brain}
+: ${LLAMA_SERVER:=/usr/local/bin/llama-server}
+: ${LOCAL_MODEL_GGUF:=/home/akujin/.cache/llama.cpp/ggml-org_gemma-3-4b-it-qat-GGUF_gemma-3-4b-it-qat-Q4_0.gguf}
+: ${LOCAL_MODEL_HOST:=127.0.0.1}
+: ${LOCAL_MODEL_PORT:=5007}
+: ${LOCAL_MODEL_THREADS:=4}
+: ${LOCAL_MODEL_CTX:=4096}
+: ${LOCAL_MODEL_PARALLEL:=2}
+: ${LOCAL_MODEL_CACHE_RAM:=512}
+: ${LOCAL_MODEL_CTX_CHECKPOINTS:=2}
+
+supervisor="supervise-daemon"
+
+# All flags and ceilings live in the launcher so a manual run and this service
+# can never diverge.
+command="${NAVI_BRAIN_ROOT}/bin/navi-brain-local-model"
+command_args=""
+
+export LLAMA_SERVER LOCAL_MODEL_GGUF LOCAL_MODEL_THREADS LOCAL_MODEL_CTX LOCAL_MODEL_PARALLEL
+export LOCAL_MODEL_CACHE_RAM LOCAL_MODEL_CTX_CHECKPOINTS LOCAL_MODEL_REPACK
+export NAVI_BRAIN_LOCAL_MODEL_HOST="${LOCAL_MODEL_HOST}"
+export NAVI_BRAIN_LOCAL_MODEL_PORT="${LOCAL_MODEL_PORT}"
+
+command_user="akujin:users"
+command_background="yes"
+pidfile="/run/navi-brain-local-model.pid"
+output_log="${NAVI_BRAIN_ROOT}/var/local-model.log"
+error_log="${NAVI_BRAIN_ROOT}/var/local-model.err"
+
+# Never let background cognition outrank interactive work or the voice path.
+SSD_NICELEVEL=10
+SSD_IONICELEVEL="idle"
+
+respawn_delay=10
+respawn_max=5
+respawn_period=300
+
+# Hard ceilings. memory.max is the backstop that makes this safe to leave
+# running: if the model ever tries to exceed it the kernel kills this service
+# alone, and Navi-Brain degrades to the remote pool or to honest sleep.
+rc_cgroup_mode="unified"
+rc_cgroup_settings="
+memory.max 5G
+memory.high 4G
+memory.swap.max 1G
+pids.max 128
+cpu.max 600000 100000
+"
+
+umask 0077
+
+depend() {
+    after localmount
+    before navi-brain-heartbeat
+}
+
+start_pre() {
+    if [ ! -x "${command}" ]; then
+        eerror "launcher not executable at ${command}"
+        return 1
+    fi
+    if [ ! -x "${LLAMA_SERVER}" ]; then
+        eerror "llama-server not found at ${LLAMA_SERVER}"
+        return 1
+    fi
+    if [ ! -r "${LOCAL_MODEL_GGUF}" ]; then
+        eerror "Local model weights not readable at ${LOCAL_MODEL_GGUF}"
+        return 1
+    fi
+    checkpath --directory --owner akujin:users --mode 0700 "${NAVI_BRAIN_ROOT}/var"
+}

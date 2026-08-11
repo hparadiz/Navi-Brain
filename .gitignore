@@ -1,5 +1,6 @@
 /vendor/
 /build/
+/supervisor/target/
 /var/*.sqlite
 /var/*.sqlite-shm
 /var/*.sqlite-wal
@@ -8,5 +9,11 @@
 /var/*.log
 /var/*.err
 /var/*.pid
+/var/navi-transcript.json
+/var/navi-thread.json
 /.phpunit.cache/
 /assets/papers/*.pdf
+/var/mind-stream.jsonl
+/var/senses.log
+/var/senses.err
+/var/local-model.log

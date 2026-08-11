@@ -1,0 +1,391 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Sensory daemon.
+ *
+ * Pet owns the organs: it runs the capture and the transcription model. This
+ * process is only the nerve between Pet and Navi-Brain's cortex. It subscribes
+ * to Pet's feeds on their own cadence, hands each sample to the cortex, and
+ * lets the cortex decide what counts as a change worth remembering.
+ *
+ * It runs out of process on purpose. A sense must never be able to stall a
+ * cognitive wake, and a slow or dead Pet must degrade perception rather than
+ * cognition.
+ */
+
+use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Perception\DesktopAwareness;
+use NaviBrain\Perception\HearingStream;
+use NaviBrain\Perception\Interoception;
+use NaviBrain\Perception\PerceptCodec;
+use NaviBrain\Perception\CommandSense;
+use NaviBrain\Perception\SignalSampler;
+
+require dirname(__DIR__) . '/bootstrap/app.php';
+
+const PET_BRIDGE = 'http://127.0.0.1:47831';
+const HEARING_SOURCE = 'pet_hearing';
+const PRESENCE_SOURCE = 'desktop_presence';
+const HEALTH_SOURCE = 'self_health';
+const TIME_SOURCE = 'chronoception';
+const HEARING_INTERVAL = 1;
+const SILENCE_INTERVAL = 60;
+// Comfortably inside Pet's sixty second belief window, so a live daemon always
+// looks live and a dead one stops labelling rather than freezing the last mode.
+const MODE_REFRESH_INTERVAL = 25;
+const PRESENCE_INTERVAL = 30;
+const SIGNAL_INTERVAL = 20;
+const HEALTH_INTERVAL = 60;
+const TIME_INTERVAL = 60;
+const MAINTENANCE_INTERVAL = 300;
+const LOOKING_SOURCE = 'machine_inspection';
+// How often a queued look is drained. Looking is Navi's own initiative, so this
+// is a floor on how fast it can happen rather than a schedule for doing it.
+const LOOKING_INTERVAL = 10;
+
+$core = new ExecutiveCore();
+$core->initialize();
+$cortex = $core->sensoryCortex();
+$awareness = new DesktopAwareness();
+$intero = new Interoception($core);
+$social = $core->socialFeedback();
+$codec = new PerceptCodec($core);
+$signals = new SignalSampler();
+$hearing = new HearingStream();
+$hearing->seed();
+$running = true;
+
+if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
+    pcntl_async_signals(true);
+    pcntl_signal(SIGTERM, static function () use (&$running): void { $running = false; });
+    pcntl_signal(SIGINT, static function () use (&$running): void { $running = false; });
+}
+
+function emit(array $record): void
+{
+    $record['at'] = time();
+    fwrite(STDOUT, json_encode(
+        $record,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+    ) . PHP_EOL);
+    fflush(STDOUT);
+}
+
+/** @return list<array<string, mixed>> */
+/**
+ * Fetch transcripts along with the source's own idea of how far it has counted.
+ *
+ * The status line is the only way to tell a quiet source from a restarted one.
+ * Pet numbers transcripts from zero every time it starts, so its sequence is
+ * only meaningful within a single run of the process.
+ *
+ * @return array{latest: ?int, rows: list<array<string, mixed>>}
+ */
+function petTranscripts(int $after): array
+{
+    $context = stream_context_create(['http' => ['timeout' => 4, 'ignore_errors' => true]]);
+    $body = @file_get_contents(PET_BRIDGE . '/transcripts?after=' . $after, false, $context);
+    if (!is_string($body) || $body === '') {
+        return ['latest' => null, 'rows' => []];
+    }
+    $latest = null;
+    $rows = [];
+    foreach (preg_split('/\R/u', trim($body)) ?: [] as $line) {
+        if (trim($line) === '') {
+            continue;
+        }
+        $decoded = json_decode($line, true);
+        if (!is_array($decoded)) {
+            continue;
+        }
+        if (($decoded['type'] ?? null) === 'status' && isset($decoded['latestSequence'])) {
+            $latest = (int) $decoded['latestSequence'];
+        }
+        if (($decoded['type'] ?? null) === 'transcript') {
+            $rows[] = $decoded;
+        }
+    }
+    return ['latest' => $latest, 'rows' => $rows];
+}
+
+/**
+ * Tell Pet how the room is being read, so the transcript can mark it.
+ *
+ * The mode is derived from the same gate that decides whether a line reaches
+ * Navi, rather than from a second rule that happens to agree today. An empty
+ * mode clears the label.
+ */
+function pushHearingMode(string $mode): void
+{
+    $context = stream_context_create(['http' => [
+        'method' => 'POST',
+        'header' => "Content-Type: application/json\r\n",
+        'content' => json_encode(['mode' => $mode], JSON_UNESCAPED_SLASHES),
+        'timeout' => 2,
+        'ignore_errors' => true,
+    ]]);
+    @file_get_contents(PET_BRIDGE . '/hearing', false, $context);
+}
+
+/**
+ * Name what this chunk arrived in, in the words the transcript should show.
+ *
+ * Only speech that the gate turned away for being room noise gets a label. Navi's
+ * own echo and sampled quiet are not states of the room, and a line that was
+ * addressed to Navi needs no explaining.
+ */
+function hearingModeFor($cortex, array $payload): string
+{
+    if (($payload['self_echo'] ?? false) === true || ($payload['silence'] ?? false) === true) {
+        return '';
+    }
+    return $cortex->senseAccepts('heard_speech', $payload) ? '' : 'meeting';
+}
+
+$looking = new CommandSense();
+$nextLooking = 0;
+// Held across passes so a source restart is noticed once rather than every tick.
+$hearingCursor = null;
+$nextHearing = 0;
+$nextSilence = time() + SILENCE_INTERVAL;
+$heardAt = 0;
+$lastMode = null;
+$nextModePush = 0;
+$nextPresence = 0;
+$nextSignals = 0;
+$nextHealth = 0;
+$nextTime = 0;
+$nextMaintenance = time() + MAINTENANCE_INTERVAL;
+
+while ($running) {
+    $now = time();
+
+    if ($now >= $nextHearing) {
+        $nextHearing = $now + HEARING_INTERVAL;
+        try {
+            // The cursor is held here rather than re-read from storage every
+            // pass. Readings are what storage remembers, and a restart that
+            // produces no new transcripts writes no reading, so re-deriving the
+            // cursor from storage kept returning the pre-restart value and the
+            // rewind below fired on every tick for as long as the room stayed
+            // quiet. Holding it means a restart is noticed once.
+            $after = $hearingCursor ?? ($cortex->latestSequence(HEARING_SOURCE) ?? 0);
+            $feed = petTranscripts($after);
+            // A cursor sitting above the source's own latest sequence is not
+            // ahead of the stream, it is pointing into a numbering that no
+            // longer exists, because Pet counts from zero again every time it
+            // starts. Left alone Navi stays deaf until the new run happens to
+            // count past the old total, which after a long session is hundreds
+            // of utterances of silence that look exactly like a quiet room.
+            if ($feed['latest'] !== null && $feed['latest'] < $after) {
+                emit([
+                    'sense' => HEARING_SOURCE,
+                    'source_restarted' => true,
+                    'cursor_was' => $after,
+                    'source_latest' => $feed['latest'],
+                ]);
+                $after = 0;
+                $hearingCursor = 0;
+                $feed = petTranscripts(0);
+            }
+            foreach ($feed['rows'] as $row) {
+                $sequence = (int) ($row['sequence'] ?? 0);
+                if ($sequence <= $after) {
+                    continue;
+                }
+                $observedAt = isset($row['createdAtMs'])
+                    ? (int) round(((int) $row['createdAtMs']) / 1000)
+                    : $now;
+                // The chunk alone cannot tell a meeting from being spoken to.
+                // The stream around it can, so it is described before ingest.
+                $payload = $hearing->annotate(
+                    trim((string) ($row['text'] ?? '')),
+                    (int) ($row['durationMs'] ?? 0),
+                    $observedAt
+                );
+                $result = $cortex->ingest(HEARING_SOURCE, $payload, $sequence, $observedAt);
+                $hearingCursor = $sequence;
+                $heardAt = $now;
+
+                // Pet labels the next line it hears with this, so it is sent as
+                // soon as the reading that decides it exists. Sending only on a
+                // change would leave the label to expire during a long call,
+                // which reads as the meeting having ended.
+                $mode = hearingModeFor($cortex, $payload);
+                if ($mode !== $lastMode || $now >= $nextModePush) {
+                    pushHearingMode($mode);
+                    $lastMode = $mode;
+                    $nextModePush = $now + MODE_REFRESH_INTERVAL;
+                }
+
+                if (($result['events'] ?? []) !== []) {
+                    emit(['sense' => HEARING_SOURCE, 'sequence' => $sequence, 'events' => $result['events']]);
+                }
+            }
+        } catch (Throwable $throwable) {
+            emit(['sense' => HEARING_SOURCE, 'error' => $throwable->getMessage()]);
+        }
+    }
+
+    // Looks Navi asked for. The queue is the interface: something in cognition
+    // decides there is a question about the machine worth answering and writes
+    // it here, and the answer arrives as perception rather than as a return
+    // value, so it is ranked, damped and forgotten like anything else sensed.
+    if ($now >= $nextLooking) {
+        $nextLooking = $now + LOOKING_INTERVAL;
+        try {
+            foreach ($core->claimPendingLooks(3) as $look) {
+                $reading = $looking->observe((string) $look['command']);
+                $result = $cortex->ingest(LOOKING_SOURCE, $reading, null, $now);
+                // The reading is perception and expires. What the look taught
+                // is a fact about this machine and does not, so it is kept
+                // separately and consolidated like any other observation.
+                $core->rememberLook(
+                    (string) $look['command'],
+                    (string) $look['because'],
+                    $reading,
+                    (int) $look['event_id']
+                );
+                emit([
+                    'sense' => LOOKING_SOURCE,
+                    'command' => mb_substr((string) $look['command'], 0, 120),
+                    'refused' => $reading['refused'] ?? null,
+                    'exit_code' => $reading['exit_code'] ?? null,
+                    'events' => $result['events'] ?? [],
+                ]);
+            }
+        } catch (Throwable $throwable) {
+            emit(['sense' => LOOKING_SOURCE, 'error' => $throwable->getMessage()]);
+        }
+    }
+
+    // A room that has gone quiet stops producing transcripts, so nothing would
+    // ever revise the reading that says a call is in progress. Quiet is sampled
+    // rather than inferred from the absence of samples.
+    if ($now >= $nextSilence) {
+        $nextSilence = $now + SILENCE_INTERVAL;
+        if (($now - $heardAt) >= SILENCE_INTERVAL) {
+            try {
+                // Carry the cursor forward so a long quiet stretch cannot bury
+                // the last real sequence and replay Pet's whole buffer.
+                $result = $cortex->ingest(
+                    HEARING_SOURCE,
+                    $hearing->silence($now),
+                    $hearingCursor ?? $cortex->latestSequence(HEARING_SOURCE),
+                    $now
+                );
+                // A quiet room is not a meeting. Clearing the label here means
+                // it lifts when the call ends rather than lingering on whatever
+                // the last person to speak happened to be doing.
+                if ($lastMode !== '') {
+                    pushHearingMode('');
+                    $lastMode = '';
+                    $nextModePush = $now + MODE_REFRESH_INTERVAL;
+                }
+                if (($result['events'] ?? []) !== []) {
+                    emit(['sense' => HEARING_SOURCE, 'quiet' => true, 'events' => $result['events']]);
+                }
+            } catch (Throwable $throwable) {
+                emit(['sense' => HEARING_SOURCE, 'error' => $throwable->getMessage()]);
+            }
+        }
+    }
+
+    if ($now >= $nextPresence) {
+        $nextPresence = $now + PRESENCE_INTERVAL;
+        try {
+            $presence = $awareness->presence();
+            $result = $cortex->ingest(PRESENCE_SOURCE, [
+                'using_computer' => $presence['using_computer'],
+                'state' => (string) ($presence['state'] ?? 'unknown'),
+            ]);
+            if (($result['events'] ?? []) !== []) {
+                emit(['sense' => PRESENCE_SOURCE, 'events' => $result['events']]);
+            }
+        } catch (Throwable $throwable) {
+            emit(['sense' => PRESENCE_SOURCE, 'error' => $throwable->getMessage()]);
+        }
+    }
+
+    // Every evidence stream is its own source. Nothing here decides what they
+    // mean together; that lives in each sense's configuration.
+    if ($now >= $nextSignals) {
+        $nextSignals = $now + SIGNAL_INTERVAL;
+        foreach ($signals->sampleAll($now) as $sourceKey => $payload) {
+            try {
+                $result = $cortex->ingest($sourceKey, $payload);
+                if (($result['events'] ?? []) !== []) {
+                    emit(['sense' => $sourceKey, 'events' => $result['events']]);
+                }
+            } catch (Throwable $throwable) {
+                emit(['sense' => $sourceKey, 'error' => $throwable->getMessage()]);
+            }
+        }
+    }
+
+    // Interoception and chronoception are self-directed: they reveal nothing
+    // about the room, so they can be sampled steadily without cost to privacy.
+    if ($now >= $nextHealth) {
+        $nextHealth = $now + HEALTH_INTERVAL;
+        try {
+            $result = $cortex->ingest(HEALTH_SOURCE, $intero->health());
+            if (($result['events'] ?? []) !== []) {
+                emit(['sense' => HEALTH_SOURCE, 'events' => $result['events']]);
+            }
+        } catch (Throwable $throwable) {
+            emit(['sense' => HEALTH_SOURCE, 'error' => $throwable->getMessage()]);
+        }
+    }
+
+    if ($now >= $nextTime) {
+        $nextTime = $now + TIME_INTERVAL;
+        try {
+            $result = $cortex->ingest(TIME_SOURCE, $intero->time());
+            if (($result['events'] ?? []) !== []) {
+                emit(['sense' => TIME_SOURCE, 'events' => $result['events']]);
+            }
+        } catch (Throwable $throwable) {
+            emit(['sense' => TIME_SOURCE, 'error' => $throwable->getMessage()]);
+        }
+    }
+
+    if ($now >= $nextMaintenance) {
+        $nextMaintenance = $now + MAINTENANCE_INTERVAL;
+        try {
+            // Close elapsed response windows, then queue bounded reflection.
+            // The sensory nerve never waits on inference.
+            $closed = $social->closeWindows($now);
+            if ($closed !== []) {
+                emit(['utterance_windows_closed' => count($closed)]);
+            }
+            $reflections = $social->queueReflections(2);
+            if ($reflections !== []) {
+                emit(['reflections_queued' => count($reflections)]);
+            }
+            // Aged readings become bit-packed frames and their rows go away.
+            $compacted = $codec->compact(900, $now);
+            if ($compacted !== []) {
+                emit(['compacted' => $compacted]);
+            }
+            // Speech nobody got to in time stops being a pending answer.
+            $staleSpeech = $cortex->expireStaleAddressed();
+            if ($staleSpeech !== []) {
+                emit(['unanswered_speech_expired' => count($staleSpeech)]);
+            }
+            $decayed = $cortex->decay($now);
+            $tuned = $cortex->tune($now);
+            if ($decayed['expired_readings'] > 0 || $decayed['expired_events'] > 0 || $tuned !== []) {
+                emit(['maintenance' => $decayed, 'tuning' => $tuned]);
+            }
+        } catch (Throwable $throwable) {
+            emit(['maintenance' => false, 'error' => $throwable->getMessage()]);
+        }
+    }
+
+    sleep(1);
+}
+
+emit(['stopped' => true]);

@@ -1,0 +1,47 @@
+#!/sbin/openrc-run
+
+name="navi-brain senses"
+description="Sensory nerve between the Pet bridge and Navi-Brain's cortex"
+
+: ${NAVI_BRAIN_ROOT:=/home/akujin/Sources/Navi-Brain}
+
+supervisor="supervise-daemon"
+command="${NAVI_BRAIN_ROOT}/bin/navi-brain-senses"
+command_user="akujin:users"
+pidfile="/run/navi-brain-senses.pid"
+output_log="${NAVI_BRAIN_ROOT}/var/senses.log"
+error_log="${NAVI_BRAIN_ROOT}/var/senses.err"
+
+# Perception must never outrank the voice path or interactive work, and a slow
+# sense must degrade perception rather than cognition.
+SSD_NICELEVEL=10
+SSD_IONICELEVEL="idle"
+
+respawn_delay=5
+respawn_max=5
+respawn_period=120
+
+# This process only reads already-authorized feeds and writes readings. It has
+# no actuator, so its ceilings are about not becoming a resource problem.
+rc_cgroup_mode="unified"
+rc_cgroup_settings="
+memory.max 512M
+memory.high 384M
+pids.max 64
+cpu.max 50000 100000
+"
+
+umask 0077
+
+depend() {
+    after localmount
+    before navi-brain-heartbeat
+}
+
+start_pre() {
+    if [ ! -x "${command}" ]; then
+        eerror "sense daemon not executable at ${command}"
+        return 1
+    fi
+    checkpath --directory --owner akujin:users --mode 0700 "${NAVI_BRAIN_ROOT}/var"
+}

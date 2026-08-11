@@ -1,15 +1,27 @@
 #!/sbin/openrc-run
 
-name="navi-brain heartbeat"
-description="Low-brain heartbeat and bounded high-brain wake scheduler"
-command="/home/akujin/Sources/Navi-Brain/bin/navi-brain-heartbeat"
+name="navi-brain continuity supervisor"
+description="Rust continuity supervisor for the Navi-Brain heartbeat"
+supervisor="supervise-daemon"
+command="/home/akujin/Sources/Navi-Brain/supervisor/target/release/navi-brain-supervisor"
+command_args="--heartbeat /home/akujin/Sources/Navi-Brain/bin/navi-brain-heartbeat --health-file /home/akujin/Sources/Navi-Brain/var/supervisor-health.json --lock-file /home/akujin/Sources/Navi-Brain/var/supervisor.lock"
 command_user="akujin:users"
-command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/home/akujin/Sources/Navi-Brain/var/heartbeat.log"
 error_log="/home/akujin/Sources/Navi-Brain/var/heartbeat.err"
+respawn_max=5
+respawn_period=60
+respawn_delay=5
+
+umask 0077
 
 depend() {
-    need net
     after localmount
+    use net
+}
+
+start_pre() {
+    if [ ! -x "${command}" ]; then
+        eerror "Build the continuity supervisor with: make continuity-supervisor"
+        return 1
+    fi
 }

@@ -1,0 +1,64 @@
+#!/bin/sh
+# Canonical launcher for Navi-Brain's baseline local model.
+#
+# The OpenRC service and any manual run both go through this script so the
+# resource ceilings can never drift between them. Every value is overridable by
+# environment variable; the defaults are the measured-safe configuration.
+set -eu
+
+: "${LLAMA_SERVER:=/usr/local/bin/llama-server}"
+: "${LOCAL_MODEL_GGUF:=/home/akujin/.cache/llama.cpp/ggml-org_gemma-3-4b-it-qat-GGUF_gemma-3-4b-it-qat-Q4_0.gguf}"
+: "${NAVI_BRAIN_LOCAL_MODEL_HOST:=127.0.0.1}"
+: "${NAVI_BRAIN_LOCAL_MODEL_PORT:=5007}"
+: "${LOCAL_MODEL_THREADS:=4}"
+: "${LOCAL_MODEL_CTX:=4096}"
+: "${LOCAL_MODEL_PARALLEL:=2}"
+: "${LOCAL_MODEL_CACHE_RAM:=512}"
+: "${LOCAL_MODEL_CTX_CHECKPOINTS:=2}"
+: "${LOCAL_MODEL_NICE:=10}"
+# Weight repacking roughly halves time-to-proposal but costs about 1.7 GiB of
+# resident anonymous memory. Off by default: this endpoint exists to stay alive
+# cheaply for thirty-minute wakes, not to win latency benchmarks.
+: "${LOCAL_MODEL_REPACK:=0}"
+
+if [ ! -x "${LLAMA_SERVER}" ]; then
+    echo "llama-server not found at ${LLAMA_SERVER}" >&2
+    exit 1
+fi
+if [ ! -r "${LOCAL_MODEL_GGUF}" ]; then
+    echo "local model weights not readable at ${LOCAL_MODEL_GGUF}" >&2
+    exit 1
+fi
+
+if [ "${LOCAL_MODEL_REPACK}" = "1" ]; then
+    REPACK_FLAG="--repack"
+else
+    REPACK_FLAG="--no-repack"
+fi
+
+# --device none: the Vulkan backend reserves over a gigabyte of VRAM and
+#   accelerates prompt processing even with zero offloaded layers, so leaving it
+#   enabled would contend with the Orpheus TTS server that owns Navi's voice.
+#   Disabling it keeps GPU use at roughly nine megabytes.
+# Two slots let the executive worker and the background worker make progress
+# independently. LOCAL_MODEL_CTX is per slot; llama.cpp divides the total
+# context across parallel slots, so pass their product as the server context.
+TOTAL_MODEL_CTX=$((LOCAL_MODEL_CTX * LOCAL_MODEL_PARALLEL))
+exec nice -n "${LOCAL_MODEL_NICE}" ionice -c 3 "${LLAMA_SERVER}" \
+    -m "${LOCAL_MODEL_GGUF}" \
+    --host "${NAVI_BRAIN_LOCAL_MODEL_HOST}" \
+    --port "${NAVI_BRAIN_LOCAL_MODEL_PORT}" \
+    --device none \
+    "${REPACK_FLAG}" \
+    --n-gpu-layers 0 \
+    --ctx-size "${TOTAL_MODEL_CTX}" \
+    --batch-size 512 \
+    --ubatch-size 256 \
+    --threads "${LOCAL_MODEL_THREADS}" \
+    --threads-batch "${LOCAL_MODEL_THREADS}" \
+    --parallel "${LOCAL_MODEL_PARALLEL}" \
+    --cache-ram "${LOCAL_MODEL_CACHE_RAM}" \
+    --ctx-checkpoints "${LOCAL_MODEL_CTX_CHECKPOINTS}" \
+    --no-webui \
+    --jinja \
+    "$@"

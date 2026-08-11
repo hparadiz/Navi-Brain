@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace NaviBrain\Core;
 
 use JsonException;
+use NaviBrain\Perception\SocialFeedback;
 use RuntimeException;
 
 final class FreeModelWorker
@@ -70,6 +71,18 @@ final class FreeModelWorker
                     result: $invocation['proposal'],
                     model: $modelId
                 );
+                try {
+                    $integration = $this->core->integrateWorkerResult(
+                        $work,
+                        $invocation['proposal'],
+                        $modelId
+                    );
+                } catch (\Throwable $throwable) {
+                    $integration = $this->core->handleWorkerFailure(
+                        $work,
+                        'Worker completed, but thread integration failed: ' . $throwable->getMessage()
+                    );
+                }
                 if (isset($invocation['session_id'])) {
                     $this->deleteSession((string) $invocation['session_id']);
                 }
@@ -78,6 +91,7 @@ final class FreeModelWorker
                     'model' => $modelId,
                     'latency_ms' => $latency,
                     'result' => $finished,
+                    'integration' => $integration,
                 ];
             } catch (\Throwable $throwable) {
                 $latency = (int) round((hrtime(true) - $started) / 1_000_000);
@@ -101,7 +115,13 @@ final class FreeModelWorker
             model: null,
             error: $message
         );
-        return ['status' => 'failed', 'errors' => $errors, 'result' => $failed];
+        $integration = $this->core->handleWorkerFailure($work, $message);
+        return [
+            'status' => 'failed',
+            'errors' => $errors,
+            'result' => $failed,
+            'integration' => $integration,
+        ];
     }
 
     /** @return list<string> */
@@ -149,12 +169,10 @@ final class FreeModelWorker
      */
     private function invokeModel(array $work, string $modelId, int $wall): array
     {
-        $prompt = (string) $work['prompt'] . "\n\nRequired JSON schema:\n" . json_encode([
-            'kind' => 'short_snake_case_string',
-            'content' => 'one bounded unverified thought or repair proposal',
-            'confidence' => 'number from 0 through 1',
-            'challenged_assumption' => 'the assumption this proposal challenges',
-        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $prompt = (string) $work['prompt'] . "\n\nRequired JSON schema:\n" . json_encode(
+            $this->workerSchema((string) $work['work_type']),
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+        );
         $wall = max(1, min(3600, $wall));
         $title = sprintf('navi:%s:%d', $work['work_type'], $work['id']);
         $result = $this->runProcess([
@@ -184,6 +202,65 @@ final class FreeModelWorker
             ));
         }
         return $this->parseWorkerStream($result['output']);
+    }
+
+    /** @return array<string, string> */
+    private function workerSchema(string $workType): array
+    {
+        if ($workType === DecisionStateMachine::WORK_TYPE) {
+            return [
+                'kind' => 'decision_candidates',
+                'content' => 'minified JSON object with current_plan, decision_basis, and one-to-three adapter-valid terminal candidates',
+                'confidence' => 'number from 0 through 1',
+                'challenged_assumption' => 'the assumption the proposed terminal action most depends on',
+            ];
+        }
+        if ($workType === OtherModel::WORK_TYPE) {
+            return [
+                'kind' => 'other_model_proposition',
+                'content' => 'minified JSON with exactly type, proposition, evidence_quote; type is goal, belief, plan, constraint, or none',
+                'confidence' => 'number from 0 through 1 for extraction confidence only',
+                'challenged_assumption' => 'the assumption that the utterance explicitly reports the extracted proposition',
+            ];
+        }
+        if ($workType === SocialFeedback::WORK_TYPE) {
+            return [
+                'kind' => 'social_feedback_reflection',
+                'content' => 'one lowercase word or short_snake_case phrase naming the observed interaction',
+                'confidence' => 'number from 0 through 1',
+                'challenged_assumption' => 'the assumption the descriptor most depends on',
+            ];
+        }
+        if ($workType === 'epistemic_advance_step') {
+            return [
+                'kind' => 'the operation identifier named in the prompt, with no extra words',
+                'content' => 'one bounded sentence of 6 to 60 words, grounded in the supplied evidence',
+                'confidence' => 'number from 0 through 1',
+                'challenged_assumption' => 'the assumption in the current belief this step questions',
+            ];
+        }
+        if ($workType === ExecutiveCore::SELF_PRESENCE_ANSWER_WORK_TYPE) {
+            return [
+                'kind' => 'self_presence_utterance',
+                'content' => '3 to 36 spoken words that directly answer the addressed speech in the prompt',
+                'confidence' => 'number from 0 through 1',
+                'challenged_assumption' => 'the assumption the answer most depends on',
+            ];
+        }
+        if ($workType === ExecutiveCore::SELF_PRESENCE_SPEECH_WORK_TYPE) {
+            return [
+                'kind' => 'one of: self_presence_utterance, remain_silent',
+                'content' => '3 to 35 spoken words for an utterance, or a short reason for silence',
+                'confidence' => 'number from 0 through 1',
+                'challenged_assumption' => 'whether speaking or silence is better at this wake',
+            ];
+        }
+        return [
+            'kind' => 'short_snake_case_string',
+            'content' => 'one bounded unverified thought or repair proposal',
+            'confidence' => 'number from 0 through 1',
+            'challenged_assumption' => 'the assumption this proposal challenges',
+        ];
     }
 
     /** @return array{proposal: array<string, mixed>, session_id?: string} */
@@ -255,8 +332,11 @@ final class FreeModelWorker
     private function ensureRuntimeDirectories(): void
     {
         foreach ([$this->runtimeRoot, $this->runtimeRoot . '/work', $this->runtimeRoot . '/xdg-data'] as $path) {
-            if (!is_dir($path) && !mkdir($path, 0770, true) && !is_dir($path)) {
+            if (!is_dir($path) && !mkdir($path, 0700, true) && !is_dir($path)) {
                 throw new RuntimeException(sprintf('Unable to create worker runtime directory: %s', $path));
+            }
+            if (!chmod($path, 0700)) {
+                throw new RuntimeException(sprintf('Unable to harden worker runtime directory: %s', $path));
             }
         }
     }

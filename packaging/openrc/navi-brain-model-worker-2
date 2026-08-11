@@ -1,0 +1,44 @@
+#!/sbin/openrc-run
+
+name="navi-brain model worker 2"
+description="Second bounded model-work lane for Navi-Brain"
+
+: ${NAVI_BRAIN_ROOT:=/home/akujin/Sources/Navi-Brain}
+
+supervisor="supervise-daemon"
+command="${NAVI_BRAIN_ROOT}/bin/navi-brain-model-worker"
+command_user="akujin:users"
+pidfile="/run/navi-brain-model-worker-2.pid"
+output_log="${NAVI_BRAIN_ROOT}/var/model-worker-2.log"
+error_log="${NAVI_BRAIN_ROOT}/var/model-worker-2.err"
+
+SSD_NICELEVEL=10
+SSD_IONICELEVEL="idle"
+
+respawn_delay=5
+respawn_max=5
+respawn_period=120
+
+rc_cgroup_mode="unified"
+rc_cgroup_settings="
+memory.max 512M
+memory.high 384M
+pids.max 128
+cpu.max 100000 100000
+"
+
+umask 0077
+
+depend() {
+    after localmount navi-brain-local-model
+    before navi-brain-heartbeat
+    use net
+}
+
+start_pre() {
+    if [ ! -x "${command}" ]; then
+        eerror "model worker not executable at ${command}"
+        return 1
+    fi
+    checkpath --directory --owner akujin:users --mode 0700 "${NAVI_BRAIN_ROOT}/var"
+}

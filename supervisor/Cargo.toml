@@ -1,0 +1,14 @@
+[package]
+name = "navi-brain-supervisor"
+version = "0.1.0"
+edition = "2024"
+license = "proprietary"
+description = "Continuity supervisor for the Navi-Brain heartbeat"
+
+[dependencies]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true
