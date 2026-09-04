@@ -41,6 +41,10 @@ final class ActionExecution extends ActiveRecord
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $procedure_id = null;
 
+    /** Immutable token-memory generation that authorized this action. */
+    #[Column(type: 'integer', notnull: false, unsigned: true)]
+    protected ?int $procedure_memory_id = null;
+
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $procedure_run_id = null;
 
@@ -65,6 +69,6 @@ final class ActionExecution extends ActiveRecord
     #[Column(type: 'integer', unsigned: true)]
     protected int $verified = 0;
 
-    #[Column(type: 'enum', values: ['pending', 'waiting', 'succeeded', 'failed', 'cancelled'])]
+    #[Column(type: 'enum', values: ['pending', 'dispatching', 'waiting', 'succeeded', 'failed', 'cancelled'])]
     protected string $status = 'pending';
 }

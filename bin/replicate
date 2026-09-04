@@ -1,28 +1,101 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOCAL_BRAIN_DIR="/home/akujin/Sources/Navi-Brain"
-REMOTE_HOST="akuj.in"
-REMOTE_BRAIN_DIR="/home/akujin/navi-brain"
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+LOCAL_BRAIN_DIR="${NAVI_REPLICATION_LOCAL_DIR:-/home/akujin/Sources/Navi-Brain}"
+REMOTE_HOST="${NAVI_REPLICATION_REMOTE_HOST:-akuj.in}"
+REMOTE_BRAIN_DIR="${NAVI_REPLICATION_REMOTE_DIR:-/home/akujin/navi-brain}"
+DATABASE_PATH="${NAVI_BRAIN_DB:-$LOCAL_BRAIN_DIR/var/navi-brain.sqlite}"
+TOKEN_STORE_PATH="${NAVI_TOKEN_MEMORY_STORE:-$LOCAL_BRAIN_DIR/memories/store}"
+TOKMEM_PATH="$LOCAL_BRAIN_DIR/memories/build/tokmem"
+QUIESCE_HELPER="${NAVI_REPLICATION_QUIESCE_HELPER:-}"
+TIMESTAMP="$(date -u +%Y%m%d-%H%M%S)"
+BUNDLE_NAME="navi-brain-$TIMESTAMP-$$.bundle"
+LOCAL_BACKUP_DIR="$LOCAL_BRAIN_DIR/var/backups"
+BUNDLE_PATH="$LOCAL_BACKUP_DIR/$BUNDLE_NAME"
+REMOTE_BACKUP_DIR="$REMOTE_BRAIN_DIR/var/backups"
+REMOTE_INCOMING="$REMOTE_BACKUP_DIR/.$BUNDLE_NAME.incoming"
+REMOTE_BUNDLE="$REMOTE_BACKUP_DIR/$BUNDLE_NAME"
 
-echo "[replicate] Creating local backup..."
-cd "$LOCAL_BRAIN_DIR"
-BACKUP_PATH=$(php bin/navi-brain backup:create --reason="mesh-replication" 2>/dev/null | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-print(d['result']['path'])
-")
-BACKUP_FILE=$(basename "$BACKUP_PATH")
-echo "[replicate] Backup: $BACKUP_PATH"
+case "$REMOTE_HOST" in
+    ""|-*|*[!A-Za-z0-9_.@:-]*)
+        echo "[replicate] Unsafe remote host syntax: $REMOTE_HOST" >&2
+        exit 2
+        ;;
+esac
+case "$REMOTE_BRAIN_DIR" in
+    /*) ;;
+    *)
+        echo "[replicate] Remote brain directory must be absolute." >&2
+        exit 2
+        ;;
+esac
+case "$REMOTE_BRAIN_DIR" in
+    *[!A-Za-z0-9_./-]*)
+        echo "[replicate] Unsafe remote directory syntax: $REMOTE_BRAIN_DIR" >&2
+        exit 2
+        ;;
+esac
+case "$QUIESCE_HELPER" in
+    /*) ;;
+    *)
+        echo "[replicate] NAVI_REPLICATION_QUIESCE_HELPER must name an absolute executable." >&2
+        exit 2
+        ;;
+esac
+if [[ -L "$QUIESCE_HELPER" || ! -f "$QUIESCE_HELPER" || ! -x "$QUIESCE_HELPER" ]]; then
+    echo "[replicate] Quiescence helper must be a non-symlink regular executable." >&2
+    exit 2
+fi
 
-echo "[replicate] Syncing to akuj.in..."
-rsync -az -e ssh "$BACKUP_PATH" "$REMOTE_HOST:$REMOTE_BRAIN_DIR/var/backups/$BACKUP_FILE"
+WRITERS_QUIESCED=0
+resume_on_exit() {
+    local original_status=$?
+    if [[ "$WRITERS_QUIESCED" -eq 1 ]]; then
+        set +e
+        "$QUIESCE_HELPER" resume --database "$DATABASE_PATH" --store "$TOKEN_STORE_PATH"
+        local resume_status=$?
+        set -e
+        if [[ "$original_status" -eq 0 && "$resume_status" -ne 0 ]]; then
+            echo "[replicate] Writer resume failed; writers remain deliberately stopped." >&2
+            return "$resume_status"
+        fi
+    fi
+    return "$original_status"
+}
+trap resume_on_exit EXIT
 
-echo "[replicate] Restoring on akuj.in and restarting daemon..."
-ssh -o ServerAliveInterval=3 "$REMOTE_HOST" "cd $REMOTE_BRAIN_DIR && \
-    php bin/restore-backup var/backups/$BACKUP_FILE && \
-    systemctl restart navi-brain && \
-    echo 'Daemon restarted via systemd'"
+mkdir -p -- "$LOCAL_BACKUP_DIR"
 
+echo "[replicate] Quiescing every application memory writer..."
+WRITERS_QUIESCED=1
+"$QUIESCE_HELPER" quiesce --database "$DATABASE_PATH" --store "$TOKEN_STORE_PATH"
+"$QUIESCE_HELPER" verify --database "$DATABASE_PATH" --store "$TOKEN_STORE_PATH"
+
+echo "[replicate] Creating locked token-memory bundle..."
+"$LOCAL_BRAIN_DIR/bin/token-memory-bundle" create \
+    --database "$DATABASE_PATH" \
+    --store "$TOKEN_STORE_PATH" \
+    --tokmem "$TOKMEM_PATH" \
+    --destination "$BUNDLE_PATH" \
+    --close-daemon \
+    --deep-verify
+
+"$QUIESCE_HELPER" verify --database "$DATABASE_PATH" --store "$TOKEN_STORE_PATH"
+"$QUIESCE_HELPER" resume --database "$DATABASE_PATH" --store "$TOKEN_STORE_PATH"
+WRITERS_QUIESCED=0
+
+echo "[replicate] Uploading staging bundle to $REMOTE_HOST..."
+ssh -o ServerAliveInterval=3 "$REMOTE_HOST" \
+    "test ! -e '$REMOTE_INCOMING' && test ! -e '$REMOTE_BUNDLE' && mkdir -p '$REMOTE_BACKUP_DIR'"
+rsync -a --protect-args -- "$BUNDLE_PATH/" "$REMOTE_HOST:$REMOTE_INCOMING/"
+
+echo "[replicate] Verifying and atomically publishing remote bundle..."
+ssh -o ServerAliveInterval=3 "$REMOTE_HOST" "cd '$REMOTE_BRAIN_DIR' && \
+    ./bin/token-memory-bundle publish-received \
+        --incoming '$REMOTE_INCOMING' \
+        --destination '$REMOTE_BUNDLE' \
+        --tokmem ./memories/build/tokmem"
+
+echo "[replicate] Published verified standby bundle: $REMOTE_HOST:$REMOTE_BUNDLE"
+echo "[replicate] Live replica activation is an explicit stopped-writer restore; no daemon was restarted."
 echo "[replicate] Done at $TIMESTAMP"

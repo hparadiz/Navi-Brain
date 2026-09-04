@@ -57,7 +57,7 @@ final class Procedure extends ActiveRecord
     #[Column(type: 'enum', values: ['user', 'developer', 'system', 'agent'])]
     protected string $authority = 'agent';
 
-    #[Column(type: 'enum', values: ['active', 'invalidated'])]
+    #[Column(type: 'enum', values: ['active', 'retiring', 'invalidated'])]
     protected string $status = 'active';
 
     #[Column(type: 'serialized')]

@@ -1,0 +1,1436 @@
+#!/usr/bin/env python3
+"""Create and verify durable, no-clobber Navi token-memory backup bundles."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager, ExitStack
+import ctypes
+import datetime as dt
+import errno
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+os.umask(0o077)
+
+
+FORMAT_VERSION = "NAVITOKBACKUP1"
+MANIFEST_NAME = "MANIFEST.sha256"
+FORMAT_NAME = "FORMAT"
+APPLICATION_NAME = "application.sqlite3"
+TOKEN_STORE_NAME = "token-store"
+SAFE_TIER = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
+SAFE_ID = re.compile(r"[1-9][0-9]*\Z")
+SHA_LINE = re.compile(r"([0-9a-f]{64})  ([0-9]+)  ([!-~]+)\n\Z")
+CORE_CATALOG_TABLES = {
+    "token_translation",
+    "memory_accounting",
+    "pair_observation",
+    "link_reinforcement",
+    "memory_state",
+}
+CURRENT_CATALOG_TABLES = CORE_CATALOG_TABLES | {
+    "neutral_accounting_intent",
+    "operation_receipt",
+}
+CATALOG_TABLE_SQL = {
+    "token_translation": (
+        "CREATE TABLE token_translation(token_id INTEGER PRIMARY KEY,"
+        "segment BLOB NOT NULL UNIQUE,write_count BLOB NOT NULL "
+        "CHECK(length(write_count)=8),read_count BLOB NOT NULL "
+        "CHECK(length(read_count)=8),usage_count BLOB NOT NULL "
+        "CHECK(length(usage_count)=8),left_id INTEGER NULL,right_id INTEGER NULL,"
+        "CHECK((left_id IS NULL)=(right_id IS NULL))) WITHOUT ROWID"
+    ),
+    "memory_accounting": (
+        "CREATE TABLE memory_accounting(memory_id INTEGER PRIMARY KEY,"
+        "tier TEXT NOT NULL,content_sha256 BLOB NOT NULL "
+        "CHECK(length(content_sha256)=32),metadata_sha256 BLOB NOT NULL "
+        "CHECK(length(metadata_sha256)=32))"
+    ),
+    "neutral_accounting_intent": (
+        "CREATE TABLE neutral_accounting_intent(memory_id INTEGER PRIMARY KEY,"
+        "tier TEXT NOT NULL,content_sha256 BLOB NOT NULL "
+        "CHECK(length(content_sha256)=32),metadata_sha256 BLOB NOT NULL "
+        "CHECK(length(metadata_sha256)=32))"
+    ),
+    "pair_observation": (
+        "CREATE TABLE pair_observation(left_id INTEGER NOT NULL,"
+        "right_id INTEGER NOT NULL,observations BLOB NOT NULL "
+        "CHECK(length(observations)=8),PRIMARY KEY(left_id,right_id)) WITHOUT ROWID"
+    ),
+    "link_reinforcement": (
+        "CREATE TABLE link_reinforcement(source_id INTEGER NOT NULL,"
+        "target_id INTEGER NOT NULL,reinforcement INTEGER NOT NULL,"
+        "PRIMARY KEY(source_id,target_id)) WITHOUT ROWID"
+    ),
+    "memory_state": (
+        "CREATE TABLE memory_state(memory_id INTEGER PRIMARY KEY,"
+        "access_count BLOB NOT NULL CHECK(length(access_count)=8)) WITHOUT ROWID"
+    ),
+    "operation_receipt": (
+        "CREATE TABLE operation_receipt(op_key TEXT PRIMARY KEY,"
+        "request_sha256 BLOB NOT NULL CHECK(length(request_sha256)=32),"
+        "kind TEXT NOT NULL,memory_id INTEGER NOT NULL,state INTEGER NOT NULL "
+        "CHECK(state IN (0,1))) WITHOUT ROWID"
+    ),
+}
+CATALOG_AUXILIARY_SCHEMA = {
+    (
+        "index",
+        "sqlite_autoindex_token_translation_1",
+        "token_translation",
+        None,
+    ),
+}
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+class BundleError(RuntimeError):
+    pass
+
+
+def fail(message: str) -> None:
+    raise BundleError(message)
+
+
+def absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def regular_file(path: Path, description: str) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"missing {description}: {path}")
+    if not stat.S_ISREG(info.st_mode):
+        fail(f"{description} is not a regular file: {path}")
+    return info
+
+
+def same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        same_inode(left, right)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def open_regular(path: Path, description: str) -> tuple[int, os.stat_result]:
+    before = regular_file(path, description)
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or not same_inode(before, opened):
+            fail(f"{description} changed while it was opened: {path}")
+        after = path.lstat()
+        if not same_inode(opened, after):
+            fail(f"{description} path changed while it was opened: {path}")
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def read_regular_bytes(path: Path, description: str) -> bytes:
+    fd, expected = open_regular(path, description)
+    try:
+        payload = bytearray()
+        while len(payload) < expected.st_size:
+            chunk = os.read(fd, min(1024 * 1024, expected.st_size - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) != expected.st_size or os.read(fd, 1):
+            fail(f"{description} changed while it was read: {path}")
+        current = os.fstat(fd)
+        if not same_file_state(expected, current):
+            fail(f"{description} changed while it was read: {path}")
+        return bytes(payload)
+    finally:
+        os.close(fd)
+
+
+def directory(path: Path, description: str) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"missing {description}: {path}")
+    if not stat.S_ISDIR(info.st_mode):
+        fail(f"{description} is not a directory: {path}")
+    return info
+
+
+def open_directory(path: Path, description: str) -> tuple[int, os.stat_result]:
+    before = directory(path, description)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode) or not same_file_state(before, opened):
+            fail(f"{description} changed while it was opened: {path}")
+        after = path.lstat()
+        if not same_file_state(opened, after):
+            fail(f"{description} path changed while it was opened: {path}")
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def directory_entries(directory_fd: int) -> list[tuple[str, os.stat_result]]:
+    entries: list[tuple[str, os.stat_result]] = []
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        entries.append((name, info))
+    return sorted(entries, key=lambda item: os.fsencode(item[0]))
+
+
+def open_child_directory(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    description: str,
+) -> tuple[int, os.stat_result]:
+    if not stat.S_ISDIR(expected.st_mode):
+        fail(f"{description} is not a directory: {name}")
+    fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(fd)
+        visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not same_file_state(expected, opened) or not same_file_state(opened, visible):
+            fail(f"{description} changed while it was opened: {name}")
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def open_child_regular(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    description: str,
+) -> tuple[int, os.stat_result]:
+    if not stat.S_ISREG(expected.st_mode):
+        fail(f"{description} is not a regular file: {name}")
+    fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not same_file_state(expected, opened) or not same_file_state(opened, visible):
+            fail(f"{description} changed while it was opened: {name}")
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def read_open_regular(fd: int, expected: os.stat_result, description: str) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    payload = bytearray()
+    while len(payload) < expected.st_size:
+        chunk = os.read(fd, min(1024 * 1024, expected.st_size - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if len(payload) != expected.st_size or os.read(fd, 1):
+        fail(f"{description} changed while it was read")
+    if not same_file_state(expected, os.fstat(fd)):
+        fail(f"{description} changed while it was read")
+    return bytes(payload)
+
+
+def sha256_open_regular(fd: int, expected: os.stat_result, description: str) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    total = 0
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+        total += len(chunk)
+    if total != expected.st_size or not same_file_state(expected, os.fstat(fd)):
+        fail(f"{description} changed while it was hashed")
+    return digest.hexdigest()
+
+
+def copy_open_regular(
+    source_fd: int,
+    source_info: os.stat_result,
+    destination: Path,
+) -> None:
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        total = 0
+        while chunk := os.read(source_fd, 1024 * 1024):
+            total += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short write", str(destination))
+                view = view[written:]
+        if total != source_info.st_size or not same_file_state(
+            source_info, os.fstat(source_fd)
+        ):
+            fail(f"source file changed while it was copied: {destination.name}")
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+
+
+def path_present(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def reject_sqlite_sidecars(database: Path) -> None:
+    for suffix in SQLITE_SIDECAR_SUFFIXES:
+        sidecar = Path(f"{database}{suffix}")
+        if path_present(sidecar):
+            fail(f"SQLite restore sidecar is forbidden: {sidecar}")
+
+
+def make_owned_stage(parent: Path, prefix: str) -> tuple[Path, os.stat_result, os.stat_result]:
+    parent_info = directory(parent, "staging parent")
+    stage = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+    os.chmod(stage, 0o700)
+    stage_info = directory(stage, "owned staging directory")
+    if not same_inode(parent_info, directory(parent, "staging parent")):
+        fail(f"staging parent changed while a private stage was created: {parent}")
+    return stage, stage_info, parent_info
+
+
+def cleanup_owned_stage(
+    stage: Path,
+    stage_info: os.stat_result,
+    parent_info: os.stat_result,
+) -> None:
+    if not path_present(stage):
+        return
+    current_parent = directory(stage.parent, "staging parent during cleanup")
+    current_stage = directory(stage, "owned staging directory during cleanup")
+    if not same_inode(parent_info, current_parent) or not same_inode(stage_info, current_stage):
+        fail(f"refusing to remove a replaced or unowned staging path: {stage}")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        fail("safe staging cleanup requires fd-based shutil.rmtree")
+    shutil.rmtree(stage)
+    fsync_directory(stage.parent)
+
+
+def sha256_size(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    fd, expected = open_regular(path, "file to hash")
+    try:
+        total = 0
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+            total += len(chunk)
+        current = os.fstat(fd)
+        if total != expected.st_size or not same_file_state(expected, current):
+            fail(f"file changed while it was hashed: {path}")
+    finally:
+        os.close(fd)
+    return digest.hexdigest(), expected.st_size
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_size(path)[0]
+
+
+def fsync_file(path: Path) -> None:
+    fd, _ = open_regular(path, "file to fsync")
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def fsync_directory(path: Path) -> None:
+    fd, _ = open_directory(path, "directory to fsync")
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def scan_regular_tree(
+    root: Path,
+    *,
+    collect_hashes: bool,
+    sync: bool,
+) -> dict[str, tuple[str, int]]:
+    root_fd, root_info = open_directory(root, "tree root")
+    result: dict[str, tuple[str, int]] = {}
+
+    def visit(directory_fd: int, relative_parts: tuple[str, ...]) -> None:
+        for name, entry_info in directory_entries(directory_fd):
+            child_parts = relative_parts + (name,)
+            relative = "/".join(child_parts)
+            if stat.S_ISDIR(entry_info.st_mode):
+                child_fd, child_info = open_child_directory(
+                    directory_fd, name, entry_info, "tree directory"
+                )
+                try:
+                    visit(child_fd, child_parts)
+                    if not same_file_state(child_info, os.fstat(child_fd)):
+                        fail(f"tree directory changed during traversal: {relative}")
+                    visible = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if not same_file_state(child_info, visible):
+                        fail(f"tree directory changed path during traversal: {relative}")
+                    if sync:
+                        os.fsync(child_fd)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(entry_info.st_mode):
+                child_fd, child_info = open_child_regular(
+                    directory_fd, name, entry_info, "tree file"
+                )
+                try:
+                    if collect_hashes:
+                        result[relative] = (
+                            sha256_open_regular(child_fd, child_info, f"tree file {relative}"),
+                            child_info.st_size,
+                        )
+                    if sync:
+                        os.fsync(child_fd)
+                    visible = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if not same_file_state(child_info, visible):
+                        fail(f"tree file changed path during traversal: {relative}")
+                finally:
+                    os.close(child_fd)
+            else:
+                fail(f"special file is forbidden in a backup tree: {root / relative}")
+
+    try:
+        visit(root_fd, ())
+        if sync:
+            os.fsync(root_fd)
+        if not same_file_state(root_info, os.fstat(root_fd)) or not same_file_state(
+            root_info, root.lstat()
+        ):
+            fail(f"tree root changed during traversal: {root}")
+        return result
+    finally:
+        os.close(root_fd)
+
+
+def fsync_tree(root: Path) -> None:
+    scan_regular_tree(root, collect_hashes=False, sync=True)
+
+
+def rename_noreplace(source: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        fail("atomic no-clobber publication requires renameat2")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    source_parent_fd, source_parent_info = open_directory(
+        source.parent, "rename source parent"
+    )
+    destination_parent_fd, destination_parent_info = open_directory(
+        destination.parent, "rename destination parent"
+    )
+    try:
+        source_info = os.stat(source.name, dir_fd=source_parent_fd, follow_symlinks=False)
+        result = renameat2(
+            source_parent_fd,
+            os.fsencode(source.name),
+            destination_parent_fd,
+            os.fsencode(destination.name),
+            1,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(destination))
+        published_info = os.stat(
+            destination.name, dir_fd=destination_parent_fd, follow_symlinks=False
+        )
+        if not same_inode(source_info, published_info):
+            fail(f"renamed object changed inode during no-clobber publication: {destination}")
+        if not same_inode(source_parent_info, source.parent.lstat()) or not same_inode(
+            destination_parent_info, destination.parent.lstat()
+        ):
+            fail("rename parent path changed during no-clobber publication")
+    finally:
+        os.close(destination_parent_fd)
+        os.close(source_parent_fd)
+
+
+def write_new_file(path: Path, payload: bytes, mode: int = 0o600) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, mode)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(errno.EIO, "short write", str(path))
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def copy_regular(source: Path, destination: Path) -> None:
+    source_fd, source_info = open_regular(source, "source file")
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short write", str(destination))
+                view = view[written:]
+        if not same_file_state(source_info, os.fstat(source_fd)):
+            fail(f"source file changed while it was copied: {source}")
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+        os.close(source_fd)
+
+
+def sqlite_quick_check(path: Path) -> None:
+    fd, _ = open_regular(path, "SQLite database")
+    try:
+        uri = f"file:/proc/self/fd/{fd}?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            result = [str(row[0]) for row in connection.execute("PRAGMA quick_check")]
+        finally:
+            connection.close()
+    finally:
+        os.close(fd)
+    if result != ["ok"]:
+        fail(f"SQLite quick_check failed for {path}: {'; '.join(result)}")
+
+
+def sqlite_backup(
+    source: Path,
+    destination: Path,
+    expected_inode: os.stat_result | None = None,
+) -> None:
+    source_fd, source_info = open_regular(source, "source SQLite database")
+    if expected_inode is not None and not same_inode(source_info, expected_inode):
+        os.close(source_fd)
+        fail(f"source SQLite database changed before backup: {source}")
+    source_uri = f"file:/proc/self/fd/{source_fd}?mode=ro"
+    source_connection: sqlite3.Connection | None = None
+    destination_connection: sqlite3.Connection | None = None
+    try:
+        source_connection = sqlite3.connect(source_uri, uri=True, timeout=30)
+        destination_connection = sqlite3.connect(destination)
+        source_connection.backup(destination_connection, pages=4096, sleep=0.01)
+    finally:
+        if destination_connection is not None:
+            destination_connection.close()
+        if source_connection is not None:
+            source_connection.close()
+        current = os.fstat(source_fd)
+        os.close(source_fd)
+    if not same_file_state(source_info, current):
+        fail(f"source SQLite database changed while it was copied: {source}")
+    os.chmod(destination, 0o600)
+    fsync_file(destination)
+    sqlite_quick_check(destination)
+
+
+def parse_sequence(path: Path) -> int:
+    payload = read_regular_bytes(path, "token-store sequence")
+    if not re.fullmatch(rb"(?:0|[1-9][0-9]*)\n", payload):
+        fail(f"noncanonical token-store sequence: {path}")
+    value = int(payload[:-1])
+    if value > 9223372036854775807:
+        fail(f"token-store sequence exceeds signed 64-bit range: {path}")
+    return value
+
+
+def parse_record_manifest(path: Path) -> dict[str, str]:
+    try:
+        text = read_regular_bytes(path, "memory checksum manifest").decode("ascii")
+    except UnicodeDecodeError as error:
+        fail(f"non-ASCII memory checksum manifest {path}: {error}")
+    result: dict[str, str] = {}
+    for line in text.splitlines(keepends=True):
+        match = re.fullmatch(r"([0-9a-f]{64})  (content\.memory|metadata\.memory)\n", line)
+        if match is None or match.group(2) in result:
+            fail(f"invalid memory checksum manifest: {path}")
+        result[match.group(2)] = match.group(1)
+    if set(result) != {"content.memory", "metadata.memory"}:
+        fail(f"incomplete memory checksum manifest: {path}")
+    return result
+
+
+def parse_open_record_manifest(fd: int, info: os.stat_result, description: str) -> dict[str, str]:
+    try:
+        text = read_open_regular(fd, info, description).decode("ascii")
+    except UnicodeDecodeError as error:
+        fail(f"non-ASCII memory checksum manifest {description}: {error}")
+    result: dict[str, str] = {}
+    for line in text.splitlines(keepends=True):
+        match = re.fullmatch(r"([0-9a-f]{64})  (content\.memory|metadata\.memory)\n", line)
+        if match is None or match.group(2) in result:
+            fail(f"invalid memory checksum manifest: {description}")
+        result[match.group(2)] = match.group(1)
+    if set(result) != {"content.memory", "metadata.memory"}:
+        fail(f"incomplete memory checksum manifest: {description}")
+    return result
+
+
+def scan_memory_records(
+    root: Path,
+    destination: Path | None = None,
+) -> list[tuple[str, str, Path]]:
+    root_fd, root_info = open_directory(root, "token-store memories directory")
+    records: list[tuple[str, str, Path]] = []
+    if destination is not None:
+        destination.mkdir(mode=0o700)
+    try:
+        for tier, tier_info in directory_entries(root_fd):
+            tier_path = root / tier
+            if SAFE_TIER.fullmatch(tier) is None or tier in {".", ".."}:
+                fail(f"invalid token-store tier directory: {tier_path}")
+            tier_fd, opened_tier = open_child_directory(
+                root_fd, tier, tier_info, "token-store tier"
+            )
+            try:
+                id_entries = directory_entries(tier_fd)
+                if not id_entries:
+                    fail(f"empty token-store tier directory is forbidden: {tier_path}")
+                destination_tier = destination / tier if destination is not None else None
+                if destination_tier is not None:
+                    destination_tier.mkdir(mode=0o700)
+                for memory_id, id_info in id_entries:
+                    record_path = tier_path / memory_id
+                    if SAFE_ID.fullmatch(memory_id) is None:
+                        fail(f"invalid token-store memory ID directory: {record_path}")
+                    record_fd, opened_record = open_child_directory(
+                        tier_fd, memory_id, id_info, "token-store memory record"
+                    )
+                    try:
+                        members = dict(directory_entries(record_fd))
+                        expected_names = {
+                            "content.memory",
+                            "metadata.memory",
+                            "manifest.sha256",
+                        }
+                        if set(members) != expected_names:
+                            fail(f"memory directory has unexpected members: {record_path}")
+                        opened: dict[str, tuple[int, os.stat_result]] = {}
+                        try:
+                            for name in sorted(expected_names):
+                                opened[name] = open_child_regular(
+                                    record_fd,
+                                    name,
+                                    members[name],
+                                    f"memory member {record_path / name}",
+                                )
+                            manifest_fd, manifest_info = opened["manifest.sha256"]
+                            checksums = parse_open_record_manifest(
+                                manifest_fd, manifest_info, str(record_path / "manifest.sha256")
+                            )
+                            for name in ("content.memory", "metadata.memory"):
+                                member_fd, member_info = opened[name]
+                                actual = sha256_open_regular(
+                                    member_fd, member_info, f"memory blob {record_path / name}"
+                                )
+                                if actual != checksums[name]:
+                                    fail(f"memory checksum mismatch: {record_path / name}")
+                            if destination_tier is not None:
+                                destination_record = destination_tier / memory_id
+                                destination_record.mkdir(mode=0o700)
+                                for name in (
+                                    "content.memory",
+                                    "metadata.memory",
+                                    "manifest.sha256",
+                                ):
+                                    member_fd, member_info = opened[name]
+                                    copy_open_regular(
+                                        member_fd, member_info, destination_record / name
+                                    )
+                            for name, (member_fd, member_info) in opened.items():
+                                visible = os.stat(
+                                    name, dir_fd=record_fd, follow_symlinks=False
+                                )
+                                if not same_file_state(member_info, visible):
+                                    fail(f"memory member changed path: {record_path / name}")
+                        finally:
+                            for member_fd, _ in opened.values():
+                                os.close(member_fd)
+                        visible_record = os.stat(
+                            memory_id, dir_fd=tier_fd, follow_symlinks=False
+                        )
+                        if not same_file_state(opened_record, os.fstat(record_fd)) or not same_file_state(
+                            opened_record, visible_record
+                        ):
+                            fail(f"memory record changed path: {record_path}")
+                    finally:
+                        os.close(record_fd)
+                    records.append((tier, memory_id, record_path))
+                visible_tier = os.stat(tier, dir_fd=root_fd, follow_symlinks=False)
+                if not same_file_state(opened_tier, os.fstat(tier_fd)) or not same_file_state(
+                    opened_tier, visible_tier
+                ):
+                    fail(f"token-store tier changed path: {tier_path}")
+            finally:
+                os.close(tier_fd)
+        if not same_file_state(root_info, os.fstat(root_fd)) or not same_file_state(
+            root_info, root.lstat()
+        ):
+            fail(f"token-store memories directory changed during validation: {root}")
+        return records
+    finally:
+        os.close(root_fd)
+
+
+def memory_records(root: Path) -> list[tuple[str, str, Path]]:
+    return scan_memory_records(root)
+
+
+def validate_catalog(path: Path) -> str:
+    sqlite_quick_check(path)
+    fd, _ = open_regular(path, "token catalog")
+    connection = sqlite3.connect(f"file:/proc/self/fd/{fd}?mode=ro&immutable=1", uri=True)
+    try:
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+        schema = {
+            (str(row[0]), str(row[1]), str(row[2]), None if row[3] is None else str(row[3]))
+            for row in connection.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name"
+            )
+        }
+    finally:
+        connection.close()
+        os.close(fd)
+    if user_version != 0 or application_id != 0:
+        fail(
+            "token catalog has noncanonical SQLite identity pragmas: "
+            f"user_version={user_version}, application_id={application_id}"
+        )
+    tables = {
+        name: sql
+        for object_type, name, table_name, sql in schema
+        if object_type == "table" and not name.startswith("sqlite_") and table_name == name
+    }
+    if set(tables) == CORE_CATALOG_TABLES:
+        catalog_kind = "core5"
+    elif set(tables) == CURRENT_CATALOG_TABLES:
+        catalog_kind = "current7"
+    else:
+        fail(
+            "token catalog table set is neither core5 nor current7: "
+            f"{', '.join(sorted(tables))}"
+        )
+    expected_tables = CORE_CATALOG_TABLES if catalog_kind == "core5" else CURRENT_CATALOG_TABLES
+    for name in expected_tables:
+        actual = tables.get(name)
+        expected = CATALOG_TABLE_SQL[name]
+        if actual != expected:
+            fail(f"token catalog table DDL is noncanonical: {name}")
+    expected_schema = {
+        ("table", name, name, CATALOG_TABLE_SQL[name]) for name in expected_tables
+    } | CATALOG_AUXILIARY_SCHEMA
+    if schema != expected_schema:
+        unexpected = sorted(
+            f"{item[0]}:{item[1]}" for item in schema - expected_schema
+        )
+        missing = sorted(
+            f"{item[0]}:{item[1]}" for item in expected_schema - schema
+        )
+        fail(
+            "token catalog schema objects are noncanonical; "
+            f"unexpected={unexpected}, missing={missing}"
+        )
+    return catalog_kind
+
+
+def validate_store_files(store: Path) -> tuple[int, int]:
+    directory(store, "token store")
+    allowed = {
+        ".lock",
+        ".start.lock",
+        "catalog.sqlite3",
+        "catalog.sqlite3-shm",
+        "catalog.sqlite3-wal",
+        "sqlite-sequence",
+        "tokmem.sock",
+        "memories",
+    }
+    unexpected = sorted(entry.name for entry in os.scandir(store) if entry.name not in allowed)
+    if unexpected:
+        fail(f"token store has unexpected top-level members: {', '.join(unexpected)}")
+    validate_catalog(store / "catalog.sqlite3")
+    sequence = parse_sequence(store / "sqlite-sequence")
+    records = memory_records(store / "memories")
+    maximum = max((int(item[1]) for item in records), default=0)
+    if sequence < maximum:
+        fail(f"token-store sequence {sequence} is below maximum memory ID {maximum}")
+    return len(records), sequence
+
+
+def validate_source_store_root(store: Path) -> None:
+    directory(store, "token store")
+    allowed = {
+        ".lock",
+        ".start.lock",
+        "catalog.sqlite3",
+        "catalog.sqlite3-shm",
+        "catalog.sqlite3-wal",
+        "sqlite-sequence",
+        "tokmem.sock",
+        "memories",
+    }
+    entries = {entry.name: entry for entry in os.scandir(store)}
+    unexpected = sorted(set(entries) - allowed)
+    if unexpected:
+        fail(f"token store has unexpected top-level members: {', '.join(unexpected)}")
+    for name, entry in entries.items():
+        if entry.is_symlink():
+            fail(f"symlink is forbidden in token store: {entry.path}")
+        if name == "memories":
+            if not entry.is_dir(follow_symlinks=False):
+                fail(f"token-store memories is not a directory: {entry.path}")
+        elif name == "tokmem.sock":
+            if not stat.S_ISSOCK(entry.stat(follow_symlinks=False).st_mode):
+                fail(f"token daemon socket path is not a socket: {entry.path}")
+        elif not entry.is_file(follow_symlinks=False):
+            fail(f"unexpected special token-store member: {entry.path}")
+    for required in (".lock", "catalog.sqlite3", "sqlite-sequence", "memories"):
+        if required not in entries:
+            fail(f"token store is missing required member: {required}")
+
+
+def validate_bundled_store_files(store: Path) -> tuple[int, int]:
+    directory(store, "bundled token store")
+    names = {entry.name for entry in os.scandir(store)}
+    expected = {"catalog.sqlite3", "sqlite-sequence", "memories"}
+    if names != expected:
+        fail(
+            "bundled token store has unexpected or missing top-level members: "
+            f"{sorted(names ^ expected)}"
+        )
+    return validate_store_files(store)
+
+
+def close_daemon(store: Path, timeout: float) -> None:
+    socket_path = store / "tokmem.sock"
+    try:
+        info = socket_path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(info.st_mode):
+        fail(f"token daemon socket path is not a socket: {socket_path}")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(str(socket_path))
+        client.sendall(b"TOKMEM/1 CLOSE\n")
+        header = b""
+        while not header.endswith(b"\n") and len(header) < 128:
+            byte = client.recv(1)
+            if not byte:
+                fail("token daemon closed before acknowledging CLOSE")
+            header += byte
+        match = re.fullmatch(rb"(OK|ERR) ([0-9]+)\n", header)
+        if match is None:
+            fail("token daemon returned an invalid CLOSE response")
+        length = int(match.group(2))
+        if length > 1024 * 1024:
+            fail("token daemon CLOSE response is too large")
+        payload = b""
+        while len(payload) < length:
+            chunk = client.recv(length - len(payload))
+            if not chunk:
+                fail("token daemon CLOSE response ended early")
+            payload += chunk
+        if match.group(1) != b"OK":
+            fail(f"token daemon refused CLOSE: {payload.decode('utf-8', 'replace').strip()}")
+    except (ConnectionRefusedError, FileNotFoundError):
+        return
+    finally:
+        client.close()
+
+
+def acquire_store_lock(
+    store: Path,
+    close: bool,
+    timeout: float,
+) -> tuple[int, int, os.stat_result, os.stat_result]:
+    store_fd, store_info = open_directory(store, "token store")
+    fd = os.open(
+        ".lock",
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=store_fd,
+    )
+    lock_info = os.fstat(fd)
+    visible_lock = os.stat(".lock", dir_fd=store_fd, follow_symlinks=False)
+    if not stat.S_ISREG(lock_info.st_mode) or not same_inode(lock_info, visible_lock):
+        os.close(fd)
+        os.close(store_fd)
+        fail(f"token-store lock changed while it was opened: {store / '.lock'}")
+    if close:
+        try:
+            close_daemon(store, timeout)
+        except Exception:
+            os.close(fd)
+            os.close(store_fd)
+            raise
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            visible_store = store.lstat()
+            visible_lock = os.stat(".lock", dir_fd=store_fd, follow_symlinks=False)
+            if not same_inode(store_info, visible_store) or not same_inode(lock_info, visible_lock):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+                os.close(store_fd)
+                fail("token store or its lock inode changed during lock acquisition")
+            return fd, store_fd, store_info, lock_info
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                os.close(store_fd)
+                fail("token store is resident; stop writers or use --close-daemon")
+            time.sleep(0.05)
+
+
+def assert_store_lock_identity(
+    store: Path,
+    store_fd: int,
+    store_info: os.stat_result,
+    lock_fd: int,
+    lock_info: os.stat_result,
+) -> None:
+    if not same_inode(store_info, os.fstat(store_fd)) or not same_inode(
+        store_info, store.lstat()
+    ):
+        fail("token-store directory inode changed during locked snapshot")
+    visible_lock = os.stat(".lock", dir_fd=store_fd, follow_symlinks=False)
+    if not same_inode(lock_info, os.fstat(lock_fd)) or not same_inode(lock_info, visible_lock):
+        fail("token-store lock inode changed during locked snapshot")
+
+
+def copy_memory_tree(source: Path, destination: Path) -> int:
+    return len(scan_memory_records(source, destination))
+
+
+def copy_bundled_store(source: Path, destination: Path) -> None:
+    validate_bundled_store_files(source)
+    destination.mkdir(mode=0o700)
+    copy_regular(source / "catalog.sqlite3", destination / "catalog.sqlite3")
+    copy_regular(source / "sqlite-sequence", destination / "sqlite-sequence")
+    copy_memory_tree(source / "memories", destination / "memories")
+
+
+def build_manifest(bundle: Path) -> bytes:
+    inventory = scan_regular_tree(bundle, collect_hashes=True, sync=False)
+    inventory.pop(MANIFEST_NAME, None)
+    lines = []
+    for relative in sorted(inventory, key=os.fsencode):
+        digest, size = inventory[relative]
+        lines.append(f"{digest}  {size}  {relative}\n")
+    return "".join(lines).encode("ascii")
+
+
+def parse_bundle_manifest(bundle: Path) -> dict[str, tuple[str, int]]:
+    manifest_path = bundle / MANIFEST_NAME
+    try:
+        lines = read_regular_bytes(manifest_path, "bundle manifest").decode("ascii").splitlines(
+            keepends=True
+        )
+    except UnicodeDecodeError as error:
+        fail(f"non-ASCII bundle manifest: {error}")
+    result: dict[str, tuple[str, int]] = {}
+    previous: bytes | None = None
+    for line in lines:
+        match = SHA_LINE.fullmatch(line)
+        if match is None:
+            fail("bundle manifest has invalid syntax")
+        digest, size_text, relative_text = match.groups()
+        relative = Path(relative_text)
+        if relative.is_absolute() or ".." in relative.parts or relative_text == MANIFEST_NAME:
+            fail(f"bundle manifest has unsafe path: {relative_text}")
+        encoded = os.fsencode(relative_text)
+        if previous is not None and encoded <= previous:
+            fail("bundle manifest paths are duplicate or not byte-sorted")
+        previous = encoded
+        result[relative_text] = (digest, int(size_text))
+    return result
+
+
+def verify_bundle(bundle: Path, tokmem: Path | None, deep: bool) -> dict[str, int | str]:
+    bundle_info = directory(bundle, "backup bundle")
+    root_names = {entry.name for entry in os.scandir(bundle)}
+    expected_root = {FORMAT_NAME, MANIFEST_NAME, APPLICATION_NAME, TOKEN_STORE_NAME}
+    if root_names != expected_root:
+        fail(f"bundle root has unexpected or missing members: {sorted(root_names ^ expected_root)}")
+    expected = parse_bundle_manifest(bundle)
+    actual = scan_regular_tree(bundle, collect_hashes=True, sync=False)
+    actual.pop(MANIFEST_NAME, None)
+    if set(expected) != set(actual):
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        fail(f"bundle inventory mismatch; missing={missing}, extra={extra}")
+    for relative, (digest, size) in expected.items():
+        actual_digest, actual_size = actual[relative]
+        if actual_size != size or actual_digest != digest:
+            fail(f"bundle member does not match manifest: {relative}")
+
+    try:
+        format_lines = read_regular_bytes(bundle / FORMAT_NAME, "bundle format").decode(
+            "ascii"
+        ).splitlines()
+    except UnicodeDecodeError as error:
+        fail(f"non-ASCII token-memory bundle FORMAT: {error}")
+    if len(format_lines) != 5 or format_lines[0] != FORMAT_VERSION:
+        fail("unsupported or malformed token-memory bundle format")
+    fields: dict[str, str] = {}
+    for line in format_lines[1:]:
+        key, separator, value = line.partition(" ")
+        if not separator or key in fields:
+            fail("malformed token-memory bundle FORMAT")
+        fields[key] = value
+    if set(fields) != {"created_utc", "records", "sqlite_sequence", "catalog_schema"}:
+        fail("token-memory bundle FORMAT has unexpected fields")
+    try:
+        record_count = int(fields["records"])
+        sequence = int(fields["sqlite_sequence"])
+        dt.datetime.strptime(fields["created_utc"], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        fail(f"token-memory bundle FORMAT has invalid values: {error}")
+
+    sqlite_quick_check(bundle / APPLICATION_NAME)
+    store = bundle / TOKEN_STORE_NAME
+    found_records, found_sequence = validate_bundled_store_files(store)
+    found_catalog_schema = validate_catalog(store / "catalog.sqlite3")
+    if found_records != record_count or found_sequence != sequence:
+        fail("token-memory bundle FORMAT counts disagree with stored state")
+    if fields["catalog_schema"] != found_catalog_schema:
+        fail("token-memory bundle FORMAT catalog schema disagrees with stored state")
+
+    if deep:
+        if tokmem is None:
+            fail("deep verification requires --tokmem")
+        regular_file(tokmem, "tokmem executable")
+        if not os.access(tokmem, os.X_OK):
+            fail(f"tokmem is not executable: {tokmem}")
+        with tempfile.TemporaryDirectory(prefix="navi-token-bundle-verify-") as temporary:
+            copied_store = Path(temporary) / TOKEN_STORE_NAME
+            copy_bundled_store(store, copied_store)
+            result = subprocess.run(
+                [str(tokmem), "verify", str(copied_store)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if result.returncode != 0:
+                message = result.stderr.decode("utf-8", "replace").strip()
+                fail(f"tokmem deep verification failed: {message}")
+
+    if not same_inode(bundle_info, bundle.lstat()):
+        fail("backup bundle directory changed during verification")
+
+    return {
+        "records": record_count,
+        "sqlite_sequence": sequence,
+        "files": len(expected),
+        "manifest_sha256": sha256_file(bundle / MANIFEST_NAME),
+    }
+
+
+def assert_restored_store(bundle: Path, store: Path) -> None:
+    validate_bundled_store_files(store)
+    expected = {
+        relative.removeprefix(f"{TOKEN_STORE_NAME}/"): value
+        for relative, value in parse_bundle_manifest(bundle).items()
+        if relative.startswith(f"{TOKEN_STORE_NAME}/")
+    }
+    actual = scan_regular_tree(store, collect_hashes=True, sync=False)
+    if actual != expected:
+        fail(f"partial restore token store does not exactly match bundle: {store}")
+
+
+def assert_restored_database(bundle: Path, database: Path) -> None:
+    expected = parse_bundle_manifest(bundle)[APPLICATION_NAME]
+    actual = sha256_size(database)
+    if actual != expected:
+        fail(f"partial restore database does not exactly match bundle: {database}")
+    sqlite_quick_check(database)
+
+
+@contextmanager
+def guarded_restored_database(bundle: Path, database: Path, timeout: float):
+    """Authenticate a restored main DB and hold SQLite's exclusive writer guard."""
+    reject_sqlite_sidecars(database)
+    database_fd, database_info = open_regular(database, "restored application database")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:/proc/self/fd/{database_fd}?mode=rw",
+            uri=True,
+            timeout=timeout,
+            isolation_level=None,
+        )
+        connection.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        connection.execute("BEGIN EXCLUSIVE")
+        assert_restored_database(bundle, database)
+        if not same_inode(database_info, database.lstat()):
+            fail("restored application database inode changed under exclusive guard")
+        result = [str(row[0]) for row in connection.execute("PRAGMA quick_check")]
+        if result != ["ok"]:
+            fail(f"SQLite quick_check failed under restore guard: {'; '.join(result)}")
+        yield
+        if not same_inode(database_info, database.lstat()):
+            fail("restored application database inode changed before guard release")
+    finally:
+        if connection is not None:
+            try:
+                connection.rollback()
+            finally:
+                connection.close()
+        os.close(database_fd)
+        reject_sqlite_sidecars(database)
+
+
+def create_bundle(args: argparse.Namespace) -> None:
+    store = absolute_path(args.store)
+    database = absolute_path(args.database)
+    destination = absolute_path(args.destination)
+    tokmem = absolute_path(args.tokmem)
+    directory(store, "token store")
+    regular_file(tokmem, "tokmem executable")
+    if path_present(destination):
+        fail(f"backup destination already exists: {destination}")
+    parent = destination.parent
+    directory(parent, "backup destination parent")
+    staging, staging_info, staging_parent_info = make_owned_stage(
+        parent, f".{destination.name}.stage."
+    )
+    published = False
+    lock_fd: int | None = None
+    store_fd: int | None = None
+    store_info: os.stat_result | None = None
+    lock_info: os.stat_result | None = None
+    database_fd: int | None = None
+    database_info: os.stat_result | None = None
+    database_guard: sqlite3.Connection | None = None
+    try:
+        lock_fd, store_fd, store_info, lock_info = acquire_store_lock(
+            store, args.close_daemon, args.timeout
+        )
+        validate_source_store_root(store)
+
+        database_fd, database_info = open_regular(database, "application database")
+        database_guard = sqlite3.connect(
+            f"file:/proc/self/fd/{database_fd}?mode=rw",
+            uri=True,
+            timeout=args.timeout,
+        )
+        database_guard.execute(f"PRAGMA busy_timeout={int(args.timeout * 1000)}")
+        database_guard.execute("BEGIN IMMEDIATE")
+
+        application_copy = staging / APPLICATION_NAME
+        sqlite_backup(database, application_copy, database_info)
+
+        staged_store = staging / TOKEN_STORE_NAME
+        staged_store.mkdir(mode=0o700)
+        sqlite_backup(store / "catalog.sqlite3", staged_store / "catalog.sqlite3")
+        copy_regular(store / "sqlite-sequence", staged_store / "sqlite-sequence")
+        records = copy_memory_tree(store / "memories", staged_store / "memories")
+        sequence = parse_sequence(staged_store / "sqlite-sequence")
+
+        catalog_schema = validate_catalog(staged_store / "catalog.sqlite3")
+        with tempfile.TemporaryDirectory(prefix="navi-token-bundle-create-verify-") as temporary:
+            verification_store = Path(temporary) / TOKEN_STORE_NAME
+            copy_bundled_store(staged_store, verification_store)
+            result = subprocess.run(
+                [str(tokmem), "verify", str(verification_store)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if result.returncode != 0:
+                message = result.stderr.decode("utf-8", "replace").strip()
+                fail(f"staged token store failed disposable verification: {message}")
+
+        format_payload = (
+            f"{FORMAT_VERSION}\n"
+            f"created_utc {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"records {records}\n"
+            f"sqlite_sequence {sequence}\n"
+            f"catalog_schema {catalog_schema}\n"
+        ).encode("ascii")
+        write_new_file(staging / FORMAT_NAME, format_payload)
+        write_new_file(staging / MANIFEST_NAME, build_manifest(staging))
+        verify_bundle(staging, tokmem, deep=False)
+        assert_store_lock_identity(store, store_fd, store_info, lock_fd, lock_info)
+        if not same_inode(database_info, database.lstat()):
+            fail("application database inode changed during locked snapshot")
+        fsync_tree(staging)
+        rename_noreplace(staging, destination)
+        published = True
+        fsync_directory(parent)
+    finally:
+        if database_guard is not None:
+            try:
+                database_guard.rollback()
+            finally:
+                database_guard.close()
+        if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        if store_fd is not None:
+            os.close(store_fd)
+        if database_fd is not None:
+            os.close(database_fd)
+        if not published:
+            cleanup_owned_stage(staging, staging_info, staging_parent_info)
+
+    verified = verify_bundle(destination, tokmem, deep=args.deep_verify)
+    print(f"bundle={destination}")
+    for key, value in verified.items():
+        print(f"{key}={value}")
+
+
+def verify_command(args: argparse.Namespace) -> None:
+    verified = verify_bundle(
+        absolute_path(args.bundle),
+        absolute_path(args.tokmem) if args.tokmem is not None else None,
+        args.deep,
+    )
+    print(f"bundle={absolute_path(args.bundle)}")
+    for key, value in verified.items():
+        print(f"{key}={value}")
+
+
+def publish_received(args: argparse.Namespace) -> None:
+    incoming = absolute_path(args.incoming)
+    destination = absolute_path(args.destination)
+    tokmem = absolute_path(args.tokmem)
+    if incoming.parent != destination.parent:
+        fail("received staging bundle and destination must be siblings")
+    incoming_info = directory(incoming, "received staging bundle")
+    parent_info = directory(incoming.parent, "received bundle parent")
+    if path_present(destination):
+        fail(f"received bundle destination already exists: {destination}")
+    verified = verify_bundle(incoming, tokmem, deep=True)
+    fsync_tree(incoming)
+    if not same_inode(incoming_info, incoming.lstat()) or not same_inode(
+        parent_info, incoming.parent.lstat()
+    ):
+        fail("received bundle or its parent changed before publication")
+    rename_noreplace(incoming, destination)
+    fsync_directory(destination.parent)
+    verified = verify_bundle(destination, tokmem, deep=True)
+    print(f"bundle={destination}")
+    for key, value in verified.items():
+        print(f"{key}={value}")
+
+
+def restore_new(args: argparse.Namespace) -> None:
+    bundle = absolute_path(args.bundle)
+    database = absolute_path(args.database)
+    store = absolute_path(args.store)
+    tokmem = absolute_path(args.tokmem)
+    verified = verify_bundle(bundle, tokmem, deep=True)
+    directory(database.parent, "restore database parent")
+    directory(store.parent, "restore token-store parent")
+    reject_sqlite_sidecars(database)
+    database_exists = path_present(database)
+    store_exists = path_present(store)
+    if (database_exists or store_exists) and not args.resume_partial:
+        fail("restore destination exists; use --resume-partial only for an exact interrupted new-target restore")
+    if store_exists:
+        directory(store, "partial restore token store")
+        assert_restored_store(bundle, store)
+        fsync_tree(store)
+        fsync_directory(store.parent)
+
+    database_stage_owner: tuple[Path, os.stat_result, os.stat_result] | None = None
+    store_stage_owner: tuple[Path, os.stat_result, os.stat_result] | None = None
+    database_stage: Path | None = None
+    store_stage: Path | None = None
+    database_published = database_exists
+    store_published = store_exists
+    database_published_here = False
+    store_published_here = False
+    guards = ExitStack()
+    try:
+        if database_exists:
+            guards.enter_context(guarded_restored_database(bundle, database, args.timeout))
+            fsync_file(database)
+            fsync_directory(database.parent)
+        if database_exists and store_exists:
+            print(f"database={database}")
+            print(f"store={store}")
+            print("restore=already-complete")
+            return
+
+        if not database_exists:
+            database_stage_owner = make_owned_stage(
+                database.parent, f".{database.name}.restore."
+            )
+            database_stage = database_stage_owner[0] / "database"
+            copy_regular(bundle / APPLICATION_NAME, database_stage)
+            fsync_directory(database.parent)
+        if not store_exists:
+            store_stage_owner = make_owned_stage(store.parent, f".{store.name}.restore.")
+            store_stage = store_stage_owner[0] / "store"
+            copy_bundled_store(bundle / TOKEN_STORE_NAME, store_stage)
+            fsync_tree(store_stage)
+            verify_store_records, verify_sequence = validate_bundled_store_files(store_stage)
+            if verify_store_records != verified["records"] or verify_sequence != verified["sqlite_sequence"]:
+                fail("staged restore disagrees with verified bundle")
+            fsync_directory(store.parent)
+        if not store_exists:
+            assert store_stage is not None
+            rename_noreplace(store_stage, store)
+            store_published = True
+            store_published_here = True
+            fsync_directory(store.parent)
+        if not database_exists:
+            assert database_stage is not None
+            reject_sqlite_sidecars(database)
+            rename_noreplace(database_stage, database)
+            database_published = True
+            database_published_here = True
+            fsync_directory(database.parent)
+            reject_sqlite_sidecars(database)
+            guards.enter_context(guarded_restored_database(bundle, database, args.timeout))
+        assert_restored_store(bundle, store)
+        if not database_published or not store_published:
+            fail("restore publication did not produce both authenticated counterparts")
+    except Exception:
+        guards.close()
+        try:
+            if (
+                database_published_here
+                and path_present(database)
+                and database_stage is not None
+                and not path_present(database_stage)
+            ):
+                rename_noreplace(database, database_stage)
+                database_published = False
+                fsync_directory(database.parent)
+            if (
+                store_published_here
+                and path_present(store)
+                and store_stage is not None
+                and not path_present(store_stage)
+            ):
+                rename_noreplace(store, store_stage)
+                store_published = False
+                fsync_directory(store.parent)
+        except Exception as rollback_error:
+            fail(
+                "restore publication failed and automatic rollback failed; "
+                f"resume only with --resume-partial: {rollback_error}"
+            )
+        raise
+    finally:
+        guards.close()
+        if database_stage_owner is not None:
+            cleanup_owned_stage(*database_stage_owner)
+        if store_stage_owner is not None:
+            cleanup_owned_stage(*store_stage_owner)
+    print(f"database={database}")
+    print(f"store={store}")
+    for key, value in verified.items():
+        print(f"{key}={value}")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        description="Create, verify, and restore no-clobber token-memory backup bundles."
+    )
+    subcommands = root.add_subparsers(dest="command", required=True)
+
+    create = subcommands.add_parser("create", help="create and atomically publish a bundle")
+    create.add_argument("--store", type=Path, required=True)
+    create.add_argument("--database", type=Path, required=True)
+    create.add_argument("--destination", type=Path, required=True)
+    create.add_argument("--tokmem", type=Path, required=True)
+    create.add_argument("--close-daemon", action="store_true")
+    create.add_argument("--timeout", type=float, default=30.0)
+    create.add_argument("--deep-verify", action="store_true")
+    create.set_defaults(function=create_bundle)
+
+    verify = subcommands.add_parser("verify", help="verify inventory, hashes, SQLite, and blobs")
+    verify.add_argument("--bundle", type=Path, required=True)
+    verify.add_argument("--tokmem", type=Path)
+    verify.add_argument("--deep", action="store_true")
+    verify.set_defaults(function=verify_command)
+
+    publish = subcommands.add_parser(
+        "publish-received", help="deep-verify and no-clobber publish a sibling incoming bundle"
+    )
+    publish.add_argument("--incoming", type=Path, required=True)
+    publish.add_argument("--destination", type=Path, required=True)
+    publish.add_argument("--tokmem", type=Path, required=True)
+    publish.set_defaults(function=publish_received)
+
+    restore = subcommands.add_parser("restore-new", help="restore only to absent destinations")
+    restore.add_argument("--bundle", type=Path, required=True)
+    restore.add_argument("--database", type=Path, required=True)
+    restore.add_argument("--store", type=Path, required=True)
+    restore.add_argument("--tokmem", type=Path, required=True)
+    restore.add_argument("--resume-partial", action="store_true")
+    restore.add_argument("--timeout", type=float, default=30.0)
+    restore.set_defaults(function=restore_new)
+    return root
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    if getattr(arguments, "timeout", 1.0) <= 0:
+        fail("--timeout must be positive")
+    arguments.function(arguments)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (BundleError, OSError, sqlite3.Error) as error:
+        print(f"token-memory-bundle: {error}", file=sys.stderr)
+        raise SystemExit(1)

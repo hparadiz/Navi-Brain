@@ -6,14 +6,7 @@ namespace NaviBrain\Core;
 
 use Throwable;
 
-/**
- * Drives bounded work items through the local llama.cpp server.
- *
- * This is the brain's baseline cognition: it has no rate limit, no network
- * dependency, and no external account, so the thread machinery keeps advancing
- * when the free-model pool is throttled or offline. Remote free models remain
- * an optional upgrade rather than a requirement for staying alive.
- */
+/** Manual ablation worker for the former local llama.cpp cognition lane. */
 final class LocalModelWorker
 {
     public const MODEL_ID = 'local/gemma-3-4b-it-qat-Q4_0';
@@ -62,7 +55,18 @@ final class LocalModelWorker
             return ['status' => 'local_model_unavailable', 'endpoint' => $this->client->endpoint()];
         }
 
-        $claimed = $this->core->claimWork($owner, self::WORK_LEASE_SECONDS);
+        // The current local endpoint has a 4096-token slot. Full uncapped
+        // narrative compiles are intentionally routed to the larger-context
+        // background pool instead of being silently truncated to fit it.
+        $claimed = $this->core->claimWork(
+            $owner,
+            self::WORK_LEASE_SECONDS,
+            [
+                NarrativeSynthesis::PERSONALITY_WORK_TYPE,
+                NarrativeSynthesis::MOTIVATION_WORK_TYPE,
+                NarrativeSynthesis::INTENTION_WORK_TYPE,
+            ]
+        );
         if ($claimed === null) {
             return ['status' => 'idle'];
         }
@@ -74,7 +78,7 @@ final class LocalModelWorker
         try {
             $invocation = $this->client->complete(
                 (string) $work['prompt'],
-                $this->proposalSchema($work),
+                self::proposalSchema($work),
                 $maxTokens,
                 $wall
             );
@@ -159,7 +163,7 @@ final class LocalModelWorker
      * @param array<string, mixed> $work
      * @return array<string, mixed>
      */
-    private function proposalSchema(array $work): array
+    public static function proposalSchema(array $work): array
     {
         $refs = is_array($work['input_refs'] ?? null) ? $work['input_refs'] : [];
         $kind = ['type' => 'string', 'minLength' => 1, 'maxLength' => 96];
@@ -171,6 +175,50 @@ final class LocalModelWorker
             $kind['enum'] = ['self_presence_utterance'];
         } elseif (($work['work_type'] ?? null) === ExecutiveCore::SELF_PRESENCE_SPEECH_WORK_TYPE) {
             $kind['enum'] = ['self_presence_utterance', 'remain_silent'];
+        } elseif (($work['work_type'] ?? null) === ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE) {
+            $kind['enum'] = [ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE];
+        } elseif (NarrativeSynthesis::isWorkType((string) ($work['work_type'] ?? ''))) {
+            $kind['enum'] = [NarrativeSynthesis::expectedKind((string) $work['work_type'])];
+        }
+
+        if (($work['work_type'] ?? null) === ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE) {
+            return [
+                'type' => 'object',
+                'properties' => [
+                    'kind' => $kind,
+                    'content' => ['type' => 'string'],
+                    'confidence' => ['type' => 'number', 'minimum' => 0, 'maximum' => 1],
+                    'challenged_assumption' => ['type' => 'string', 'minLength' => 1],
+                    'supported_episode_ids' => [
+                        'type' => 'array',
+                        'items' => ['type' => 'integer', 'minimum' => 1],
+                        'uniqueItems' => true,
+                    ],
+                    'rejected_episode_ids' => [
+                        'type' => 'array',
+                        'items' => ['type' => 'integer', 'minimum' => 1],
+                        'uniqueItems' => true,
+                    ],
+                    'rejection_reason' => ['type' => 'string', 'minLength' => 1],
+                    'supersedes_memory_id' => [
+                        'anyOf' => [
+                            ['type' => 'integer', 'minimum' => 1],
+                            ['type' => 'null'],
+                        ],
+                    ],
+                ],
+                'required' => [
+                    'kind',
+                    'content',
+                    'confidence',
+                    'challenged_assumption',
+                    'supported_episode_ids',
+                    'rejected_episode_ids',
+                    'rejection_reason',
+                    'supersedes_memory_id',
+                ],
+                'additionalProperties' => false,
+            ];
         }
 
         return [

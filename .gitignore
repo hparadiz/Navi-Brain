@@ -11,6 +11,12 @@
 /var/*.pid
 /var/navi-transcript.json
 /var/navi-thread.json
+/var/session-memory/
+/var/token-memory-backups/
+/var/codex-spark-worker/
+/var/supervisor-health.json
+/var/supervisor.lock
+/.claude/settings.local.json
 /.phpunit.cache/
 /assets/papers/*.pdf
 /var/mind-stream.jsonl

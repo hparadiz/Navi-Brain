@@ -12,6 +12,10 @@ final class SelfModelFact extends ActiveRecord
 {
     use Getters;
 
+    private const MODEL_CONTEXT_PRIVATE_PREFIXES = [
+        'appearance.',
+    ];
+
     public static $tableName = 'self_model_facts';
     public static $primaryKey = 'id';
 
@@ -21,6 +25,16 @@ final class SelfModelFact extends ActiveRecord
             'unique' => true,
         ],
     ];
+
+    public static function isModelContextVisible(string $factKey): bool
+    {
+        foreach (self::MODEL_CONTEXT_PRIVATE_PREFIXES as $prefix) {
+            if (str_starts_with($factKey, $prefix)) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     #[Column(type: 'integer', primary: true, autoincrement: true, unsigned: true)]
     protected ?int $id = null;

@@ -418,6 +418,11 @@ final class SensoryCortex
             ttlSeconds: 900
         );
 
+        // Fresh evidence may make a stalled private thought useful again. The
+        // wake is harmless while work is already in flight and otherwise cuts
+        // short only the repetition backoff, not any safety boundary.
+        $this->core->wakeThreadNow('mind_stream');
+
         // Most edges can wait to be found when percepts are next read. A few
         // stop being what they are if they arrive late: an answer to something
         // said out loud is only an answer while the person is still standing

@@ -37,6 +37,14 @@ final class ProcedureRun extends ActiveRecord
     #[Column(type: 'integer', unsigned: true)]
     protected int $procedure_id;
 
+    /** Immutable token-memory generation that authorized this run. */
+    #[Column(type: 'integer', notnull: false, unsigned: true)]
+    protected ?int $procedure_memory_id = null;
+
+    /** Caller-stable invocation identity; null only for pre-v20 runs. */
+    #[Column(type: 'string', length: 64, notnull: false)]
+    protected ?string $operation_key = null;
+
     #[Column(type: 'integer', unsigned: true)]
     protected int $intention_id;
 

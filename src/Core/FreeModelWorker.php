@@ -6,6 +6,7 @@ namespace NaviBrain\Core;
 
 use JsonException;
 use NaviBrain\Perception\SocialFeedback;
+use NaviBrain\Support\PlainText;
 use RuntimeException;
 
 final class FreeModelWorker
@@ -13,7 +14,10 @@ final class FreeModelWorker
     private const MAX_OUTPUT_BYTES = 1048576;
     private const MODEL_REFRESH_SECONDS = 3600;
     private const MAX_MODELS_PER_WORK = 3;
-    private const WORK_LEASE_SECONDS = 360;
+    // One full-evidence narrative may legitimately use the entire 900-second
+    // work budget across model fallbacks. Keep its fence alive through that
+    // window instead of requeueing it underneath the still-running worker.
+    private const WORK_LEASE_SECONDS = 1200;
 
     private string $projectRoot;
     private string $runtimeRoot;
@@ -31,7 +35,7 @@ final class FreeModelWorker
     }
 
     /** @return array<string, mixed> */
-    public function runOnce(string $owner): array
+    public function runOnce(string $owner, array $includedWorkTypes = []): array
     {
         $this->ensureRuntimeDirectories();
         try {
@@ -42,7 +46,12 @@ final class FreeModelWorker
         if ($this->core->selectableFreeModels() === []) {
             return ['status' => 'model_pool_unavailable'];
         }
-        $claimed = $this->core->claimWork($owner, self::WORK_LEASE_SECONDS);
+        $claimed = $this->core->claimWork(
+            $owner,
+            self::WORK_LEASE_SECONDS,
+            [],
+            $includedWorkTypes
+        );
         if ($claimed === null) {
             return ['status' => 'idle'];
         }
@@ -62,8 +71,8 @@ final class FreeModelWorker
             try {
                 $invocation = $this->invokeModel($work, $modelId, $attemptWall);
                 $latency = (int) round((hrtime(true) - $started) / 1_000_000);
-                $this->core->recordModelResult($modelId, true, $latency);
-                $finished = $this->core->finishWork(
+                $this->recordModelResultBestEffort($modelId, true, $latency);
+                $finished = $this->finishWorkWithRetry(
                     workId: (int) $work['id'],
                     owner: $owner,
                     fencingToken: (int) $work['fencing_token'],
@@ -96,17 +105,19 @@ final class FreeModelWorker
             } catch (\Throwable $throwable) {
                 $latency = (int) round((hrtime(true) - $started) / 1_000_000);
                 $errors[$modelId] = $throwable->getMessage();
-                $this->core->recordModelResult($modelId, false, $latency, $throwable->getMessage());
+                $this->recordModelResultBestEffort(
+                    $modelId,
+                    false,
+                    $latency,
+                    $throwable->getMessage()
+                );
             }
         }
 
         $message = $errors === []
             ? 'No discovered free model was outside its circuit-breaker cooldown.'
-            : 'Every selectable free model failed: ' . json_encode(
-                $errors,
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-            );
-        $failed = $this->core->finishWork(
+            : 'Every selectable free model failed: ' . PlainText::inline($errors, 3000);
+        $failed = $this->finishWorkWithRetry(
             workId: (int) $work['id'],
             owner: $owner,
             fencingToken: (int) $work['fencing_token'],
@@ -122,6 +133,51 @@ final class FreeModelWorker
             'result' => $failed,
             'integration' => $integration,
         ];
+    }
+
+    /** @return array<string, mixed> */
+    private function finishWorkWithRetry(
+        int $workId,
+        string $owner,
+        int $fencingToken,
+        bool $succeeded,
+        array $result,
+        ?string $model,
+        ?string $error = null
+    ): array {
+        for ($attempt = 0; ; $attempt++) {
+            try {
+                return $this->core->finishWork(
+                    workId: $workId,
+                    owner: $owner,
+                    fencingToken: $fencingToken,
+                    succeeded: $succeeded,
+                    result: $result,
+                    model: $model,
+                    error: $error
+                );
+            } catch (\Throwable $throwable) {
+                if ($attempt >= 3
+                    || !str_contains(strtolower($throwable->getMessage()), 'database is locked')
+                ) {
+                    throw $throwable;
+                }
+                usleep(250000 * ($attempt + 1));
+            }
+        }
+    }
+
+    private function recordModelResultBestEffort(
+        string $modelId,
+        bool $succeeded,
+        int $latencyMs,
+        ?string $error = null
+    ): void {
+        try {
+            $this->core->recordModelResult($modelId, $succeeded, $latencyMs, $error);
+        } catch (\Throwable) {
+            // Telemetry must never strand fenced work after inference returns.
+        }
     }
 
     /** @return list<string> */
@@ -169,10 +225,9 @@ final class FreeModelWorker
      */
     private function invokeModel(array $work, string $modelId, int $wall): array
     {
-        $prompt = (string) $work['prompt'] . "\n\nRequired JSON schema:\n" . json_encode(
-            $this->workerSchema((string) $work['work_type']),
-            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
-        );
+        $prompt = PlainText::sanitize((string) $work['prompt'])
+            . "\n\nRequired response fields:\n"
+            . PlainText::render($this->workerSchema((string) $work['work_type']), 5000, 20);
         $wall = max(1, min(3600, $wall));
         $title = sprintf('navi:%s:%d', $work['work_type'], $work['id']);
         $result = $this->runProcess([
@@ -201,7 +256,7 @@ final class FreeModelWorker
                 trim($result['output'])
             ));
         }
-        return $this->parseWorkerStream($result['output']);
+        return $this->parseWorkerStream($result['output'], (string) $work['work_type']);
     }
 
     /** @return array<string, string> */
@@ -255,6 +310,26 @@ final class FreeModelWorker
                 'challenged_assumption' => 'whether speaking or silence is better at this wake',
             ];
         }
+        if ($workType === ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE) {
+            return [
+                'kind' => 'memory_consolidation',
+                'content' => 'the grounded durable claim itself, or an empty string when rejecting the whole batch',
+                'confidence' => 'number from 0 through 1 for the grounded claim, or 0 when rejecting the whole batch',
+                'challenged_assumption' => 'the existing belief or proposed generalization tested by this replay',
+                'supported_episode_ids' => 'JSON array of fresh episode integer IDs that directly support content',
+                'rejected_episode_ids' => 'JSON array of every other fresh episode integer ID',
+                'rejection_reason' => 'why rejected IDs do not support a durable claim, or none',
+                'supersedes_memory_id' => 'one offered semantic-memory integer ID, or null',
+            ];
+        }
+        if (NarrativeSynthesis::isWorkType($workType)) {
+            return [
+                'kind' => (string) NarrativeSynthesis::expectedKind($workType),
+                'content' => 'the complete first-person plain-language narrative requested by the prompt',
+                'confidence' => 'number from 0 through 1 for fidelity to the complete supplied evidence',
+                'challenged_assumption' => 'one short assumption that most threatens a faithful synthesis',
+            ];
+        }
         return [
             'kind' => 'short_snake_case_string',
             'content' => 'one bounded unverified thought or repair proposal',
@@ -264,7 +339,7 @@ final class FreeModelWorker
     }
 
     /** @return array{proposal: array<string, mixed>, session_id?: string} */
-    private function parseWorkerStream(string $output): array
+    private function parseWorkerStream(string $output, string $workType): array
     {
         $sessionId = null;
         $finalText = null;
@@ -302,11 +377,7 @@ final class FreeModelWorker
         if (!$stopped || $finalText === null) {
             throw new RuntimeException('OpenCode worker stream ended without a stopped final text event.');
         }
-        try {
-            $proposal = json_decode(trim($finalText), true, flags: JSON_THROW_ON_ERROR);
-        } catch (JsonException $exception) {
-            throw new RuntimeException('Worker final text was not exact JSON.', 0, $exception);
-        }
+        $proposal = $this->decodeWorkerProposal($finalText, $workType);
         if (!is_array($proposal)) {
             throw new RuntimeException('Worker proposal must be a JSON object.');
         }
@@ -315,6 +386,91 @@ final class FreeModelWorker
             $result['session_id'] = $sessionId;
         }
         return $result;
+    }
+
+    /** @return array<string, mixed> */
+    private function decodeWorkerProposal(string $finalText, string $workType): array
+    {
+        $trimmed = trim($finalText);
+        try {
+            $proposal = json_decode($trimmed, true, flags: JSON_THROW_ON_ERROR);
+            if (is_array($proposal)) {
+                return $proposal;
+            }
+        } catch (JsonException $exception) {
+            if (!NarrativeSynthesis::isWorkType($workType)) {
+                throw new RuntimeException('Worker final text was not exact JSON.', 0, $exception);
+            }
+        }
+
+        // Narrative models commonly wrap an otherwise valid transport object
+        // in a code fence or one sentence of chatter. Unwrap that only for
+        // this derived-output lane; every action-bearing worker stays exact.
+        $candidates = [];
+        if (preg_match('/```(?:json)?\s*(\{.*\})\s*```/isu', $trimmed, $match) === 1) {
+            $candidates[] = $match[1];
+        }
+        $firstBrace = strpos($trimmed, '{');
+        $lastBrace = strrpos($trimmed, '}');
+        if ($firstBrace !== false && $lastBrace !== false && $lastBrace > $firstBrace) {
+            $candidates[] = substr($trimmed, $firstBrace, $lastBrace - $firstBrace + 1);
+        }
+        foreach (array_unique($candidates) as $candidate) {
+            try {
+                $proposal = json_decode($candidate, true, flags: JSON_THROW_ON_ERROR);
+            } catch (JsonException) {
+                continue;
+            }
+            if (is_array($proposal)) {
+                return $proposal;
+            }
+        }
+
+        if (str_starts_with($trimmed, '{') || str_starts_with($trimmed, '[')) {
+            throw new RuntimeException('Narrative worker returned malformed structured output.');
+        }
+
+        $content = trim((string) preg_replace('/^```(?:text|markdown)?\s*|\s*```$/iu', '', $trimmed));
+        if ($content === '') {
+            throw new RuntimeException('Narrative worker returned no prose.');
+        }
+        $kind = (string) NarrativeSynthesis::expectedKind($workType);
+        $confidence = 0.5;
+        $challengedAssumption = 'Some ranked evidence may be transient, repetitive, or contradictory.';
+        $lines = preg_split('/\R/u', $content) ?: [];
+        while ($lines !== []) {
+            $line = trim((string) end($lines));
+            if ($line === '') {
+                array_pop($lines);
+                continue;
+            }
+            if (preg_match('/^kind\s*:\s*(.+)$/iu', $line, $match) === 1) {
+                $kind = trim($match[1]);
+                array_pop($lines);
+                continue;
+            }
+            if (preg_match('/^confidence\s*:\s*(0(?:\.\d+)?|1(?:\.0+)?)$/iu', $line, $match) === 1) {
+                $confidence = (float) $match[1];
+                array_pop($lines);
+                continue;
+            }
+            if (preg_match('/^challenged[ _-]assumption\s*:\s*(.+)$/iu', $line, $match) === 1) {
+                $challengedAssumption = trim($match[1]);
+                array_pop($lines);
+                continue;
+            }
+            break;
+        }
+        $content = trim(implode("\n", $lines));
+        if ($content === '') {
+            throw new RuntimeException('Narrative worker returned metadata without prose.');
+        }
+        return [
+            'kind' => $kind,
+            'content' => $content,
+            'confidence' => $confidence,
+            'challenged_assumption' => $challengedAssumption,
+        ];
     }
 
     private function deleteSession(string $sessionId): void

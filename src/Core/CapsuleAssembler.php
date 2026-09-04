@@ -320,8 +320,10 @@ final class CapsuleAssembler
             $candidates['self_model'] = [];
             foreach (SelfModelFact::getAll([
                 'order' => ['updated_at' => 'DESC'],
-                'limit' => self::CANDIDATES_PER_TYPE,
             ]) as $fact) {
+                if (!SelfModelFact::isModelContextVisible((string) $fact->fact_key)) {
+                    continue;
+                }
                 $candidates['self_model'][] = [
                     'record_type' => 'self_model',
                     'record_id' => (int) $fact->id,
@@ -329,6 +331,9 @@ final class CapsuleAssembler
                     'confidence' => (float) $fact->confidence,
                     'recorded_at' => $fact->updated_at,
                 ];
+                if (count($candidates['self_model']) >= self::CANDIDATES_PER_TYPE) {
+                    break;
+                }
             }
         }
 

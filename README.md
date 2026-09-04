@@ -1,8 +1,15 @@
 # Navi-Brain
 
 `navi-brain` is an experimental persistence and self-regulation layer for a
-language-model agent, built with PHP, the local Divergence v3 framework, and
-SQLite.
+language-model agent, built with PHP, the local Divergence v3 framework, SQLite
+for executive/control state, and a resident token-native store for Memory.
+
+Memory content and positional metadata live as checksum-manifested binary
+`.memory` token streams, partitioned by tier. The daemon holds the complete token
+translation/hash state and three counters per token in RAM, persists learned
+changes lazily, and flushes dirty state on close. The protocol and migration
+boundary are documented in [`memories/README.md`](memories/README.md) and
+[`memories/ARCHITECTURE.md`](memories/ARCHITECTURE.md).
 
 The project is informed by the literature in the
 [paper manifest](assets/papers/MANIFEST.md)
@@ -125,6 +132,8 @@ composer install
   --repair="No repair required"
 
 ./bin/navi-brain memory:search --query=schema
+./bin/navi-brain memory:consolidation:status
+./bin/navi-brain memory:consolidation:pump --depth=2
 ./bin/navi-brain checkpoint --reason=context-pressure
 ./bin/navi-brain need:list
 ./bin/navi-brain mind:tick
@@ -145,8 +154,8 @@ composer install
 make desktop-awareness
 ```
 
-Commands return JSON so another agent loop can consume them without scraping
-human-formatted terminal output.
+Commands return bounded plain text by default. Add `--debug-json` only when a
+script or serialization diagnosis needs the raw machine representation.
 
 ## Codex integration
 
@@ -154,7 +163,7 @@ The repository is also a Codex plugin source. Its newline-delimited stdio MCP
 server exposes a deliberately small first tool surface:
 
 - `brain_status`
-- `brain_recall`
+- `remember_navi`
 - `brain_self_model`
 - `brain_remember_self`
 - `brain_checkpoint`
@@ -216,26 +225,37 @@ generation never runs on this latency-critical loop. The durable rhythm
 intervals are:
 
 - `pulse_30s`: deterministic integrity, need accrual, and stale-lease repair;
+- `intentions_10m`: queue an intention-only prose synthesis of every open
+  canonical commitment, including authority, dependencies, and observed
+  progress, without importing affect, needs, senses, or working memory;
 - `decide_1m`: one complete executive decision cycle for the held intention;
 - `reflect_5m`: boredom/curiosity-gated daydream plus optional worker proposal;
 - `consolidate_hourly`: checkpointed sleep repair plus one assumption challenge;
-- `sleep_daily`: verified SQLite backup, sleep repair, and one cognitive audit.
+- `sleep_daily`: verified SQLite + token-memory bundle backup, sleep repair, and one cognitive audit.
 
 Only one high-brain cycle may run at once. Missed intervals are coalesced, not
 replayed. Cycle and work leases use monotonically increasing fencing tokens so
 late workers cannot commit after losing ownership.
 
-The worker periodically discovers current `opencode/*-free` models, ranks them
+All model-backed background cognition runs through `gpt-5.3-codex-spark` using
+the existing ChatGPT-authenticated Codex CLI. Calls are ephemeral, read-only,
+tool- and web-disabled, schema-constrained, and have no local or OpenCode model
+fallback. Every queued job carries a bounded, checksummed projection of current
+sensory evidence, ranked motivation, active need pressure, and computed emotional
+appraisal. Memory consolidation deliberately excludes that live projection so
+unrelated state cannot leak into a factual claim.
+
+The legacy manual `opencode:once` worker can still discover current
+`opencode/*-free` models and rank them
 by failures and observed latency, and applies exponential circuit-breaker
 cooldowns. A whole work item has one deadline and may try at most three models;
 failover does not multiply the budget. The isolated OpenCode configuration is in
 `config/opencode-worker/` and disables every tool.
 
-## Baseline local model
+## Optional local model
 
-Remote free models rate-limit, disappear from the catalogue, and fail schema
-validation. They are therefore an optional upgrade, not the thing that keeps the
-brain running. The baseline is a CPU-only llama.cpp server on loopback:
+The former CPU-only llama.cpp baseline remains available for manual comparison
+and ablation. Persistent background workers no longer start or call it:
 
 ```sh
 make local-model          # run in the foreground with production ceilings
@@ -258,9 +278,7 @@ The ceilings matter more than the speed:
 - `--no-repack` gives up roughly half the speed to save 1.7 GiB resident. Set
   `LOCAL_MODEL_REPACK=1` to trade back.
 - Four threads per request, two 4096-token slots, `nice 10`, `ionice idle`.
-  Two dedicated model workers can advance independent queued items while the
-  scheduler remains free to notice speech. Addressed-speech work has queue
-  priority over background inference.
+  Addressed-speech work still has queue priority in the durable work ledger.
 - Prompt-cache RAM is capped at 512 MiB with two checkpoints per slot. The
   upstream 8 GiB default grows rapidly under varied cognitive prompts and can
   otherwise consume the service's entire memory cgroup while the model is
@@ -269,27 +287,21 @@ The ceilings matter more than the speed:
   `pids.max 128`, and six CPUs. If the model ever exceeds them the kernel kills
   that service alone and the brain degrades rather than the workstation.
 
-Each model worker probes the local endpoint before claiming work, so a work item
-is never leased to a worker that already knows it cannot run it. If the endpoint
-is down the remote free pool is tried instead; if both are unavailable the work
-stays queued and the thread sleeps honestly.
-
 Two OpenRC services run `bin/navi-brain-model-worker`. They use the same leases,
-fencing checks, local endpoint, and deny-all remote fallback. Reflective social
-labels are queued to these workers; the
+fencing checks, Codex Spark endpoint, and deny-all structured-output contract.
+Reflective social labels are queued to these workers; the
 sensory daemon never calls an LLM and therefore keeps sampling while both model
 slots are busy.
 
 Addressed speech uses a separate `self_presence_answer` fast lane. Each accepted
 transcript chunk survives the ambient refractory window, the speech thread is
-re-due and ordered before background threads, and the reply carries only the
-captured turn plus fixed voice policy (36 spoken words, 160 decode tokens). The
-full reflective workspace remains available to background self-presence without
-making a direct answer reread it first.
+re-due and ordered before background threads, and the reply carries the captured
+turn, fixed voice policy (36 spoken words, 160 decode tokens), and the same bounded
+live-state projection without loading the full reflective workspace.
 
-Local output is constrained by a JSON schema at decode time, and `kind` is
-pinned to the exact operation the executive asked for. A malformed envelope
-cannot reach the curator at all, which the remote pool cannot promise.
+Codex Spark output is constrained by a JSON schema, and `kind` is pinned to the
+exact operation the executive asked for. A malformed envelope cannot reach the
+curator.
 
 An OpenRC service template lives at `packaging/openrc/navi-brain-heartbeat`.
 Installation is intentionally separate from repository setup so activating
@@ -309,14 +321,21 @@ open a bounded micro-wake, but never grants external action.
 
 Sleep performs SQLite integrity checks, expires only explicitly expired working
 memory, surfaces discrepancies as repair proposals, and may produce a
-provenance-marked daydream. Checkpoints are audit snapshots, not automatic
-restore images. Daily `VACUUM INTO` backups are separate verified SQLite files.
+provenance-marked daydream. Checkpoints are persistence barriers, not automatic
+restore images: they flush the resident token graph and record only a lightweight
+SQLite marker. Canonical executive rows are already durable and are not copied
+into that marker. Daily backups are
+atomic `NAVITOKBACKUP1` directories containing
+the application SQLite snapshot and the complete verified token store; a
+SQLite-only file is not treated as a memory backup. See
+[`docs/token-memory-cutover.md`](docs/token-memory-cutover.md) for restore,
+replication, and legacy-write fencing.
 
 ## Remaining boundaries
 
 - Retrieval is ranked lexical search, not embeddings.
-- The live heartbeat is still a single PHP process; the planned Rust continuity
-  supervisor and verified host-init recovery path are not implemented.
+- The heartbeat domain loop is still one PHP process supervised by Rust; remote
+  witness restore and split-brain recovery remain unimplemented.
 - The terminal decision action space is intentionally only sourced semantic
   learning plus observe-only machine grounding. Dialogue and broader digital
   environments need separately reviewed adapters.

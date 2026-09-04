@@ -1,0 +1,42 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "php /home/akujin/Sources/Navi-Brain/bin/claude_turn_memory.php --session-start",
+            "timeout": 5,
+            "statusMessage": "Loading Navi continuity"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "php /home/akujin/Sources/Navi-Brain/bin/claude_turn_memory.php --stop",
+            "timeout": 10,
+            "async": true,
+            "statusMessage": "Recording Navi continuity"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "php /home/akujin/Sources/Navi-Brain/bin/claude_turn_memory.php --session-end",
+            "timeout": 5,
+            "statusMessage": "Finalizing Navi continuity"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
-use JsonException;
+use NaviBrain\Support\PlainText;
 
 /**
  * Builds a prompt out of what Navi's executive functions currently report.
@@ -60,9 +60,6 @@ final class ExecutiveComposition
         );
     }
 
-    /**
-     * @throws JsonException
-     */
     public function prompt(): string
     {
         $lines = [$this->situation, ''];
@@ -87,14 +84,11 @@ final class ExecutiveComposition
                 '%s holds: %s',
                 ucfirst(str_replace('_', ' ', $faculty['function'])),
                 is_string($faculty['holds'])
-                    ? $faculty['holds']
-                    : json_encode(
-                        $faculty['holds'],
-                        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-                    )
+                    ? PlainText::sanitize($faculty['holds'])
+                    : PlainText::render($faculty['holds'], 12000, 20)
             );
         }
 
-        return implode("\n", $lines);
+        return PlainText::sanitize(implode("\n", $lines));
     }
 }

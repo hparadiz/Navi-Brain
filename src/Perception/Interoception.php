@@ -4,13 +4,12 @@ declare(strict_types=1);
 
 namespace NaviBrain\Perception;
 
+use NaviBrain\Core\CodexSparkWorker;
 use NaviBrain\Core\ExecutiveCore;
-use NaviBrain\Core\LocalModelClient;
 use NaviBrain\Model\CognitiveThread;
 use NaviBrain\Model\SenseEvent;
 use NaviBrain\Model\ThreadStep;
 use NaviBrain\Model\WorkItem;
-use Throwable;
 
 /**
  * The two senses Navi has of herself rather than of the room.
@@ -55,10 +54,13 @@ final class Interoception
         }
 
         $modelHealthy = false;
-        try {
-            $modelHealthy = (new LocalModelClient())->isHealthy();
-        } catch (Throwable) {
-            $modelHealthy = false;
+        foreach ($this->core->listModelEndpoints() as $endpoint) {
+            if (($endpoint['model_id'] ?? null) !== CodexSparkWorker::MODEL_ID) {
+                continue;
+            }
+            $modelHealthy = ($endpoint['status'] ?? null) === 'available'
+                && (int) ($endpoint['consecutive_failures'] ?? 0) === 0;
+            break;
         }
 
         $dbPath = getenv('NAVI_BRAIN_DB') ?: $root . '/var/navi-brain.sqlite';
@@ -96,7 +98,7 @@ final class Interoception
             'heartbeat_silent_seconds' => $supervisorAge,
             'heartbeat_restarts' => $restarts,
             'heartbeat_consecutive_failures' => $consecutiveFailures,
-            'local_model_healthy' => $modelHealthy,
+            'spark_model_healthy' => $modelHealthy,
             'store_megabytes' => (int) round($dbBytes / 1048576),
             'worker_failure_rate' => $recentTotal === 0
                 ? 0.0

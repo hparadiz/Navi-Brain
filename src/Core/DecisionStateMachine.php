@@ -12,6 +12,7 @@ use NaviBrain\Model\DecisionCycle;
 use NaviBrain\Model\Intention;
 use NaviBrain\Model\Memory;
 use NaviBrain\Model\WorkItem;
+use NaviBrain\Support\PlainText;
 use RuntimeException;
 use Throwable;
 
@@ -152,16 +153,18 @@ final class DecisionStateMachine
             ? $retrievalAction['dispatch']['observed']
             : [];
         $retrieved = [];
-        foreach ((array) ($retrievalObserved['memory_ids'] ?? []) as $memoryId) {
-            $memory = Memory::getByID((int) $memoryId);
-            if (!$memory instanceof Memory || $memory->status !== 'active' || $memory->tier === 'working') {
+        foreach ((array) ($retrievalObserved['memories'] ?? []) as $memory) {
+            if (!is_array($memory)
+                || ($memory['status'] ?? null) !== 'active'
+                || ($memory['tier'] ?? null) === 'working'
+            ) {
                 continue;
             }
             $retrieved[] = [
-                'id' => (int) $memory->id,
-                'tier' => (string) $memory->tier,
-                'content' => mb_substr((string) $memory->content, 0, 320),
-                'confidence' => (float) $memory->confidence,
+                'id' => (int) ($memory['id'] ?? 0),
+                'tier' => (string) ($memory['tier'] ?? ''),
+                'content' => mb_substr((string) ($memory['content'] ?? ''), 0, 320),
+                'confidence' => (float) ($memory['confidence'] ?? 0.0),
             ];
         }
         $retrieval = [
@@ -198,15 +201,15 @@ final class DecisionStateMachine
             'Use only an installed action_kind below. arguments must match that adapter exactly.',
             'Retrieval and reasoning have already happened inside planning. Propose only a terminal grounding or learning action.',
             'Do not execute anything. Deterministic code evaluates and dispatches after you return.',
-            'Intention: ' . $this->encode([
+            "Intention:\n" . PlainText::render([
                 'title' => (string) $intention->title,
                 'next_action' => (string) $intention->next_action,
                 'success_condition' => (string) $intention->success_condition,
-            ]),
-            'Trigger: ' . $trigger,
-            'Observations: ' . $this->encode($observations),
-            'Retrieved memory: ' . $this->encode($retrieval['memories']),
-            'Installed adapters: ' . $this->encode($adapters),
+            ], 3000, 8),
+            'Trigger: ' . PlainText::sanitize($trigger),
+            "Observations:\n" . PlainText::render($observations, 4000, 12),
+            "Retrieved memory:\n" . PlainText::render($retrieval['memories'], 5000, 8),
+            "Installed adapters:\n" . PlainText::render($adapters, 6000, 20),
         ]);
         $queued = $this->core->enqueueWork(
             parentRunId: $parentRunId,
@@ -396,6 +399,7 @@ final class DecisionStateMachine
                     ?? ($sourceWasRetrieved ? null : 'Learning source was not retrieved during this planning cycle.'),
                 'effect_ceiling' => $effect,
                 'recalled_procedure_id' => $inspection['procedure']['procedure_id'] ?? null,
+                'recalled_procedure_memory_id' => $inspection['procedure']['memory_id'] ?? null,
                 'grounding_score' => round($grounding, 4),
                 'forward_simulation' => $simulation,
             ];
@@ -445,6 +449,7 @@ final class DecisionStateMachine
             'action_kind' => (string) $selected->action_kind,
             'score' => (float) $selected->score,
             'procedure_id' => $inspection['procedure']['procedure_id'] ?? null,
+            'procedure_memory_id' => $inspection['procedure']['memory_id'] ?? null,
             'reason' => 'Highest deterministic score among adapter-valid candidates.',
         ]);
         $this->advance($cycle, 'execute', 'select', $this->elapsedMs($started));
@@ -458,41 +463,176 @@ final class DecisionStateMachine
             (string) $selected->expected,
             isset($inspection['procedure']['procedure_id'])
                 ? (int) $inspection['procedure']['procedure_id']
-                : null
+                : null,
+            procedureMemoryId: isset($inspection['procedure']['memory_id'])
+                ? (int) $inspection['procedure']['memory_id']
+                : null,
+            decisionCycleId: (int) $cycle->id
         );
         $actionId = (int) ($outcome['started']['action']['id'] ?? 0);
-        $cycle->setField('execution', [
-            'candidate_id' => (int) $selected->id,
-            'action_id' => $actionId,
-            'status' => $outcome['status'] ?? 'failed',
-            'adapter_dispatch' => $outcome['dispatch'] ?? null,
-        ]);
-        $this->advance($cycle, 'verify', 'execute', $this->elapsedMs($started));
-        if (($outcome['status'] ?? null) === 'waiting') {
-            $cycle->setFields(['status' => 'waiting', 'updated_at' => time()]);
-            $cycle->save();
-            return ['status' => 'waiting', 'cycle' => $cycle->getData(), 'selected' => $selected->getData(), 'execution' => $outcome];
+        $durableCycle = DecisionCycle::getByID((int) $cycle->id);
+        if (!$durableCycle instanceof DecisionCycle) {
+            throw new RuntimeException('Decision cycle disappeared after action dispatch.');
         }
-        return $this->finishVerified($cycle, $outcome);
+        $durableExecution = is_array($durableCycle->execution) ? $durableCycle->execution : [];
+        if ((int) ($durableExecution['action_id'] ?? 0) !== $actionId) {
+            throw new RuntimeException('Decision cycle lost its pre-dispatch action binding.');
+        }
+        $actionExecution = \NaviBrain\Model\ActionExecution::getByField('action_trace_id', $actionId);
+        if ($actionExecution instanceof \NaviBrain\Model\ActionExecution
+            && in_array($actionExecution->status, ['succeeded', 'failed', 'cancelled'], true)
+        ) {
+            $finished = is_array($outcome['finished'] ?? null)
+                ? $outcome['finished']
+                : $this->core->proceduralMemory()->finishDurableAction($actionId);
+            return $this->completeAsyncAction(
+                $actionId,
+                (string) $actionExecution->status === 'succeeded'
+                    && (int) $actionExecution->verified === 1,
+                $finished
+            );
+        }
+        if ((string) $durableCycle->state === 'verify') {
+            return [
+                'status' => (string) $durableCycle->status,
+                'cycle' => $durableCycle->getData(),
+                'selected' => $selected->getData(),
+                'execution' => $outcome,
+            ];
+        }
+        if (in_array($durableCycle->status, ['completed', 'failed', 'cancelled'], true)) {
+            return ['status' => (string) $durableCycle->status, 'cycle' => $durableCycle->getData()];
+        }
+        return [
+            'status' => 'in_progress',
+            'cycle' => $durableCycle->getData(),
+            'selected' => $selected->getData(),
+            'execution' => $outcome,
+        ];
     }
 
     /** @return array<string, mixed> */
     public function completeAsyncAction(int $actionId, bool $matched, array $finished): array
     {
-        foreach (DecisionCycle::getAllByWhere(
-            ['status' => 'waiting', 'state' => 'verify'],
-            ['order' => ['id' => 'DESC'], 'limit' => 50]
-        ) as $cycle) {
+        $cycleId = $this->core->decisionCycleForAsyncAction($actionId);
+        if ($cycleId === null) {
+            // Pre-v21 cycles have no indexed claim. Scan only the outstanding
+            // set once, then install a durable legacy binding before finish.
+            foreach (DecisionCycle::getAllByWhere(
+                ['status' => 'waiting', 'state' => 'verify'],
+                ['order' => ['id' => 'ASC']]
+            ) as $cycle) {
+                $execution = is_array($cycle->execution) ? $cycle->execution : [];
+                if ((int) ($execution['action_id'] ?? 0) !== $actionId) {
+                    continue;
+                }
+                $actionExecution = \NaviBrain\Model\ActionExecution::getByField(
+                    'action_trace_id',
+                    $actionId
+                );
+                $requestEventId = $actionExecution instanceof \NaviBrain\Model\ActionExecution
+                    ? (int) ($actionExecution->dispatch_event_id ?? 0)
+                    : 0;
+                $this->core->bindLegacyDecisionAsyncClaim(
+                    (int) $cycle->id,
+                    $actionId,
+                    $requestEventId
+                );
+                $cycleId = (int) $cycle->id;
+                break;
+            }
+        }
+        if ($cycleId !== null) {
+            $cycle = DecisionCycle::getByID($cycleId);
+            if (!$cycle instanceof DecisionCycle) {
+                throw new RuntimeException('Asynchronous decision claim points to a missing cycle.');
+            }
             $execution = is_array($cycle->execution) ? $cycle->execution : [];
             if ((int) ($execution['action_id'] ?? 0) !== $actionId) {
-                continue;
+                throw new RuntimeException('Asynchronous decision claim crossed its action identity.');
             }
-            return $this->finishVerified($cycle, [
-                'status' => $matched ? 'succeeded' : 'failed',
-                'finished' => $finished,
-            ]);
+            return $this->core->finalizeAsyncDecisionCycle($cycleId, $actionId, $matched, $finished);
         }
         return ['status' => 'no_waiting_decision_cycle'];
+    }
+
+    /**
+     * Close crash-stranded decision actions without ever re-running an adapter.
+     * Pending actions become an explicit refusal; dead/same-owner dispatches
+     * use the action ledger's atomic indeterminate outcome; terminal actions
+     * replay their durable finish into the exact decision claim.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function reconcileAsyncActions(int $limit = 64): array
+    {
+        $reconciled = [];
+        foreach ($this->core->pendingDecisionActionClaims($limit) as $claim) {
+            $actionId = (int) $claim['action_id'];
+            $execution = \NaviBrain\Model\ActionExecution::getByField('action_trace_id', $actionId);
+            if (!$execution instanceof \NaviBrain\Model\ActionExecution) {
+                throw new RuntimeException('Decision action claim points to a missing execution.');
+            }
+            if ((string) $execution->status === 'pending') {
+                if ($claim['owner_live']) {
+                    continue;
+                }
+                $this->core->rejectPendingActionExecution($actionId, [
+                    'error' => 'Decision worker exited before its bound adapter dispatch began.',
+                ]);
+                $execution = \NaviBrain\Model\ActionExecution::getByField('action_trace_id', $actionId);
+            } elseif ((string) $execution->status === 'dispatching') {
+                $dispatch = $this->core->claimActionDispatch($actionId);
+                if (!$dispatch['recover']) {
+                    continue;
+                }
+                $execution = \NaviBrain\Model\ActionExecution::getByField('action_trace_id', $actionId);
+            }
+            if (!$execution instanceof \NaviBrain\Model\ActionExecution
+                || !in_array($execution->status, ['succeeded', 'failed', 'cancelled'], true)
+            ) {
+                continue;
+            }
+            $finished = $this->core->proceduralMemory()->finishDurableAction($actionId);
+            $reconciled[] = $this->completeAsyncAction(
+                $actionId,
+                (string) $execution->status === 'succeeded' && (int) $execution->verified === 1,
+                $finished
+            );
+        }
+
+        // Pre-v21 waiting cycles cannot be indexed because their serialized
+        // action identity was not normalized. This scans only outstanding
+        // cycles and installs the durable claim before terminal replay.
+        foreach (DecisionCycle::getAllByWhere(
+            ['status' => 'waiting', 'state' => 'verify'],
+            ['order' => ['id' => 'ASC'], 'limit' => max(1, min(512, $limit))]
+        ) as $cycle) {
+            $cycleExecution = is_array($cycle->execution) ? $cycle->execution : [];
+            $actionId = (int) ($cycleExecution['action_id'] ?? 0);
+            if ($actionId < 1 || $this->core->decisionCycleForAsyncAction($actionId) !== null) {
+                continue;
+            }
+            $execution = \NaviBrain\Model\ActionExecution::getByField('action_trace_id', $actionId);
+            if (!$execution instanceof \NaviBrain\Model\ActionExecution
+                || !in_array($execution->status, ['succeeded', 'failed', 'cancelled'], true)
+                || (int) ($execution->dispatch_event_id ?? 0) < 1
+            ) {
+                continue;
+            }
+            $this->core->bindLegacyDecisionAsyncClaim(
+                (int) $cycle->id,
+                $actionId,
+                (int) $execution->dispatch_event_id
+            );
+            $finished = $this->core->proceduralMemory()->finishDurableAction($actionId);
+            $reconciled[] = $this->completeAsyncAction(
+                $actionId,
+                (string) $execution->status === 'succeeded' && (int) $execution->verified === 1,
+                $finished
+            );
+        }
+        return $reconciled;
     }
 
     /** @return array<string, mixed> */

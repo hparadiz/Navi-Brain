@@ -238,24 +238,59 @@ while ($running) {
         $nextLooking = $now + LOOKING_INTERVAL;
         try {
             foreach ($core->claimPendingLooks(3) as $look) {
-                $reading = $looking->observe((string) $look['command']);
-                $result = $cortex->ingest(LOOKING_SOURCE, $reading, null, $now);
-                // The reading is perception and expires. What the look taught
-                // is a fact about this machine and does not, so it is kept
-                // separately and consolidated like any other observation.
-                $core->rememberLook(
-                    (string) $look['command'],
-                    (string) $look['because'],
-                    $reading,
-                    (int) $look['event_id']
-                );
-                emit([
-                    'sense' => LOOKING_SOURCE,
-                    'command' => mb_substr((string) $look['command'], 0, 120),
-                    'refused' => $reading['refused'] ?? null,
-                    'exit_code' => $reading['exit_code'] ?? null,
-                    'events' => $result['events'] ?? [],
-                ]);
+                $reading = null;
+                try {
+                    $replay = is_array($look['replay_reading'] ?? null);
+                    $reading = $replay
+                        ? $look['replay_reading']
+                        : $looking->observe((string) $look['command']);
+                    $core->stageLookCompletion(
+                        (string) $look['command'],
+                        (string) $look['because'],
+                        $reading,
+                        (int) $look['event_id']
+                    );
+                    $result = $replay
+                        ? ['events' => []]
+                        : $cortex->ingest(LOOKING_SOURCE, $reading, null, $now);
+                    // The reading is perception and expires. What the look taught
+                    // is a fact about this machine and does not, so it is kept
+                    // separately and consolidated like any other observation.
+                    $core->rememberLook(
+                        (string) $look['command'],
+                        (string) $look['because'],
+                        $reading,
+                        (int) $look['event_id']
+                    );
+                    emit([
+                        'sense' => LOOKING_SOURCE,
+                        'command' => mb_substr((string) $look['command'], 0, 120),
+                        'refused' => $reading['refused'] ?? null,
+                        'exit_code' => $reading['exit_code'] ?? null,
+                        'events' => $result['events'] ?? [],
+                        'replayed' => $replay,
+                    ]);
+                } catch (Throwable $lookFailure) {
+                    if (!is_array($reading)) {
+                        $reading = [
+                            'refused' => true,
+                            'refused_because' => 'The local look executor failed: ' . $lookFailure->getMessage(),
+                            'exit_code' => null,
+                            'timed_out' => false,
+                        ];
+                    }
+                    $core->rememberLook(
+                        (string) $look['command'],
+                        (string) $look['because'],
+                        $reading,
+                        (int) $look['event_id']
+                    );
+                    emit([
+                        'sense' => LOOKING_SOURCE,
+                        'command' => mb_substr((string) $look['command'], 0, 120),
+                        'error' => $lookFailure->getMessage(),
+                    ]);
+                }
             }
         } catch (Throwable $throwable) {
             emit(['sense' => LOOKING_SOURCE, 'error' => $throwable->getMessage()]);

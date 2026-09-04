@@ -6,10 +6,17 @@ namespace NaviBrain\Cli;
 
 use InvalidArgumentException;
 use JsonException;
+use NaviBrain\Core\CodexSparkWorker;
 use NaviBrain\Core\ExecutiveCore;
 use NaviBrain\Core\FreeModelWorker;
+use NaviBrain\Core\IntentionCompiler;
 use NaviBrain\Core\LocalModelClient;
 use NaviBrain\Core\LocalModelWorker;
+use NaviBrain\Core\MotivationCompiler;
+use NaviBrain\Core\PersonalityCompiler;
+use NaviBrain\Storage\TokenMemoryDaemon;
+use NaviBrain\Support\CompilerText;
+use NaviBrain\Support\PlainText;
 use Throwable;
 
 final class Application
@@ -21,9 +28,11 @@ final class Application
     {
         array_shift($argv);
         $command = array_shift($argv) ?? 'help';
+        $debugJson = in_array('--debug-json', $argv, true);
 
         try {
             $options = $this->parseOptions($argv);
+            unset($options['debug-json']);
             $this->core = new ExecutiveCore();
             $schema = $this->core->initialize();
 
@@ -70,7 +79,8 @@ final class Application
                 'procedure:run' => $this->core->runProcedure(
                     $this->integer($options, 'id'),
                     $this->integer($options, 'intention'),
-                    $this->jsonObject($options, 'arguments', [])
+                    $this->jsonObject($options, 'arguments', []),
+                    $this->string($options, 'operation-key')
                 ),
                 'procedure:compose' => $this->core->composeProcedure(
                     $this->string($options, 'name'),
@@ -121,10 +131,27 @@ final class Application
                     $this->string($options, 'query'),
                     $this->integer($options, 'limit', 20)
                 ),
+                'personality:compile' => (new PersonalityCompiler($this->core))->compile(
+                    $this->string($options, 'context')
+                ),
+                'motivation:compile' => (new MotivationCompiler($this->core))->compile(
+                    $this->string($options, 'context')
+                ),
+                'intention:compile' => (new IntentionCompiler())->compile(),
+                'narrative:queue' => $this->core->queueNarrativeSynthesis(
+                    $this->string($options, 'reason')
+                ),
                 'memory:consolidate' => $this->core->consolidateMemory(
                     $this->integer($options, 'episode'),
                     $this->string($options, 'content'),
                     $this->number($options, 'confidence')
+                ),
+                'memory:consolidation:status' => $this->core->consolidationStatus(),
+                'memory:consolidation:pump' => $this->core->maintainConsolidationQueue(
+                    $this->integer($options, 'depth', 2)
+                ),
+                'memory:consolidation:repair' => $this->core->repairConsolidationHistory(
+                    $this->string($options, 'reason')
                 ),
                 'need:list' => $this->core->listNeeds(),
                 'need:set' => $this->core->setNeed(
@@ -168,6 +195,10 @@ final class Application
                 ),
                 'thread:step:list' => $this->core->listThreadSteps(
                     $this->optionalInteger($options, 'thread')
+                ),
+                'thread:release' => $this->core->releaseCognitiveThreadByKey(
+                    $this->string($options, 'key'),
+                    $this->string($options, 'reason')
                 ),
                 'thread:due' => $this->core->runDueCognitiveThreads(
                     $this->string($options, 'node')
@@ -248,7 +279,13 @@ final class Application
                     $this->commaSeparated($options, 'ids')
                 ),
                 'models:discover' => (new FreeModelWorker($this->core))->discoverModels(),
-                'worker:once' => (new FreeModelWorker($this->core))->runOnce(
+                'spark:once' => (new CodexSparkWorker($this->core))->runOnce(
+                    $this->string($options, 'owner')
+                ),
+                'worker:once' => (new CodexSparkWorker($this->core))->runOnce(
+                    $this->string($options, 'owner')
+                ),
+                'opencode:once' => (new FreeModelWorker($this->core))->runOnce(
                     $this->string($options, 'owner')
                 ),
                 'local:status' => $this->localModelStatus(),
@@ -269,19 +306,35 @@ final class Application
                 'self:list' => $this->core->listSelfModelFacts(),
                 'appraise' => $this->appraise($options),
                 'checkpoint' => $this->core->checkpoint($this->string($options, 'reason')),
-                'status' => $this->core->status(),
+                'status' => $debugJson
+                    ? array_merge(
+                        ['primary_intention' => $this->optionalString($options, 'active-intention')],
+                        $this->core->status()
+                    )
+                    : $this->core->contextStatus(
+                        $this->string($options, 'active-intention'),
+                        $this->integer(
+                            $options,
+                            'token-budget',
+                            TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS
+                        )
+                    ),
                 default => throw new InvalidArgumentException(sprintf('Unknown command: %s', $command)),
             };
 
-            $this->writeJson(['ok' => true, 'command' => $command, 'result' => $result], STDOUT);
+            $this->writeOutput(
+                ['ok' => true, 'command' => $command, 'result' => $result],
+                STDOUT,
+                $debugJson
+            );
             return 0;
         } catch (Throwable $throwable) {
-            $this->writeJson([
+            $this->writeOutput([
                 'ok' => false,
                 'command' => $command,
                 'error' => $throwable->getMessage(),
                 'type' => $throwable::class,
-            ], STDERR);
+            ], STDERR, $debugJson);
             return 1;
         }
     }
@@ -320,6 +373,7 @@ final class Application
             tier: $this->string($options, 'tier'),
             content: $this->string($options, 'content'),
             confidence: $this->number($options, 'confidence'),
+            idempotencyKey: $this->string($options, 'idempotency-key'),
             sourceEventId: $this->optionalInteger($options, 'source-event'),
             sourceMemoryId: $this->optionalInteger($options, 'source-memory'),
             supersedesId: $this->optionalInteger($options, 'supersedes'),
@@ -538,7 +592,7 @@ final class Application
     private function help(): array
     {
         return [
-            'usage' => './bin/navi-brain COMMAND [--option=value]',
+            'usage' => './bin/navi-brain COMMAND with named options; add --debug-json only for raw serialization output',
             'commands' => [
                 'init',
                 'event:list [--limit=50]',
@@ -552,7 +606,7 @@ final class Application
                 'action:list [--status=pending]',
                 'procedure:list [--status=active|invalidated]',
                 'procedure:adapters',
-                'procedure:run --id --intention [--arguments=JSON]',
+                'procedure:run --id --intention --operation-key [--arguments=JSON]',
                 'procedure:compose --name --description --procedures=1,2 --authority=user|developer',
                 'decision:start --intention --trigger [--thread] [--model-hint]',
                 'decision:list [--status=running|waiting|completed|impasse|failed|cancelled] [--limit=20]',
@@ -565,9 +619,16 @@ final class Application
                 'other:cycles [--status=running|waiting|completed|abstained|failed] [--limit=20]',
                 'other:correct --hypothesis --correction',
                 'other:replay [--limit=500]',
-                'memory:add --tier --content --confidence [--source-event] [--source-memory] [--supersedes] [--expires] [--allow-procedural-write]',
+                'memory:add --tier --content --confidence --idempotency-key [--source-event] [--source-memory] [--supersedes] [--expires] [--allow-procedural-write]',
                 'memory:search --query [--limit=20]',
+                'personality:compile --context',
+                'motivation:compile --context',
+                'intention:compile',
+                'narrative:queue --reason',
                 'memory:consolidate --episode --content --confidence',
+                'memory:consolidation:status',
+                'memory:consolidation:pump [--depth=2]',
+                'memory:consolidation:repair --reason',
                 'need:list',
                 'need:set --key --description --pressure --growth-per-hour --trigger-threshold --status --rationale [--authority=agent]',
                 'need:satisfy --key --amount --source',
@@ -583,6 +644,7 @@ final class Application
                 'stream:recent [--limit=12]',
                 'thread:list [--status=active|waiting|blocked|complete|released]',
                 'thread:step:list [--thread]',
+                'thread:release --key --reason',
                 'thread:due --node',
                 'sense:status',
                 'sense:events [--limit=10] [--min-significance]',
@@ -610,7 +672,9 @@ final class Application
                 'models:list',
                 'models:sync --ids=model-a,model-b',
                 'models:discover',
+                'spark:once --owner',
                 'worker:once --owner',
+                'opencode:once --owner',
                 'local:status',
                 'local:reset --reason',
                 'local:once --owner',
@@ -619,7 +683,7 @@ final class Application
                 'self:list',
                 'appraise --event|--intention --relevance --urgency --controllability --uncertainty --commitment-impact',
                 'checkpoint --reason',
-                'status',
+                'status --active-intention="current user-directed objective" [--token-budget=1024]',
             ],
         ];
     }
@@ -627,8 +691,38 @@ final class Application
     /** @param resource $stream
      *  @throws JsonException
      */
-    private function writeJson(array $payload, $stream): void
+    private function writeOutput(array $payload, $stream, bool $debugJson): void
     {
+        if (!$debugJson) {
+            $command = (string) ($payload['command'] ?? '');
+            if (($payload['ok'] ?? false) === true
+                && in_array(
+                    $command,
+                    ['personality:compile', 'motivation:compile', 'intention:compile'],
+                    true
+                )
+            ) {
+                $result = $payload['result'] ?? [];
+                fwrite(
+                    $stream,
+                    CompilerText::render($command, is_array($result) ? $result : []) . PHP_EOL
+                );
+                return;
+            }
+            if (($payload['ok'] ?? false) === true && $command === 'status') {
+                $result = $payload['result'] ?? [];
+                fwrite($stream, is_string($result) ? $result : '');
+                return;
+            }
+            if (($payload['ok'] ?? false) === true && $command === 'checkpoint') {
+                fwrite($stream, 'saved' . PHP_EOL);
+                return;
+            }
+            $maxCharacters = $command === 'help' ? 30000 : 20000;
+            $listLimit = $command === 'help' ? 200 : 12;
+            fwrite($stream, PlainText::render($payload, $maxCharacters, $listLimit) . PHP_EOL);
+            return;
+        }
         fwrite($stream, json_encode(
             $payload,
             JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR

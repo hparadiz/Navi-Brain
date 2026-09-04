@@ -22,11 +22,11 @@ install -o root -g root -m 0755 "$SRC_DIR/packaging/openrc/navi-brain-senses" /e
 rc-update add navi-brain-senses default >/dev/null 2>&1 || true
 rc-service navi-brain-senses restart
 
-# Workers probe before claiming, so bring their two-slot local endpoint up
-# before either queue consumer starts polling.
-install -o root -g root -m 0755 "$SRC_DIR/packaging/openrc/navi-brain-local-model" /etc/init.d/navi-brain-local-model
-rc-update add navi-brain-local-model default >/dev/null 2>&1 || true
-rc-service navi-brain-local-model restart
+# Both queue consumers use the authenticated Codex CLI. Migrate an existing
+# installation away from the former always-on llama.cpp baseline; it remains
+# available as a foreground manual ablation target.
+rc-update del navi-brain-local-model default >/dev/null 2>&1 || true
+rc-service navi-brain-local-model stop >/dev/null 2>&1 || true
 
 install -o root -g root -m 0755 "$SRC_DIR/packaging/openrc/navi-brain-model-worker" /etc/init.d/navi-brain-model-worker
 rc-update add navi-brain-model-worker default >/dev/null 2>&1 || true
@@ -42,7 +42,7 @@ rc-service navi-brain-heartbeat restart
 
 echo
 echo "--- status ---"
-for s in navi-senses navi-brain-senses navi-brain-model-worker navi-brain-model-worker-2 navi-brain-heartbeat navi-brain-local-model; do
+for s in navi-senses navi-brain-senses navi-brain-model-worker navi-brain-model-worker-2 navi-brain-heartbeat; do
     printf '%-24s %s\n' "$s" "$(rc-service "$s" status 2>&1 | sed 's/^ \* status: //' | head -1)"
 done
 echo

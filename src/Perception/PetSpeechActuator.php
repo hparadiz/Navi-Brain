@@ -34,6 +34,7 @@ final class PetSpeechActuator
      * @var array<string, string>
      */
     private const UNSPEAKABLE = [
+        'a first-person model identity claim' => '/\b(?:i\s+am|i[\'’]m)\s+(?:an?\s+|the\s+)?(?:(?:ai|artificial intelligence|foundation|language|large language|machine learning)\s+model|model\b|codex\b|chatgpt\b|gpt(?:[- .]?\d+)?\b|claude\b|gemini\b|gemma\b|llama\b|mistral\b|mixtral\b|qwen\b|deepseek\b|grok\b|phi\b|kimi\b)/iu',
         'code punctuation' => '/[`{}\[\]<>|\\\\]/u',
         'an operator' => '/(?:=>|->|::|\$[a-zA-Z_]|\w\(\)|\+\+|!==?|>=|<=)/u',
         'a file path' => '/(?:(?:^|\s)[~.]?\/[\w.-]+|\/[\w.-]+\/)/u',

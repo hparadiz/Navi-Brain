@@ -11,6 +11,7 @@ use Divergence\IO\Database\Connections;
 use Divergence\Models\ActiveRecord;
 use InvalidArgumentException;
 use PDO;
+use NaviBrain\Model\ActionExecution;
 use NaviBrain\Model\ActionTrace;
 use NaviBrain\Model\Appraisal;
 use NaviBrain\Model\CapsuleSlot;
@@ -18,14 +19,18 @@ use NaviBrain\Model\Checkpoint;
 use NaviBrain\Model\CognitiveThread;
 use NaviBrain\Model\ContextCapsule;
 use NaviBrain\Model\CycleRun;
+use NaviBrain\Model\DecisionCandidate;
 use NaviBrain\Model\DecisionCycle;
 use NaviBrain\Model\Event;
 use NaviBrain\Model\ExecutiveInterrupt;
 use NaviBrain\Model\Intention;
 use NaviBrain\Model\Memory;
+use NaviBrain\Model\MemoryConsolidationEpisode;
 use NaviBrain\Model\MetricSnapshot;
 use NaviBrain\Model\ModelEndpoint;
 use NaviBrain\Model\Need;
+use NaviBrain\Model\Procedure;
+use NaviBrain\Model\ProcedureRun;
 use NaviBrain\Model\Rhythm;
 use NaviBrain\Model\SelfModelFact;
 use NaviBrain\Model\Sense;
@@ -40,6 +45,9 @@ use NaviBrain\Perception\PetSpeechActuator;
 use NaviBrain\Perception\SensoryCortex;
 use NaviBrain\Perception\SocialFeedback;
 use NaviBrain\Storage\Schema;
+use NaviBrain\Storage\TokenMemoryDaemon;
+use NaviBrain\Support\ActivityBus;
+use NaviBrain\Support\PlainText;
 use RuntimeException;
 use Throwable;
 
@@ -47,22 +55,22 @@ final class ExecutiveCore
 {
     public const SELF_PRESENCE_SPEECH_WORK_TYPE = 'self_presence_speech';
     public const SELF_PRESENCE_ANSWER_WORK_TYPE = 'self_presence_answer';
+    public const MEMORY_CONSOLIDATION_WORK_TYPE = 'memory_consolidation';
     private const STALE_ACTION_SECONDS = 86400;
-    private const CONSOLIDATION_WORK_TYPE = 'memory_consolidation';
     private const LOOK_WORK_TYPE = 'machine_look';
     private const COMPLETION_WORK_TYPE = 'intention_completion';
     /** A finished intention is a claim about the world, so it needs real confidence. */
     private const COMPLETION_CONFIDENCE_FLOOR = 0.7;
-    /**
-     * The replay mix. New material is the minority on purpose: interleaving is
-     * only interleaving if what is already known outweighs what just happened,
-     * which is what keeps one loud recent hour from being written down as
-     * though it were the shape of things.
-     */
-    private const CONSOLIDATION_NEW = 4;
-    private const CONSOLIDATION_INTERLEAVED = 6;
-    private const CONSOLIDATION_EXISTING = 3;
-    private const CONSOLIDATION_CONFIDENCE_FLOOR = 0.4;
+    private const CONSOLIDATION_NEW = 12;
+    private const CONSOLIDATION_INTERLEAVED = 4;
+    private const CONSOLIDATION_EXISTING = 5;
+    /** Bound each scheduler pass even when a long offline period leaves a backlog. */
+    private const CONSOLIDATION_PENDING_WINDOW = 512;
+    private const CONSOLIDATION_CONFIDENCE_FLOOR = 0.55;
+    private const CONSOLIDATION_MAX_ATTEMPTS = 3;
+    private const CONSOLIDATION_VALIDATOR_VERSION = 7;
+    /** Validator v4 was the first format whose accepted memories passed the evidence fence. */
+    private const CONSOLIDATION_MEMORY_FLOOR = 4;
     /** Returning to a subject an hour later is fine; four times in a row is not. */
     private const REPEAT_WINDOW_SECONDS = 3600;
     private const REPEAT_OVERLAP = 0.6;
@@ -87,8 +95,23 @@ final class ExecutiveCore
     private const METRICS_PROTOCOL_V1 = 'cognitive-v1';
     private const MIND_STREAM_THREAD_KEY = 'mind_stream';
     private const MIND_STREAM_WORK_TYPE = 'mind_stream_thought';
+    private const MIND_STREAM_HISTORY = 24;
+    private const MIND_STREAM_CONTENT_OVERLAP = 0.35;
+    private const MIND_STREAM_CHALLENGE_OVERLAP = 0.55;
+    private const MIND_STREAM_CHALLENGE_CONTENT_OVERLAP = 0.25;
+    private const MIND_STREAM_EVIDENCE_CONTENT_OVERLAP = 0.30;
+    private const MIND_STREAM_EVIDENCE_CHALLENGE_OVERLAP = 0.40;
     private const LOCAL_MODEL_PROVIDER = 'local';
+    private const CODEX_MODEL_PROVIDER = 'codex';
     private const MIN_WORKER_INTERVAL_SECONDS = 300;
+    /** Unique to this PHP process; never reused as crash-recovery authority. */
+    private static ?string $dispatchOwner = null;
+    private static int $lookClaimSweepCursor = 0;
+    private static int $decisionClaimSweepCursor = 0;
+    /** Full-database integrity scans are safety audits, not five-second pulse work. */
+    private const QUICK_CHECK_INTERVAL_SECONDS = 900;
+    /** A scheduler claim with no worker dispatch should settle well inside this window. */
+    private const STALE_THREAD_STEP_SECONDS = 300;
     /** Roughly one local model call: the shortest honest conversational turn. */
     private const ENGAGED_WORKER_INTERVAL_SECONDS = 45;
 
@@ -107,14 +130,21 @@ final class ExecutiveCore
     private ProceduralMemory $proceduralMemory;
     private DecisionStateMachine $decisionStateMachine;
     private OtherModel $otherModel;
+    private ActivityBus $activityBus;
     private ?SensoryCortex $sensoryCortex = null;
     private ?SocialFeedback $socialFeedback = null;
+    /** @var list<string>|null */
+    private ?array $cachedQuickCheck = null;
+    private int $cachedQuickCheckAt = 0;
+    /** @var list<array{kind: string, payload: array<string, mixed>}> */
+    private array $pendingActivityEvents = [];
 
     public function __construct(
         private readonly Schema $schema = new Schema(),
         ?PetSpeechActuator $speechActuator = null
     ) {
         $this->connection = Connections::getConnection();
+        $this->activityBus = new ActivityBus();
         $this->speechActuator = $speechActuator ?? new PetSpeechActuator();
         $this->capsuleAssembler = new CapsuleAssembler($this);
         $this->workingMemory = new WorkingMemory($this);
@@ -169,13 +199,1171 @@ final class ExecutiveCore
         return $this->emit($kind, $payload)->getData();
     }
 
+    /**
+     * Emit one immutable event for a durable operation identity.
+     *
+     * @param array<string, mixed> $payload
+     */
+    public function emitEventOnce(string $dedupeKey, string $kind, array $payload): array
+    {
+        return $this->emitOnce($dedupeKey, $kind, $payload)->getData();
+    }
+
+    /**
+     * Retire SQLite authorization before touching the token generation. This
+     * creates a fail-closed state that action-dispatch claims cannot cross.
+     */
+    public function beginProcedureInvalidation(
+        int $procedureId,
+        int $expectedMemoryId,
+        ?int $actionId,
+        string $reason
+    ): bool {
+        $this->requireText($reason, 'procedure invalidation reason');
+        return $this->transaction(function () use (
+            $procedureId,
+            $expectedMemoryId,
+            $actionId,
+            $reason
+        ): bool {
+            $statement = $this->connection->prepare(
+                "UPDATE procedures
+                 SET status = 'retiring', invalidation_reason = :reason, updated_at = :updated_at
+                 WHERE id = :id AND memory_id = :memory_id AND status = 'active'"
+            );
+            $statement->execute([
+                'reason' => $reason,
+                'updated_at' => date('Y-m-d H:i:s'),
+                'id' => $procedureId,
+                'memory_id' => $expectedMemoryId,
+            ]);
+            if ($statement->rowCount() === 1) {
+                $claim = $this->connection->prepare(
+                    'INSERT INTO procedure_invalidation_claims
+                     (procedure_id,memory_id,action_id,reason)
+                     VALUES (:procedure_id,:memory_id,:action_id,:reason)'
+                );
+                $claim->execute([
+                    'procedure_id' => $procedureId,
+                    'memory_id' => $expectedMemoryId,
+                    'action_id' => $actionId,
+                    'reason' => $reason,
+                ]);
+                return true;
+            }
+            $check = $this->connection->prepare(
+                'SELECT status,invalidation_reason FROM procedures
+                 WHERE id = :id AND memory_id = :memory_id'
+            );
+            $check->execute(['id' => $procedureId, 'memory_id' => $expectedMemoryId]);
+            $row = $check->fetch(PDO::FETCH_ASSOC);
+            $check->closeCursor();
+            if (is_array($row) && in_array($row['status'], ['retiring', 'invalidated'], true)) {
+                $claim = $this->procedureInvalidationClaim($procedureId, $expectedMemoryId);
+                if ($claim !== null
+                    && $claim['action_id'] === $actionId
+                    && $claim['reason'] === $reason
+                    && (string) $row['invalidation_reason'] === $reason
+                ) {
+                    return false;
+                }
+            }
+            throw new RuntimeException('Procedure invalidation no longer owns the expected generation.');
+        });
+    }
+
+    /** @return array{action_id: int|null, reason: string}|null */
+    public function procedureInvalidationClaim(int $procedureId, int $memoryId): ?array
+    {
+        $statement = $this->connection->prepare(
+            'SELECT action_id,reason FROM procedure_invalidation_claims
+             WHERE procedure_id = :procedure_id AND memory_id = :memory_id'
+        );
+        $statement->execute(['procedure_id' => $procedureId, 'memory_id' => $memoryId]);
+        $row = $statement->fetch(PDO::FETCH_ASSOC);
+        $statement->closeCursor();
+        if (!is_array($row)) {
+            return null;
+        }
+        return [
+            'action_id' => $row['action_id'] === null ? null : (int) $row['action_id'],
+            'reason' => (string) $row['reason'],
+        ];
+    }
+
+    /**
+     * Remove an old generation's SQLite authority before its token record is
+     * expired. The durable claim lets the same compilation replay across
+     * either cross-store crash boundary without reopening the old generation.
+     */
+    public function beginProcedureReplacement(
+        int $procedureId,
+        int $previousMemoryId,
+        string $shapeKey,
+        int $generation,
+        string $pendingHash
+    ): bool {
+        if ($procedureId < 1 || $previousMemoryId < 1 || $generation < 1) {
+            throw new InvalidArgumentException('Procedure replacement identity is invalid.');
+        }
+        $this->requireText($shapeKey, 'procedure replacement key');
+        $this->requireText($pendingHash, 'procedure replacement hash');
+
+        return $this->transaction(function () use (
+            $procedureId,
+            $previousMemoryId,
+            $shapeKey,
+            $generation,
+            $pendingHash
+        ): bool {
+            $retire = $this->connection->prepare(
+                "UPDATE procedures
+                 SET status = 'retiring', updated_at = :updated_at
+                 WHERE id = :id AND memory_id = :memory_id
+                   AND status IN ('active','invalidated')"
+            );
+            $retire->execute([
+                'updated_at' => date('Y-m-d H:i:s'),
+                'id' => $procedureId,
+                'memory_id' => $previousMemoryId,
+            ]);
+            if ($retire->rowCount() === 1) {
+                $claim = $this->connection->prepare(
+                    'INSERT INTO procedure_replacement_claims
+                     (procedure_id,previous_memory_id,shape_key,generation,pending_hash,next_memory_id)
+                     VALUES (:procedure_id,:previous_memory_id,:shape_key,:generation,:pending_hash,NULL)'
+                );
+                $claim->execute([
+                    'procedure_id' => $procedureId,
+                    'previous_memory_id' => $previousMemoryId,
+                    'shape_key' => $shapeKey,
+                    'generation' => $generation,
+                    'pending_hash' => $pendingHash,
+                ]);
+                return true;
+            }
+
+            $claim = $this->procedureReplacementClaim($procedureId, $previousMemoryId);
+            if ($claim !== null
+                && $claim['shape_key'] === $shapeKey
+                && $claim['generation'] === $generation
+                && hash_equals($claim['pending_hash'], $pendingHash)
+            ) {
+                $procedure = Procedure::getByID($procedureId);
+                if ($procedure instanceof Procedure
+                    && ((string) $procedure->status === 'retiring'
+                        || ($claim['next_memory_id'] !== null
+                            && (string) $procedure->status === 'active'
+                            && (int) $procedure->memory_id === $claim['next_memory_id']))
+                ) {
+                    return false;
+                }
+            }
+            throw new RuntimeException('Procedure replacement no longer owns the expected generation.');
+        });
+    }
+
+    /**
+     * @return array{shape_key: string, generation: int, pending_hash: string, next_memory_id: int|null}|null
+     */
+    public function procedureReplacementClaim(int $procedureId, int $previousMemoryId): ?array
+    {
+        $statement = $this->connection->prepare(
+            'SELECT shape_key,generation,pending_hash,next_memory_id
+             FROM procedure_replacement_claims
+             WHERE procedure_id = :procedure_id AND previous_memory_id = :previous_memory_id'
+        );
+        $statement->execute([
+            'procedure_id' => $procedureId,
+            'previous_memory_id' => $previousMemoryId,
+        ]);
+        $row = $statement->fetch(PDO::FETCH_ASSOC);
+        $statement->closeCursor();
+        if (!is_array($row)) {
+            return null;
+        }
+        return [
+            'shape_key' => (string) $row['shape_key'],
+            'generation' => (int) $row['generation'],
+            'pending_hash' => (string) $row['pending_hash'],
+            'next_memory_id' => $row['next_memory_id'] === null ? null : (int) $row['next_memory_id'],
+        ];
+    }
+
+    /**
+     * Publish the exact successor generation and restore SQLite authority in
+     * one transaction after token replacement has durably succeeded.
+     *
+     * @param array<string, mixed> $fields
+     * @return array{procedure: array<string, mixed>, applied: bool}
+     */
+    public function finalizeProcedureReplacement(
+        int $procedureId,
+        int $previousMemoryId,
+        int $nextMemoryId,
+        string $shapeKey,
+        int $generation,
+        string $pendingHash,
+        array $fields
+    ): array {
+        if ($nextMemoryId < 1) {
+            throw new InvalidArgumentException('Replacement memory identity is invalid.');
+        }
+        return $this->transaction(function () use (
+            $procedureId,
+            $previousMemoryId,
+            $nextMemoryId,
+            $shapeKey,
+            $generation,
+            $pendingHash,
+            $fields
+        ): array {
+            $claim = $this->procedureReplacementClaim($procedureId, $previousMemoryId);
+            if ($claim === null
+                || $claim['shape_key'] !== $shapeKey
+                || $claim['generation'] !== $generation
+                || !hash_equals($claim['pending_hash'], $pendingHash)
+                || ($claim['next_memory_id'] !== null && $claim['next_memory_id'] !== $nextMemoryId)
+            ) {
+                throw new RuntimeException('Procedure replacement claim does not match its finalization.');
+            }
+            if ($claim['next_memory_id'] === null) {
+                $bind = $this->connection->prepare(
+                    'UPDATE procedure_replacement_claims
+                     SET next_memory_id = :next_memory_id
+                     WHERE procedure_id = :procedure_id
+                       AND previous_memory_id = :previous_memory_id
+                       AND next_memory_id IS NULL'
+                );
+                $bind->execute([
+                    'next_memory_id' => $nextMemoryId,
+                    'procedure_id' => $procedureId,
+                    'previous_memory_id' => $previousMemoryId,
+                ]);
+                if ($bind->rowCount() !== 1) {
+                    throw new RuntimeException('Procedure replacement lost its successor binding.');
+                }
+            }
+
+            $procedure = Procedure::getByID($procedureId);
+            if (!$procedure instanceof Procedure) {
+                throw new RuntimeException('Procedure replacement target disappeared.');
+            }
+            $applied = false;
+            if ((string) $procedure->status === 'retiring'
+                && (int) $procedure->memory_id === $previousMemoryId
+            ) {
+                $fields['memory_id'] = $nextMemoryId;
+                $fields['status'] = 'active';
+                $procedure->setFields($fields);
+                $procedure->save();
+                $applied = true;
+            } elseif ((string) $procedure->status !== 'active'
+                || (int) $procedure->memory_id !== $nextMemoryId
+            ) {
+                throw new RuntimeException('Procedure replacement conflicts with durable procedure state.');
+            }
+
+            $procedure = Procedure::getByID($procedureId);
+            if (!$procedure instanceof Procedure
+                || (string) $procedure->status !== 'active'
+                || (int) $procedure->memory_id !== $nextMemoryId
+            ) {
+                throw new RuntimeException('Procedure replacement did not publish its exact successor.');
+            }
+            return ['procedure' => $procedure->getData(), 'applied' => $applied];
+        });
+    }
+
+    /**
+     * Finalize a runtime procedure invalidation only if the failed generation
+     * still owns the procedure row. The caller first moves SQLite authorization
+     * to retiring, then retires the token generation; this transaction keeps
+     * the final control row and its immutable event inseparable.
+     */
+    public function finalizeProcedureInvalidation(
+        int $procedureId,
+        int $expectedMemoryId,
+        ?int $actionId,
+        string $procedureKey,
+        string $reason
+    ): bool {
+        if ($procedureId < 1 || $expectedMemoryId < 1) {
+            throw new InvalidArgumentException('Procedure invalidation identity is invalid.');
+        }
+        $this->requireText($procedureKey, 'procedure invalidation key');
+        $this->requireText($reason, 'procedure invalidation reason');
+
+        return $this->transaction(function () use (
+            $procedureId,
+            $expectedMemoryId,
+            $actionId,
+            $procedureKey,
+            $reason
+        ): bool {
+            $claim = $this->procedureInvalidationClaim($procedureId, $expectedMemoryId);
+            if ($claim === null
+                || $claim['action_id'] !== $actionId
+                || $claim['reason'] !== $reason
+            ) {
+                throw new RuntimeException('Procedure invalidation claim does not match its finalization.');
+            }
+            $now = date('Y-m-d H:i:s');
+            $statement = $this->connection->prepare(
+                "UPDATE procedures
+                 SET status = 'invalidated', failure_count = failure_count + 1,
+                     invalidated_at = :invalidated_at,
+                     invalidation_reason = :reason, updated_at = :updated_at
+                 WHERE id = :id AND memory_id = :memory_id AND status = 'retiring'"
+            );
+            $statement->execute([
+                'invalidated_at' => $now,
+                'reason' => $reason,
+                'updated_at' => $now,
+                'id' => $procedureId,
+                'memory_id' => $expectedMemoryId,
+            ]);
+            if ($statement->rowCount() !== 1) {
+                return false;
+            }
+
+            $this->emitOnce(
+                'procedure.invalidated:runtime:' . $procedureId . ':' .
+                    $expectedMemoryId . ':' . hash('sha256', $reason),
+                'procedure.invalidated',
+                [
+                    'procedure_id' => $procedureId,
+                    'memory_id' => $expectedMemoryId,
+                    'action_id' => $actionId,
+                    'procedure_key' => $procedureKey,
+                    'reason' => $reason,
+                ]
+            );
+            return true;
+        });
+    }
+
+    /**
+     * Create or resume one caller-identified procedure invocation. The run row
+     * and started event share a SQLite transaction, so response loss cannot
+     * mint a second run when the caller retries the same operation key.
+     *
+     * @param array<string, mixed> $arguments
+     * @return array{run: array<string, mixed>, event: array<string, mixed>, created: bool}
+     */
+    public function startProcedureRun(
+        int $procedureId,
+        int $procedureMemoryId,
+        int $intentionId,
+        array $arguments,
+        int $stepCount,
+        string $operationKey
+    ): array {
+        if (preg_match('/^[a-f0-9]{64}$/D', $operationKey) !== 1) {
+            throw new InvalidArgumentException('Procedure run operation key must be a SHA-256 value.');
+        }
+        $payload = [
+            'procedure_id' => $procedureId,
+            'procedure_memory_id' => $procedureMemoryId,
+            'intention_id' => $intentionId,
+            'step_count' => $stepCount,
+        ];
+        $operation = function () use (
+            $procedureId,
+            $procedureMemoryId,
+            $intentionId,
+            $arguments,
+            $operationKey,
+            $payload
+        ): array {
+            $existing = ProcedureRun::getByField('operation_key', $operationKey);
+            if ($existing instanceof ProcedureRun) {
+                if ((int) $existing->procedure_id !== $procedureId
+                    || (int) ($existing->procedure_memory_id ?? 0) !== $procedureMemoryId
+                    || (int) $existing->intention_id !== $intentionId
+                    || (array) $existing->arguments !== $arguments
+                ) {
+                    throw new RuntimeException('Procedure run operation key belongs to a different invocation.');
+                }
+                $event = $this->emitOnce(
+                    'procedure.run.started:' . $operationKey,
+                    'procedure.run.started',
+                    $payload + ['procedure_run_id' => (int) $existing->id]
+                );
+                return [
+                    'run' => $existing->getData(),
+                    'event' => $event->getData(),
+                    'created' => false,
+                ];
+            }
+
+            $authorized = $this->connection->prepare(
+                "SELECT COUNT(*) FROM procedures
+                 WHERE id = :id AND memory_id = :memory_id AND status = 'active'"
+            );
+            $authorized->execute(['id' => $procedureId, 'memory_id' => $procedureMemoryId]);
+            $allowed = (int) $authorized->fetchColumn() === 1;
+            $authorized->closeCursor();
+            if (!$allowed) {
+                throw new RuntimeException('Procedure generation changed before its run could start.');
+            }
+
+            /** @var ProcedureRun $run */
+            $run = $this->insert(ProcedureRun::class, [
+                'procedure_id' => $procedureId,
+                'procedure_memory_id' => $procedureMemoryId,
+                'operation_key' => $operationKey,
+                'intention_id' => $intentionId,
+                'arguments' => $arguments,
+                'current_step' => 0,
+                'results' => [],
+                'action_trace_ids' => [],
+                'status' => 'running',
+                'updated_at' => time(),
+            ]);
+            $event = $this->emitOnce(
+                'procedure.run.started:' . $operationKey,
+                'procedure.run.started',
+                $payload + ['procedure_run_id' => (int) $run->id]
+            );
+            return [
+                'run' => $run->getData(),
+                'event' => $event->getData(),
+                'created' => true,
+            ];
+        };
+
+        try {
+            return $this->transaction($operation);
+        } catch (Throwable $throwable) {
+            $existing = ProcedureRun::getByField('operation_key', $operationKey);
+            if (!$existing instanceof ProcedureRun
+                || (int) $existing->procedure_id !== $procedureId
+                || (int) ($existing->procedure_memory_id ?? 0) !== $procedureMemoryId
+                || (int) $existing->intention_id !== $intentionId
+                || (array) $existing->arguments !== $arguments
+            ) {
+                throw $throwable;
+            }
+            $event = $this->emitEventOnce(
+                'procedure.run.started:' . $operationKey,
+                'procedure.run.started',
+                $payload + ['procedure_run_id' => (int) $existing->id]
+            );
+            return ['run' => $existing->getData(), 'event' => $event, 'created' => false];
+        }
+    }
+
+    /**
+     * Compare-and-set one resumable procedure run into a terminal state and
+     * emit its immutable completion event in the same SQLite transaction.
+     * Replays return the exact committed terminal operation; a competing,
+     * different terminal result is rejected instead of being overwritten.
+     *
+     * @param list<array<string, mixed>> $results
+     * @param list<int> $actionTraceIds
+     * @return array{run: array<string, mixed>, event: array<string, mixed>, applied: bool}
+     */
+    public function finalizeProcedureRun(
+        int $runId,
+        int $procedureId,
+        ?int $expectedMemoryId,
+        string $status,
+        array $results,
+        array $actionTraceIds,
+        ?string $reason = null
+    ): array {
+        if ($runId < 1 || $procedureId < 1 || ($expectedMemoryId !== null && $expectedMemoryId < 1)) {
+            throw new InvalidArgumentException('Procedure run terminal identity is invalid.');
+        }
+        $this->requireChoice($status, ['succeeded', 'failed', 'cancelled'], 'procedure run status');
+        if ($status !== 'succeeded') {
+            $this->requireText((string) $reason, 'procedure run terminal reason');
+        } elseif ($reason !== null) {
+            throw new InvalidArgumentException('A successful procedure run cannot have an error reason.');
+        }
+        $actionTraceIds = array_values(array_unique(array_map('intval', $actionTraceIds)));
+
+        return $this->transaction(function () use (
+            $runId,
+            $procedureId,
+            $expectedMemoryId,
+            $status,
+            $results,
+            $actionTraceIds,
+            $reason
+        ): array {
+            $now = date('Y-m-d H:i:s');
+            $generationPredicate = $expectedMemoryId === null
+                ? 'procedure_memory_id IS NULL'
+                : 'procedure_memory_id = :procedure_memory_id';
+            $authorizationPredicate = $status === 'succeeded'
+                ? "AND EXISTS (
+                       SELECT 1 FROM procedures
+                       WHERE procedures.id = procedure_runs.procedure_id
+                         AND procedures.memory_id = procedure_runs.procedure_memory_id
+                         AND procedures.status = 'active'
+                   )"
+                : '';
+            $statement = $this->connection->prepare(
+                "UPDATE procedure_runs
+                 SET status = :status, results = :results,
+                     action_trace_ids = :action_trace_ids, error = :error,
+                     completed_at = :completed_at, updated_at = :updated_at
+                 WHERE id = :id AND procedure_id = :procedure_id
+                   AND {$generationPredicate}
+                   {$authorizationPredicate}
+                   AND status IN ('running', 'waiting')"
+            );
+            $parameters = [
+                'status' => $status,
+                'results' => serialize($results),
+                'action_trace_ids' => serialize($actionTraceIds),
+                'error' => $reason,
+                'completed_at' => $now,
+                'updated_at' => $now,
+                'id' => $runId,
+                'procedure_id' => $procedureId,
+            ];
+            if ($expectedMemoryId !== null) {
+                $parameters['procedure_memory_id'] = $expectedMemoryId;
+            }
+            $statement->execute($parameters);
+            $applied = $statement->rowCount() === 1;
+
+            $run = ProcedureRun::getByID($runId);
+            if (!$run instanceof ProcedureRun
+                || (int) $run->procedure_id !== $procedureId
+                || ($run->procedure_memory_id === null
+                    ? $expectedMemoryId !== null
+                    : (int) $run->procedure_memory_id !== $expectedMemoryId)
+                || (string) $run->status !== $status
+                || (array) $run->results !== $results
+                || array_values(array_map('intval', (array) $run->action_trace_ids)) !== $actionTraceIds
+                || ($status === 'succeeded'
+                    ? $run->error !== null
+                    : (string) $run->error !== (string) $reason)
+            ) {
+                throw new RuntimeException('Procedure run already has a different terminal result.');
+            }
+
+            if ($applied && $status === 'succeeded' && $expectedMemoryId !== null) {
+                $increment = $this->connection->prepare(
+                    "UPDATE procedures
+                     SET execution_count = execution_count + 1,
+                         last_executed_at = :executed_at, updated_at = :updated_at
+                     WHERE id = :id AND memory_id = :memory_id AND status = 'active'"
+                );
+                $increment->execute([
+                    'executed_at' => $now,
+                    'updated_at' => $now,
+                    'id' => $procedureId,
+                    'memory_id' => $expectedMemoryId,
+                ]);
+            }
+
+            $payload = [
+                'procedure_id' => $procedureId,
+                'procedure_run_id' => $runId,
+                'procedure_memory_id' => $expectedMemoryId,
+                'status' => $status,
+            ];
+            if ($status === 'succeeded') {
+                $payload['steps_completed'] = count($results);
+                $payload['action_trace_ids'] = $actionTraceIds;
+            } else {
+                $payload['reason'] = $reason;
+            }
+            $event = $this->emitOnce(
+                'procedure.run.finished:' . $runId,
+                'procedure.run.finished',
+                $payload
+            );
+            return [
+                'run' => $run->getData(),
+                'event' => $event->getData(),
+                'applied' => $applied,
+            ];
+        });
+    }
+
+    /**
+     * Claim one adapter dispatch for this process epoch. A claim left by a
+     * dead process is never stolen for re-execution: the new process receives
+     * a recovery claim and records an honest indeterminate failure instead.
+     *
+     * @return array{execution: array<string, mixed>, claimed: bool, recover: bool}
+     */
+    public function claimActionDispatch(int $actionId): array
+    {
+        if ($actionId < 1) {
+            throw new InvalidArgumentException('Action dispatch identity is invalid.');
+        }
+        return $this->transaction(function () use ($actionId): array {
+            $execution = ActionExecution::getByField('action_trace_id', $actionId);
+            if (!$execution instanceof ActionExecution) {
+                throw new RuntimeException('Action dispatch has no execution record.');
+            }
+            $owner = $this->dispatchOwner();
+            if ($execution->status === 'pending') {
+                $claim = $this->connection->prepare(
+                    "INSERT INTO action_dispatch_claims
+                     (action_trace_id,owner,claimed_at,status,outcome_hash,outcome_data)
+                     VALUES (:action_id,:owner,:claimed_at,'claimed',NULL,NULL)"
+                );
+                $claim->execute([
+                    'action_id' => $actionId,
+                    'owner' => $owner,
+                    'claimed_at' => time(),
+                ]);
+                $statement = $this->connection->prepare(
+                    "UPDATE action_executions
+                     SET status = 'dispatching', updated_at = :updated_at
+                     WHERE action_trace_id = :action_id AND status = 'pending'
+                       AND (procedure_id IS NULL OR EXISTS (
+                           SELECT 1 FROM procedures
+                           WHERE procedures.id = action_executions.procedure_id
+                             AND procedures.memory_id = action_executions.procedure_memory_id
+                             AND procedures.status = 'active'
+                       ))
+                       AND (procedure_run_id IS NULL OR EXISTS (
+                           SELECT 1
+                           FROM procedure_runs
+                           INNER JOIN procedures
+                             ON procedures.id = procedure_runs.procedure_id
+                            AND procedures.memory_id = procedure_runs.procedure_memory_id
+                            AND procedures.status = 'active'
+                           WHERE procedure_runs.id = action_executions.procedure_run_id
+                             AND procedure_runs.status = 'running'
+                       ))"
+                );
+                $statement->execute([
+                    'updated_at' => date('Y-m-d H:i:s'),
+                    'action_id' => $actionId,
+                ]);
+                if ($statement->rowCount() !== 1) {
+                    throw new RuntimeException('Unable to claim action dispatch.');
+                }
+                $execution = ActionExecution::getByField('action_trace_id', $actionId);
+                if (!$execution instanceof ActionExecution) {
+                    throw new RuntimeException('Claimed action dispatch disappeared.');
+                }
+                return ['execution' => $execution->getData(), 'claimed' => true, 'recover' => false];
+            }
+            if ($execution->status === 'dispatching') {
+                $claim = $this->connection->prepare(
+                    'SELECT owner,status,outcome_hash,outcome_data
+                     FROM action_dispatch_claims WHERE action_trace_id = :action_id'
+                );
+                $claim->execute(['action_id' => $actionId]);
+                $claimRow = $claim->fetch(PDO::FETCH_ASSOC);
+                $claim->closeCursor();
+                $previousOwner = is_array($claimRow) ? $claimRow['owner'] ?? null : null;
+                if (!is_string($previousOwner) || $previousOwner === '') {
+                    throw new RuntimeException('Dispatching action is missing its process claim.');
+                }
+                $previousStatus = (string) ($claimRow['status'] ?? '');
+                if (!in_array($previousStatus, ['legacy', 'claimed'], true)) {
+                    throw new RuntimeException('Dispatching action has an invalid claim state.');
+                }
+                if ($previousStatus === 'claimed'
+                    && !hash_equals($previousOwner, $owner)
+                    && $this->dispatchOwnerIsLive($previousOwner)
+                ) {
+                    return ['execution' => $execution->getData(), 'claimed' => false, 'recover' => false];
+                }
+                $observed = [
+                    'error' => $previousStatus === 'legacy'
+                        ? 'Adapter dispatch predates the durable owner ledger; its outcome is indeterminate.'
+                        : (hash_equals($previousOwner, $owner)
+                            ? 'Adapter dispatch returned without durably staging its outcome.'
+                            : 'Adapter dispatch outcome became indeterminate after its owning process exited.'),
+                ];
+                $outcomeHash = hash('sha256', serialize([
+                    'observed' => $observed,
+                    'verified' => false,
+                    'status' => 'failed',
+                ]));
+                $recover = $this->connection->prepare(
+                    'UPDATE action_dispatch_claims
+                     SET owner = :owner, claimed_at = :claimed_at, status = :status,
+                         outcome_hash = :outcome_hash, outcome_data = :outcome_data
+                     WHERE action_trace_id = :action_id AND owner = :previous_owner
+                       AND status = :previous_status'
+                );
+                $recover->execute([
+                    'owner' => $owner,
+                    'claimed_at' => time(),
+                    'status' => 'completed',
+                    'outcome_hash' => $outcomeHash,
+                    'outcome_data' => serialize($observed),
+                    'action_id' => $actionId,
+                    'previous_owner' => $previousOwner,
+                    'previous_status' => $previousStatus,
+                ]);
+                if ($recover->rowCount() !== 1) {
+                    throw new RuntimeException('Unable to claim indeterminate dispatch recovery.');
+                }
+                $now = date('Y-m-d H:i:s');
+                $terminal = $this->connection->prepare(
+                    "UPDATE action_executions
+                     SET observed = :observed, verified = 0, status = 'failed',
+                         completed_at = :completed_at, updated_at = :updated_at
+                     WHERE action_trace_id = :action_id AND status = 'dispatching'"
+                );
+                $terminal->execute([
+                    'observed' => serialize($observed),
+                    'completed_at' => $now,
+                    'updated_at' => $now,
+                    'action_id' => $actionId,
+                ]);
+                if ($terminal->rowCount() !== 1) {
+                    throw new RuntimeException('Unable to close indeterminate action dispatch atomically.');
+                }
+                $execution = ActionExecution::getByField('action_trace_id', $actionId);
+                if (!$execution instanceof ActionExecution) {
+                    throw new RuntimeException('Recovered action dispatch disappeared.');
+                }
+                return ['execution' => $execution->getData(), 'claimed' => false, 'recover' => true];
+            }
+            return [
+                'execution' => $execution->getData(),
+                'claimed' => false,
+                'recover' => false,
+            ];
+        });
+    }
+
+    /**
+     * Compare-and-set one machine-readable adapter outcome. Callback races and
+     * crash replays must either match this exact durable result or fail.
+     *
+     * @param array<string, mixed> $observed
+     * @return array{execution: array<string, mixed>, applied: bool}
+     */
+    public function finalizeActionExecution(
+        int $actionId,
+        array $observed,
+        bool $verified,
+        string $status
+    ): array {
+        $this->requireChoice($status, ['succeeded', 'failed', 'cancelled'], 'action execution status');
+        $outcomeHash = hash('sha256', serialize([
+            'observed' => $observed,
+            'verified' => $verified,
+            'status' => $status,
+        ]));
+        return $this->transaction(function () use (
+            $actionId,
+            $observed,
+            $verified,
+            $status,
+            $outcomeHash
+        ): array {
+            $before = ActionExecution::getByField('action_trace_id', $actionId);
+            if (!$before instanceof ActionExecution) {
+                throw new RuntimeException('Action execution disappeared before outcome finalization.');
+            }
+            if (in_array($before->status, ['succeeded', 'failed', 'cancelled'], true)) {
+                if ((array) $before->observed !== $observed
+                    || (int) $before->verified !== ($verified ? 1 : 0)
+                    || (string) $before->status !== $status
+                ) {
+                    throw new RuntimeException('Action execution already has a different durable outcome.');
+                }
+                $claim = $this->connection->prepare(
+                    'SELECT status,outcome_hash FROM action_dispatch_claims
+                     WHERE action_trace_id = :action_id'
+                );
+                $claim->execute(['action_id' => $actionId]);
+                $claimRow = $claim->fetch(PDO::FETCH_ASSOC);
+                $claim->closeCursor();
+                if (is_array($claimRow) && (string) $claimRow['status'] === 'legacy') {
+                    $upgrade = $this->connection->prepare(
+                        "UPDATE action_dispatch_claims
+                         SET status = 'completed', outcome_hash = :outcome_hash,
+                             outcome_data = :outcome_data
+                         WHERE action_trace_id = :action_id AND status = 'legacy'"
+                    );
+                    $upgrade->execute([
+                        'outcome_hash' => $outcomeHash,
+                        'outcome_data' => serialize($observed),
+                        'action_id' => $actionId,
+                    ]);
+                    if ($upgrade->rowCount() !== 1) {
+                        throw new RuntimeException('Unable to upgrade legacy dispatch receipt.');
+                    }
+                    $claimRow = ['status' => 'completed', 'outcome_hash' => $outcomeHash];
+                }
+                if (is_array($claimRow)
+                    && ((string) $claimRow['status'] !== 'completed'
+                        || !is_string($claimRow['outcome_hash'])
+                        || !hash_equals($claimRow['outcome_hash'], $outcomeHash))
+                ) {
+                    throw new RuntimeException('Terminal action has a different dispatch receipt.');
+                }
+                return ['execution' => $before->getData(), 'applied' => false];
+            }
+            if (!in_array($before->status, ['dispatching', 'waiting'], true)) {
+                throw new RuntimeException('Action execution is not ready for an outcome.');
+            }
+            $claim = $this->connection->prepare(
+                'SELECT owner,status FROM action_dispatch_claims WHERE action_trace_id = :action_id'
+            );
+            $claim->execute(['action_id' => $actionId]);
+            $claimRow = $claim->fetch(PDO::FETCH_ASSOC);
+            $claim->closeCursor();
+            $expectedClaimStatus = (string) $before->status === 'waiting' ? 'waiting' : 'claimed';
+            if (!is_array($claimRow)
+                || (string) $claimRow['status'] !== $expectedClaimStatus
+                || ((string) $before->status === 'dispatching'
+                    && !hash_equals((string) $claimRow['owner'], $this->dispatchOwner()))
+            ) {
+                throw new RuntimeException('Action outcome does not own its dispatch claim.');
+            }
+            $stage = $this->connection->prepare(
+                "UPDATE action_dispatch_claims
+                 SET status = 'completing', outcome_hash = :outcome_hash, outcome_data = :outcome_data
+                 WHERE action_trace_id = :action_id AND status = :expected_status"
+            );
+            $stage->execute([
+                'outcome_hash' => $outcomeHash,
+                'outcome_data' => serialize($observed),
+                'action_id' => $actionId,
+                'expected_status' => $expectedClaimStatus,
+            ]);
+            if ($stage->rowCount() !== 1) {
+                throw new RuntimeException('Action outcome lost its durable staging claim.');
+            }
+            $statement = $this->connection->prepare(
+                "UPDATE action_executions
+                 SET observed = :observed, verified = :verified, status = :status,
+                     completed_at = :completed_at, updated_at = :updated_at
+                 WHERE action_trace_id = :action_id
+                   AND status IN ('dispatching', 'waiting')"
+            );
+            $now = date('Y-m-d H:i:s');
+            $statement->execute([
+                'observed' => serialize($observed),
+                'verified' => $verified ? 1 : 0,
+                'status' => $status,
+                'completed_at' => $now,
+                'updated_at' => $now,
+                'action_id' => $actionId,
+            ]);
+            $execution = ActionExecution::getByField('action_trace_id', $actionId);
+            if (!$execution instanceof ActionExecution
+                || (array) $execution->observed !== $observed
+                || (int) $execution->verified !== ($verified ? 1 : 0)
+                || (string) $execution->status !== $status
+            ) {
+                throw new RuntimeException('Action execution already has a different durable outcome.');
+            }
+            $complete = $this->connection->prepare(
+                "UPDATE action_dispatch_claims SET status = 'completed'
+                 WHERE action_trace_id = :action_id AND status = 'completing'
+                   AND outcome_hash = :outcome_hash"
+            );
+            $complete->execute(['action_id' => $actionId, 'outcome_hash' => $outcomeHash]);
+            if ($complete->rowCount() !== 1) {
+                throw new RuntimeException('Action outcome lost its completion receipt.');
+            }
+            return [
+                'execution' => $execution->getData(),
+                'applied' => $statement->rowCount() === 1,
+            ];
+        });
+    }
+
+    /**
+     * Fail an action whose authorization disappeared before any process
+     * claimed dispatch. This CAS can never overwrite a live dispatcher.
+     *
+     * @param array<string, mixed> $observed
+     * @return array<string, mixed>
+     */
+    public function rejectPendingActionExecution(int $actionId, array $observed): array
+    {
+        return $this->transaction(function () use ($actionId, $observed): array {
+            $now = date('Y-m-d H:i:s');
+            $statement = $this->connection->prepare(
+                "UPDATE action_executions
+                 SET observed = :observed, verified = 0, status = 'failed',
+                     completed_at = :completed_at, updated_at = :updated_at
+                 WHERE action_trace_id = :action_id AND status = 'pending'"
+            );
+            $statement->execute([
+                'observed' => serialize($observed),
+                'completed_at' => $now,
+                'updated_at' => $now,
+                'action_id' => $actionId,
+            ]);
+            $execution = ActionExecution::getByField('action_trace_id', $actionId);
+            if (!$execution instanceof ActionExecution
+                || (array) $execution->observed !== $observed
+                || (int) $execution->verified !== 0
+                || (string) $execution->status !== 'failed'
+            ) {
+                throw new RuntimeException('Pending action authorization denial lost its dispatch race.');
+            }
+            return $execution->getData();
+        });
+    }
+
+    /** @return array<string, mixed> */
+    public function markActionExecutionWaiting(int $actionId, int $dispatchEventId): array
+    {
+        if ($actionId < 1 || $dispatchEventId < 1) {
+            throw new InvalidArgumentException('Waiting action dispatch identity is invalid.');
+        }
+        return $this->transaction(function () use ($actionId, $dispatchEventId): array {
+            $statement = $this->connection->prepare(
+                "UPDATE action_executions
+                 SET dispatch_event_id = :dispatch_event_id, status = 'waiting', updated_at = :updated_at
+                 WHERE action_trace_id = :action_id AND status = 'dispatching'"
+            );
+            $statement->execute([
+                'dispatch_event_id' => $dispatchEventId,
+                'updated_at' => date('Y-m-d H:i:s'),
+                'action_id' => $actionId,
+            ]);
+            if ($statement->rowCount() === 1) {
+                $wait = $this->connection->prepare(
+                    "UPDATE action_dispatch_claims SET status = 'waiting'
+                     WHERE action_trace_id = :action_id AND owner = :owner AND status = 'claimed'"
+                );
+                $wait->execute(['action_id' => $actionId, 'owner' => $this->dispatchOwner()]);
+                if ($wait->rowCount() !== 1) {
+                    throw new RuntimeException('Waiting action lost its dispatch claim.');
+                }
+            }
+            $execution = ActionExecution::getByField('action_trace_id', $actionId);
+            if (!$execution instanceof ActionExecution
+                || (int) ($execution->dispatch_event_id ?? 0) !== $dispatchEventId
+                || (string) $execution->status !== 'waiting'
+            ) {
+                throw new RuntimeException('Waiting action dispatch conflicts with durable execution state.');
+            }
+            $claim = $this->connection->prepare(
+                'SELECT status FROM action_dispatch_claims WHERE action_trace_id = :action_id'
+            );
+            $claim->execute(['action_id' => $actionId]);
+            $claimStatus = $claim->fetchColumn();
+            $claim->closeCursor();
+            if ($claimStatus !== 'waiting') {
+                throw new RuntimeException('Waiting action has no durable dispatch receipt.');
+            }
+            return $execution->getData();
+        });
+    }
+
+    /**
+     * Persist one completed asynchronous result exactly once before resuming
+     * its next step. Replays validate the already-committed result and may
+     * safely re-enter advanceRun; per-step dispatch identities deduplicate it.
+     *
+     * @param list<array<string, mixed>> $results
+     * @param array<string, mixed> $completedResult
+     * @return array{run: array<string, mixed>, applied: bool}
+     */
+    public function resumeProcedureRunAfterAsync(
+        int $runId,
+        int $procedureId,
+        ?int $expectedMemoryId,
+        int $stepIndex,
+        array $results,
+        array $completedResult
+    ): array {
+        if ($runId < 1 || $procedureId < 1 || $stepIndex < 0) {
+            throw new InvalidArgumentException('Asynchronous procedure result identity is invalid.');
+        }
+        return $this->transaction(function () use (
+            $runId,
+            $procedureId,
+            $expectedMemoryId,
+            $stepIndex,
+            $results,
+            $completedResult
+        ): array {
+            $generationPredicate = $expectedMemoryId === null
+                ? 'procedure_memory_id IS NULL'
+                : 'procedure_memory_id = :procedure_memory_id';
+            $statement = $this->connection->prepare(
+                "UPDATE procedure_runs
+                 SET current_step = :next_step, results = :results,
+                     status = 'running', updated_at = :updated_at
+                 WHERE id = :id AND procedure_id = :procedure_id
+                   AND {$generationPredicate}
+                   AND status = 'waiting' AND current_step = :step_index"
+            );
+            $parameters = [
+                'next_step' => $stepIndex + 1,
+                'results' => serialize($results),
+                'updated_at' => date('Y-m-d H:i:s'),
+                'id' => $runId,
+                'procedure_id' => $procedureId,
+                'step_index' => $stepIndex,
+            ];
+            if ($expectedMemoryId !== null) {
+                $parameters['procedure_memory_id'] = $expectedMemoryId;
+            }
+            $statement->execute($parameters);
+
+            $run = ProcedureRun::getByID($runId);
+            $matchingResult = null;
+            if ($run instanceof ProcedureRun) {
+                foreach ((array) $run->results as $candidate) {
+                    if (is_array($candidate)
+                        && (int) ($candidate['step'] ?? -1) === $stepIndex
+                        && (int) ($candidate['action_id'] ?? 0) === (int) ($completedResult['action_id'] ?? 0)
+                    ) {
+                        $matchingResult = $candidate;
+                        break;
+                    }
+                }
+            }
+            if (!$run instanceof ProcedureRun
+                || (int) $run->procedure_id !== $procedureId
+                || ($run->procedure_memory_id === null
+                    ? $expectedMemoryId !== null
+                    : (int) $run->procedure_memory_id !== $expectedMemoryId)
+                || (int) $run->current_step < $stepIndex + 1
+                || $matchingResult !== $completedResult
+            ) {
+                throw new RuntimeException('Asynchronous procedure result conflicts with durable run state.');
+            }
+            return [
+                'run' => $run->getData(),
+                'applied' => $statement->rowCount() === 1,
+            ];
+        });
+    }
+
+    /** @param list<int> $actionTraceIds
+     *  @return array{run: array<string, mixed>, applied: bool}
+     */
+    public function suspendProcedureRunForAction(
+        int $runId,
+        int $procedureId,
+        int $expectedMemoryId,
+        int $stepIndex,
+        array $actionTraceIds
+    ): array {
+        $actionTraceIds = array_values(array_unique(array_map('intval', $actionTraceIds)));
+        return $this->transaction(function () use (
+            $runId,
+            $procedureId,
+            $expectedMemoryId,
+            $stepIndex,
+            $actionTraceIds
+        ): array {
+            $statement = $this->connection->prepare(
+                "UPDATE procedure_runs
+                 SET action_trace_ids = :action_trace_ids, status = 'waiting', updated_at = :updated_at
+                 WHERE id = :id AND procedure_id = :procedure_id
+                   AND procedure_memory_id = :procedure_memory_id
+                   AND status = 'running' AND current_step = :step_index"
+            );
+            $statement->execute([
+                'action_trace_ids' => serialize($actionTraceIds),
+                'updated_at' => date('Y-m-d H:i:s'),
+                'id' => $runId,
+                'procedure_id' => $procedureId,
+                'procedure_memory_id' => $expectedMemoryId,
+                'step_index' => $stepIndex,
+            ]);
+            $run = ProcedureRun::getByID($runId);
+            if (!$run instanceof ProcedureRun
+                || (int) $run->procedure_id !== $procedureId
+                || (int) ($run->procedure_memory_id ?? 0) !== $expectedMemoryId
+                || (int) $run->current_step !== $stepIndex
+                || (string) $run->status !== 'waiting'
+                || array_values(array_map('intval', (array) $run->action_trace_ids)) !== $actionTraceIds
+            ) {
+                throw new RuntimeException('Procedure wait checkpoint conflicts with durable run state.');
+            }
+            return ['run' => $run->getData(), 'applied' => $statement->rowCount() === 1];
+        });
+    }
+
+    /** @param list<array<string, mixed>> $results
+     *  @param list<int> $actionTraceIds
+     *  @param array<string, mixed> $completedResult
+     *  @return array{run: array<string, mixed>, applied: bool}
+     */
+    public function checkpointProcedureRunStep(
+        int $runId,
+        int $procedureId,
+        int $expectedMemoryId,
+        int $stepIndex,
+        array $results,
+        array $actionTraceIds,
+        array $completedResult
+    ): array {
+        $actionTraceIds = array_values(array_unique(array_map('intval', $actionTraceIds)));
+        return $this->transaction(function () use (
+            $runId,
+            $procedureId,
+            $expectedMemoryId,
+            $stepIndex,
+            $results,
+            $actionTraceIds,
+            $completedResult
+        ): array {
+            $statement = $this->connection->prepare(
+                "UPDATE procedure_runs
+                 SET current_step = :next_step, results = :results,
+                     action_trace_ids = :action_trace_ids, updated_at = :updated_at
+                 WHERE id = :id AND procedure_id = :procedure_id
+                   AND procedure_memory_id = :procedure_memory_id
+                   AND status = 'running' AND current_step = :step_index"
+            );
+            $statement->execute([
+                'next_step' => $stepIndex + 1,
+                'results' => serialize($results),
+                'action_trace_ids' => serialize($actionTraceIds),
+                'updated_at' => date('Y-m-d H:i:s'),
+                'id' => $runId,
+                'procedure_id' => $procedureId,
+                'procedure_memory_id' => $expectedMemoryId,
+                'step_index' => $stepIndex,
+            ]);
+            $run = ProcedureRun::getByID($runId);
+            $matchingResult = null;
+            if ($run instanceof ProcedureRun) {
+                foreach ((array) $run->results as $candidate) {
+                    if (is_array($candidate)
+                        && (int) ($candidate['step'] ?? -1) === $stepIndex
+                        && (int) ($candidate['action_id'] ?? 0) === (int) ($completedResult['action_id'] ?? 0)
+                    ) {
+                        $matchingResult = $candidate;
+                        break;
+                    }
+                }
+            }
+            $durableActionIds = $run instanceof ProcedureRun
+                ? array_values(array_map('intval', (array) $run->action_trace_ids))
+                : [];
+            if (!$run instanceof ProcedureRun
+                || (int) $run->procedure_id !== $procedureId
+                || (int) ($run->procedure_memory_id ?? 0) !== $expectedMemoryId
+                || (int) $run->current_step < $stepIndex + 1
+                || $matchingResult !== $completedResult
+                || array_diff($actionTraceIds, $durableActionIds) !== []
+            ) {
+                throw new RuntimeException('Procedure step checkpoint conflicts with durable run state.');
+            }
+            return ['run' => $run->getData(), 'applied' => $statement->rowCount() === 1];
+        });
+    }
+
     /** @return array{version: int, tables: list<string>} */
     public function initialize(): array
     {
         $schema = $this->schema->ensure();
         $this->ensureDefaultNeeds();
         $this->ensureDefaultRhythms();
-        $this->registerLocalModel(LocalModelWorker::MODEL_ID);
+        $this->registerCodexModel(CodexSparkWorker::MODEL_ID);
         $this->otherModel->captureBaseline();
         return $schema;
     }
@@ -356,7 +1544,7 @@ final class ExecutiveCore
                     $budget['quiet_end_hour'],
                     $budget['explicit_wake_until']
                 );
-                $budget['poll_seconds'] = 5;
+                $budget['poll_seconds'] = 0;
                 $budget['max_spoken_words'] = 35;
                 $budget['allowed_actuator'] = 'pet_http_speak';
                 // 0 = no model-dispatch floor. User corrected: Navi may speak
@@ -379,7 +1567,7 @@ final class ExecutiveCore
                     'thread_key' => $existing->thread_key,
                     'change_authority' => 'user',
                     'policy' => 'moment_to_moment_intention',
-                    'poll_seconds' => 5,
+                    'poll_seconds' => 0,
                     'timer_gated_speech' => false,
                 ]);
                 return [
@@ -412,7 +1600,7 @@ final class ExecutiveCore
                 'wake_at' => $now,
                 'budget' => [
                     'need_key' => self::SELF_PRESENCE_NEED_KEY,
-                    'poll_seconds' => 5,
+                    'poll_seconds' => 0,
                     'max_spoken_words' => 35,
                     'allowed_actuator' => 'pet_http_speak',
                     'min_worker_interval_seconds' => 0,
@@ -528,9 +1716,9 @@ final class ExecutiveCore
      *
      * This is a `think`-ceiling thread: it never speaks aloud and never acts.
      * It is private self-talk — successive first-person lines Navi addresses to
-     * herself, paced by salience, causally linked through a carried-over
-     * workspace. It is not continuous token generation, and it stops while Navi
-     * is asleep.
+     * herself, causally linked through a carried-over workspace. Useful progress
+     * may continue immediately; repetition backs off until new evidence arrives.
+     * It has no actuator.
      */
     public function createMindStreamThread(int $intentionId): array
     {
@@ -546,16 +1734,16 @@ final class ExecutiveCore
             if ($existing instanceof CognitiveThread) {
                 $existing->setFields([
                     'parent_intention_id' => (int) $intention->id,
-                    'effect_ceiling' => 'act',
-                    'concern' => 'Keep one inner monologue while awake: talk to yourself about what is happening. Most lines stay private; occasionally murmur one aloud as self-talk through Pet.',
-                    'current_belief' => 'Inner monologue is successive self-talk linked across wakes; tempo follows salience; occasional spoken murmurs are still aimed at herself, not at Aku.',
+                    'effect_ceiling' => 'think',
+                    'concern' => 'Keep one continuous private inner monologue: talk to yourself about what is happening without acting or speaking.',
+                    'current_belief' => 'Inner monologue advances through bounded private self-talk when evidence or a distinct hypothesis changes the thought.',
                     'phase' => 'awake',
                     'next_operation' => 'think',
-                    'expected_postcondition' => 'Each tick records one line of self-talk or an explicit reason for drifting; a subset may be murmured aloud.',
+                    'expected_postcondition' => 'Accepted semantic progress may continue immediately; repetition is rejected and backs off until a later wake or new evidence.',
                     'wake_at' => $now,
                     'budget' => $budget,
                     'status' => 'active',
-                    'last_observation' => 'User asked that the inner monologue occasionally produce spoken self-talk.',
+                    'last_observation' => 'The user disabled autonomous speaking while cognition is audited; this lane is private only.',
                     'updated_at' => $now,
                 ]);
                 $existing->save();
@@ -563,9 +1751,9 @@ final class ExecutiveCore
                     'thread_id' => $existing->id,
                     'thread_key' => $existing->thread_key,
                     'change_authority' => 'user',
-                    'policy' => 'inner_monologue_with_occasional_murmur',
-                    'effect_ceiling' => 'act',
-                    'allowed_actuator' => 'pet_http_speak',
+                    'policy' => 'private_inner_monologue',
+                    'effect_ceiling' => 'think',
+                    'allowed_actuator' => null,
                 ]);
                 return [
                     'thread' => $existing->getData(),
@@ -580,21 +1768,20 @@ final class ExecutiveCore
                 'parent_intention_id' => (int) $intention->id,
                 'thread_key' => self::MIND_STREAM_THREAD_KEY,
                 'authority' => 'user',
-                'effect_ceiling' => 'act',
-                'concern' => 'Keep one inner monologue while awake: talk to yourself about what is happening. Most lines stay private; occasionally murmur one aloud as self-talk through Pet.',
-                'current_belief' => 'Inner monologue is successive self-talk linked across wakes; tempo follows salience; occasional spoken murmurs are still aimed at herself, not at Aku.',
+                'effect_ceiling' => 'think',
+                'concern' => 'Keep one continuous private inner monologue: talk to yourself about what is happening without acting or speaking.',
+                'current_belief' => 'Inner monologue advances through bounded private self-talk when evidence or a distinct hypothesis changes the thought.',
                 'uncertainty' => 0.7,
                 'support_refs' => [
                     'intention_id' => (int) $intention->id,
                     'authorization' => 'explicit_user_request_for_inner_monologue',
                     'authorized_at' => $now,
-                    'effect_ceiling' => 'act',
-                    'allowed_actuator' => 'pet_http_speak',
+                    'effect_ceiling' => 'think',
                 ],
-                'desired_outcome' => 'A legible monologue across a waking period, mostly private, with occasional spoken self-talk murmured through Pet.',
+                'desired_outcome' => 'A legible continuous private monologue.',
                 'phase' => 'awake',
                 'next_operation' => 'think',
-                'expected_postcondition' => 'Each tick records one line of self-talk or an explicit reason for drifting; a subset may be murmured aloud.',
+                'expected_postcondition' => 'Accepted semantic progress may continue immediately; repetition is rejected and backs off until a later wake or new evidence.',
                 'wake_at' => $now,
                 'budget' => $budget,
                 'spent' => ['worker_calls' => 0, 'accepted' => 0, 'rejected' => 0, 'murmur_count' => 0],
@@ -612,10 +1799,10 @@ final class ExecutiveCore
                 'thread_id' => $thread->id,
                 'thread_key' => $thread->thread_key,
                 'parent_intention_id' => $thread->parent_intention_id,
-                'effect_ceiling' => 'act',
+                'effect_ceiling' => 'think',
                 'continuous' => true,
                 'mode' => 'inner_monologue',
-                'allowed_actuator' => 'pet_http_speak',
+                'allowed_actuator' => null,
             ]);
 
             return ['thread' => $thread->getData(), 'event' => $event->getData(), 'deduplicated' => false];
@@ -639,21 +1826,17 @@ final class ExecutiveCore
     private function mindStreamBudget(): array
     {
         return [
-            // Tempo. The floor keeps a burst of edges from pinning the local
-            // model; the base is the idle drift rate between lines of self-talk.
-            'idle_interval_seconds' => 240,
-            'min_interval_seconds' => 60,
+            // A useful line may immediately continue. Rejected repetition
+            // backs off, and a genuinely new sense edge wakes the lane early.
+            'poll_seconds' => 0,
+            'idle_interval_seconds' => 0,
+            'min_interval_seconds' => 0,
             'salience_gain' => 3.0,
-            'min_worker_interval_seconds' => 60,
+            'min_worker_interval_seconds' => 0,
             'quiet_start_hour' => 2,
             'quiet_end_hour' => 9,
             'quiet_timezone' => 'America/Los_Angeles',
             'mode' => 'inner_monologue',
-            // Occasional spoken self-talk. Not a cooldown: each accepted line
-            // gets a deterministic chance to be murmured through Pet.
-            'allowed_actuator' => 'pet_http_speak',
-            'murmur_chance' => 0.22,
-            'murmur_min_confidence' => 0.55,
             'capsule_slots' => 6,
             'capsule_hysteresis' => 0.05,
             'capsule_roster' => [
@@ -725,9 +1908,11 @@ final class ExecutiveCore
         ?string $actionKind = null,
         array $arguments = [],
         ?int $procedureId = null,
+        ?int $procedureMemoryId = null,
         ?int $procedureRunId = null,
         ?int $stepIndex = null,
-        ?array $verifier = null
+        ?array $verifier = null,
+        ?int $decisionCycleId = null
     ): array
     {
         $this->requireText($description, 'description');
@@ -736,19 +1921,43 @@ final class ExecutiveCore
         if ($intention->status !== 'active') {
             throw new RuntimeException('Actions can only start for active intentions.');
         }
+        if (($procedureRunId === null) !== ($stepIndex === null) || ($stepIndex !== null && $stepIndex < 0)) {
+            throw new InvalidArgumentException('Procedure run actions require a non-negative run step identity.');
+        }
 
         $procedure = $this->proceduralMemory->recall($description, $expected, $actionKind, $arguments);
+        if ($procedureRunId !== null && $stepIndex !== null) {
+            $replay = $this->replayStartedProcedureStep(
+                $intentionId,
+                $description,
+                $expected,
+                $actionKind,
+                $arguments,
+                $procedureId ?? ($procedure['procedure_id'] ?? null),
+                $procedureMemoryId ?? ($procedure['memory_id'] ?? null),
+                $procedureRunId,
+                $stepIndex,
+                $verifier,
+                $procedure
+            );
+            if ($replay !== null) {
+                return $replay;
+            }
+        }
 
-        return $this->transaction(function () use (
+        try {
+            return $this->transaction(function () use (
             $intentionId,
             $description,
             $expected,
             $actionKind,
             $arguments,
             $procedureId,
+            $procedureMemoryId,
             $procedureRunId,
             $stepIndex,
             $verifier,
+            $decisionCycleId,
             $procedure
         ): array {
             /** @var ActionTrace $action */
@@ -765,10 +1974,98 @@ final class ExecutiveCore
                 $actionKind,
                 $arguments,
                 $procedureId ?? ($procedure['procedure_id'] ?? null),
+                $procedureMemoryId ?? ($procedure['memory_id'] ?? null),
                 $procedureRunId,
                 $stepIndex,
                 $verifier
             );
+
+            if ($decisionCycleId !== null) {
+                $decisionExecution = ActionExecution::getByField(
+                    'action_trace_id',
+                    (int) $action->id
+                );
+                if (!$decisionExecution instanceof ActionExecution || $procedureRunId !== null) {
+                    throw new RuntimeException('Decision action has a crossed execution identity.');
+                }
+                $decisionCycle = DecisionCycle::getByID($decisionCycleId);
+                if (!$decisionCycle instanceof DecisionCycle
+                    || (string) $decisionCycle->status !== 'running'
+                    || (string) $decisionCycle->state !== 'execute'
+                    || (int) $decisionCycle->intention_id !== $intentionId
+                ) {
+                    throw new RuntimeException('Action cannot bind a different decision cycle.');
+                }
+                $selection = is_array($decisionCycle->selection) ? $decisionCycle->selection : [];
+                $candidate = DecisionCandidate::getByID((int) ($selection['candidate_id'] ?? 0));
+                $selectedProcedureId = isset($selection['procedure_id'])
+                    && $selection['procedure_id'] !== null
+                    ? (int) $selection['procedure_id']
+                    : null;
+                $selectedProcedureMemoryId = isset($selection['procedure_memory_id'])
+                    && $selection['procedure_memory_id'] !== null
+                    ? (int) $selection['procedure_memory_id']
+                    : null;
+                $effectiveProcedureId = $procedureId ?? ($procedure['procedure_id'] ?? null);
+                $effectiveProcedureMemoryId = $procedureMemoryId ?? ($procedure['memory_id'] ?? null);
+                $candidateEvaluation = $candidate instanceof DecisionCandidate
+                    && is_array($candidate->evaluation)
+                    ? $candidate->evaluation
+                    : [];
+                $candidateProcedureId = isset($candidateEvaluation['recalled_procedure_id'])
+                    && $candidateEvaluation['recalled_procedure_id'] !== null
+                    ? (int) $candidateEvaluation['recalled_procedure_id']
+                    : null;
+                $candidateProcedureMemoryId = isset($candidateEvaluation['recalled_procedure_memory_id'])
+                    && $candidateEvaluation['recalled_procedure_memory_id'] !== null
+                    ? (int) $candidateEvaluation['recalled_procedure_memory_id']
+                    : null;
+                $recalledProcedureId = isset($procedure['procedure_id'])
+                    ? (int) $procedure['procedure_id']
+                    : null;
+                $recalledProcedureMemoryId = isset($procedure['memory_id'])
+                    ? (int) $procedure['memory_id']
+                    : null;
+                if (!$candidate instanceof DecisionCandidate
+                    || (int) $candidate->decision_cycle_id !== $decisionCycleId
+                    || (string) $candidate->status !== 'selected'
+                    || !hash_equals((string) $candidate->action_kind, (string) $actionKind)
+                    || (array) $candidate->arguments !== $arguments
+                    || !hash_equals((string) $candidate->description, $description)
+                    || !hash_equals((string) $candidate->expected, $expected)
+                    || (int) ($selectedProcedureId ?? 0) !== (int) ($effectiveProcedureId ?? 0)
+                    || (int) ($selectedProcedureMemoryId ?? 0)
+                        !== (int) ($effectiveProcedureMemoryId ?? 0)
+                    || (int) ($candidateProcedureId ?? 0) !== (int) ($selectedProcedureId ?? 0)
+                    || (int) ($candidateProcedureMemoryId ?? 0)
+                        !== (int) ($selectedProcedureMemoryId ?? 0)
+                    || (int) ($recalledProcedureId ?? 0) !== (int) ($selectedProcedureId ?? 0)
+                    || (int) ($recalledProcedureMemoryId ?? 0)
+                        !== (int) ($selectedProcedureMemoryId ?? 0)
+                ) {
+                    throw new RuntimeException('Decision action does not match its selected candidate.');
+                }
+                $decisionCycle->setFields([
+                    'execution' => [
+                        'candidate_id' => $selection['candidate_id'] ?? null,
+                        'action_id' => (int) $action->id,
+                        'status' => 'pending',
+                        'adapter_dispatch' => null,
+                    ],
+                    'updated_at' => time(),
+                ]);
+                $decisionCycle->save();
+                $decisionClaim = $this->connection->prepare(
+                    "INSERT INTO decision_async_claims
+                     (action_id,decision_cycle_id,request_event_id,owner,status,outcome_hash)
+                     VALUES (:action_id,:decision_cycle_id,NULL,:owner,'started',NULL)"
+                );
+                $decisionClaim->execute([
+                    'action_id' => (int) $action->id,
+                    'decision_cycle_id' => $decisionCycleId,
+                    'owner' => $this->dispatchOwner(),
+                ]);
+            }
 
             $event = $this->emit('action.started', [
                 'action_id' => $action->id,
@@ -778,7 +2075,8 @@ final class ExecutiveCore
                 'action_kind' => $actionKind,
                 'arguments' => $actionKind === null ? null : $arguments,
                 'procedure_id' => $procedureId ?? ($procedure['procedure_id'] ?? null),
-                'procedure_memory_id' => $procedure['memory_id'] ?? null,
+                'procedure_memory_id' => $procedureMemoryId ?? ($procedure['memory_id'] ?? null),
+                'decision_cycle_id' => $decisionCycleId,
             ]);
 
             $action->setField('start_event_id', $event->id);
@@ -804,7 +2102,99 @@ final class ExecutiveCore
                 'procedure' => $procedure,
                 'procedure_event' => $procedureEvent,
             ];
-        });
+            });
+        } catch (Throwable $throwable) {
+            if ($procedureRunId === null || $stepIndex === null) {
+                throw $throwable;
+            }
+            $replay = $this->replayStartedProcedureStep(
+                $intentionId,
+                $description,
+                $expected,
+                $actionKind,
+                $arguments,
+                $procedureId ?? ($procedure['procedure_id'] ?? null),
+                $procedureMemoryId ?? ($procedure['memory_id'] ?? null),
+                $procedureRunId,
+                $stepIndex,
+                $verifier,
+                $procedure
+            );
+            if ($replay === null) {
+                throw $throwable;
+            }
+            return $replay;
+        }
+    }
+
+    /**
+     * Return the exact action already installed for a run step. Migration 21's
+     * partial unique index turns concurrent starts into one durable winner;
+     * this method validates the full request before treating it as a replay.
+     *
+     * @param array<string, mixed> $arguments
+     * @param array<string, mixed>|null $verifier
+     * @param array<string, mixed>|null $procedure
+     * @return array<string, mixed>|null
+     */
+    private function replayStartedProcedureStep(
+        int $intentionId,
+        string $description,
+        string $expected,
+        ?string $actionKind,
+        array $arguments,
+        ?int $procedureId,
+        ?int $procedureMemoryId,
+        int $procedureRunId,
+        int $stepIndex,
+        ?array $verifier,
+        ?array $procedure
+    ): ?array {
+        $executions = ActionExecution::getAllByWhere([
+            'procedure_run_id' => $procedureRunId,
+            'step_index' => $stepIndex + 1,
+        ]);
+        if ($executions === []) {
+            return null;
+        }
+        if (count($executions) !== 1 || $actionKind === null) {
+            throw new RuntimeException('Procedure run step identity is not unique.');
+        }
+        $execution = $executions[0];
+        $effectiveVerifier = $verifier ?? $this->proceduralMemory->verifierFor($actionKind);
+        // A pre-v21 composite action has no durable child-memory generation.
+        // It may replay only into the existing execution: pending dispatch is
+        // then refused by executionAuthorizationActive(), while an already
+        // dispatched/waiting/terminal action follows its durable recovery path.
+        if ((int) ($execution->procedure_id ?? 0) !== (int) ($procedureId ?? 0)
+            || ($execution->procedure_memory_id !== null
+                && (int) $execution->procedure_memory_id !== (int) ($procedureMemoryId ?? 0))
+            || (string) $execution->action_kind !== $actionKind
+            || (array) $execution->arguments !== $arguments
+            || (array) $execution->verifier !== $effectiveVerifier
+        ) {
+            throw new RuntimeException('Procedure run step was already started with a different execution request.');
+        }
+        $action = ActionTrace::getByID((int) $execution->action_trace_id);
+        if (!$action instanceof ActionTrace
+            || (int) $action->intention_id !== $intentionId
+            || (string) $action->description !== $description
+            || (string) $action->expected !== $expected
+        ) {
+            throw new RuntimeException('Procedure run step points to a different action trace.');
+        }
+        $event = Event::getByID((int) ($action->start_event_id ?? 0));
+        if (!$event instanceof Event) {
+            throw new RuntimeException('Procedure run step is missing its start event.');
+        }
+        return [
+            'action' => $action->getData(),
+            'event' => $event->getData(),
+            'execution' => $execution->getData(),
+            'procedure' => $procedure,
+            'procedure_event' => null,
+            'replayed' => true,
+        ];
     }
 
     /** @return array<string, mixed> */
@@ -825,9 +2215,14 @@ final class ExecutiveCore
     }
 
     /** @return array<string, mixed> */
-    public function runProcedure(int $procedureId, int $intentionId, array $arguments = []): array
+    public function runProcedure(
+        int $procedureId,
+        int $intentionId,
+        array $arguments,
+        string $invocationKey
+    ): array
     {
-        return $this->proceduralMemory->run($procedureId, $intentionId, $arguments);
+        return $this->proceduralMemory->run($procedureId, $intentionId, $arguments, $invocationKey);
     }
 
     /** @param list<int> $procedureIds
@@ -894,79 +2289,113 @@ final class ExecutiveCore
         $this->requireText($observed, 'observed result');
         $this->requireText($repairNote, 'repair note');
 
-        $action = $this->requireAction($actionId);
-        if ($action->status !== 'pending') {
-            throw new RuntimeException('The action has already been finished.');
+        $matchStatus = $matched ? 'matched' : 'mismatched';
+        $result = $this->transaction(function () use (
+                $actionId,
+                $status,
+                $observed,
+                $matchStatus,
+                $repairNote
+            ): ?array {
+                $claim = $this->connection->prepare(
+                    "UPDATE action_traces SET status = status WHERE id = :id AND status = 'pending'"
+                );
+                $claim->execute(['id' => $actionId]);
+                if ($claim->rowCount() !== 1) {
+                    return null;
+                }
+
+                $action = $this->requireAction($actionId);
+                $event = $this->emitOnce('action.finished:' . $actionId, 'action.finished', [
+                    'action_id' => (int) $action->id,
+                    'intention_id' => $action->intention_id,
+                    'status' => $status,
+                    'expected' => $action->expected,
+                    'observed' => $observed,
+                    'match_status' => $matchStatus,
+                    'repair_note' => $repairNote,
+                ]);
+
+                $action->setFields([
+                    'completed_at' => time(),
+                    'observed' => $observed,
+                    'status' => $status,
+                    'match_status' => $matchStatus,
+                    'repair_note' => $repairNote,
+                    'completion_event_id' => $event->id,
+                ]);
+                $action->save();
+
+                // A manually closed typed trace remains unverified unless its
+                // adapter already recorded a machine-readable observation. This
+                // prevents `--matched=yes` alone from minting executable code.
+                $execution = \NaviBrain\Model\ActionExecution::getByField(
+                    'action_trace_id',
+                    (int) $action->id
+                );
+                if ($execution instanceof \NaviBrain\Model\ActionExecution
+                    && $execution->status === 'pending'
+                ) {
+                    $execution->setFields([
+                        'observed' => ['reported' => $observed],
+                        'status' => $status,
+                        'completed_at' => time(),
+                        'updated_at' => time(),
+                    ]);
+                    $execution->save();
+                }
+
+                return [$action, $event];
+            });
+
+        if ($result !== null) {
+            [$action, $event] = $result;
+        } else {
+            $action = $this->requireAction($actionId);
+            if ((string) $action->status !== $status
+                || (string) $action->observed !== $observed
+                || (string) $action->match_status !== $matchStatus
+                || (string) $action->repair_note !== $repairNote
+            ) {
+                throw new RuntimeException('The action was already finished with a different result.');
+            }
+            $event = $this->eventByDedupeKey('action.finished:' . $actionId);
+            if (!$event instanceof Event || $event->kind !== 'action.finished') {
+                throw new RuntimeException('The finished action is missing its completion event.');
+            }
         }
 
-        return $this->transaction(function () use ($action, $status, $observed, $matched, $repairNote): array {
-            $matchStatus = $matched ? 'matched' : 'mismatched';
-            $event = $this->emit('action.finished', [
-                'action_id' => $action->id,
-                'intention_id' => $action->intention_id,
-                'status' => $status,
-                'expected' => $action->expected,
-                'observed' => $observed,
-                'match_status' => $matchStatus,
-                'repair_note' => $repairNote,
-            ]);
+        $memoryTime = $this->timestamp($event->created_at) ?? time();
+        /** @var Memory $memory */
+        $memory = $this->insert(Memory::class, [
+            'operation_key' => TokenMemoryDaemon::operationKey(
+                'finish-action-memory',
+                (string) $event->id
+            ),
+            'tier' => 'episodic',
+            'content' => sprintf(
+                'Action "%s" expected "%s" and observed "%s". Outcome: %s. Match: %s. Repair: %s',
+                $action->description,
+                $action->expected,
+                $observed,
+                $status,
+                $matchStatus,
+                $repairNote
+            ),
+            'confidence' => 1.0,
+            'status' => 'active',
+            'source_event_id' => $event->id,
+            'created_at' => $memoryTime,
+            'updated_at' => $memoryTime,
+        ]);
+        $procedure = $this->proceduralMemory->observe($action, $event, $memory);
 
-            $action->setFields([
-                'completed_at' => time(),
-                'observed' => $observed,
-                'status' => $status,
-                'match_status' => $matchStatus,
-                'repair_note' => $repairNote,
-                'completion_event_id' => $event->id,
-            ]);
-            $action->save();
-
-            /** @var Memory $memory */
-            $memory = $this->insert(Memory::class, [
-                'tier' => 'episodic',
-                'content' => sprintf(
-                    'Action "%s" expected "%s" and observed "%s". Outcome: %s. Match: %s. Repair: %s',
-                    $action->description,
-                    $action->expected,
-                    $observed,
-                    $status,
-                    $matchStatus,
-                    $repairNote
-                ),
-                'confidence' => 1.0,
-                'status' => 'active',
-                'source_event_id' => $event->id,
-                'updated_at' => time(),
-            ]);
-
-            // A manually closed typed trace remains unverified unless its
-            // adapter already recorded a machine-readable observation. This
-            // prevents `--matched=yes` alone from minting executable code.
-            $execution = \NaviBrain\Model\ActionExecution::getByField(
-                'action_trace_id',
-                (int) $action->id
-            );
-            if ($execution instanceof \NaviBrain\Model\ActionExecution
-                && $execution->status === 'pending'
-            ) {
-                $execution->setFields([
-                    'observed' => ['reported' => $observed],
-                    'status' => $status,
-                    'completed_at' => time(),
-                    'updated_at' => time(),
-                ]);
-                $execution->save();
-            }
-
-            $procedure = $this->proceduralMemory->observe($action, $event, $memory);
-
-            return [
-                'action' => $action->getData(),
-                'event' => $event->getData(),
-                'episodic_memory' => $memory->getData(),
-                'procedure' => $procedure,
-            ];
-        });
+        return [
+            'action' => $action->getData(),
+            'event' => $event->getData(),
+            'episodic_memory' => $memory->getData(),
+            'procedure' => $procedure,
+        ];
     }
 
     /** @return list<array<string, mixed>> */
@@ -985,10 +2414,94 @@ final class ExecutiveCore
         return $this->records($records);
     }
 
+    /** @return array<string, mixed> */
+    public function releaseCognitiveThreadByKey(string $threadKey, string $reason): array
+    {
+        $this->requireText($threadKey, 'thread key');
+        $this->requireText($reason, 'release reason');
+
+        return $this->transaction(function () use ($threadKey, $reason): array {
+            $thread = CognitiveThread::getByField('thread_key', $threadKey);
+            if (!$thread instanceof CognitiveThread) {
+                throw new RuntimeException(sprintf('Cognitive thread %s does not exist.', $threadKey));
+            }
+            if ($thread->status === 'released') {
+                return ['status' => 'released', 'thread' => $thread->getData(), 'deduplicated' => true];
+            }
+
+            $now = time();
+            $cancelledWorkIds = [];
+            $cancelledStepIds = [];
+            foreach (ThreadStep::getAllByWhere(['thread_id' => $thread->id]) as $step) {
+                if (!in_array($step->status, ['running', 'dispatching'], true)) {
+                    continue;
+                }
+                $workId = (int) ($step->worker_work_item_id ?? 0);
+                if ($workId > 0) {
+                    $work = WorkItem::getByID($workId);
+                    if ($work instanceof WorkItem && in_array($work->status, ['queued', 'leased'], true)) {
+                        $work->setFields([
+                            'completed_at' => $now,
+                            'updated_at' => $now,
+                            'status' => 'cancelled',
+                            'lease_owner' => null,
+                            'lease_expires_at' => null,
+                            'error' => 'The user released the owning cognitive thread: ' . $reason,
+                        ]);
+                        $work->save();
+                        $cancelledWorkIds[] = $workId;
+                        $this->emit('work.cancelled', [
+                            'work_item_id' => $workId,
+                            'thread_id' => $thread->id,
+                            'reason' => 'cognitive_thread_released',
+                        ]);
+                    }
+                }
+                $step->setFields([
+                    'completed_at' => $now,
+                    'observed_result' => ['choice' => 'release', 'reason' => $reason],
+                    'post_state' => ['thread_phase' => 'released'],
+                    'status' => 'cancelled',
+                    'error' => 'The user released the cognitive thread.',
+                ]);
+                $step->save();
+                $cancelledStepIds[] = (int) $step->id;
+            }
+
+            $thread->setFields([
+                'phase' => 'released',
+                'wake_at' => null,
+                'status' => 'released',
+                'version' => (int) $thread->version + 1,
+                'fencing_token' => (int) $thread->fencing_token + 1,
+                'last_observation' => $reason,
+                'updated_at' => $now,
+            ]);
+            $thread->save();
+            $event = $this->emit('thread.released', [
+                'thread_id' => $thread->id,
+                'thread_key' => $thread->thread_key,
+                'reason' => $reason,
+                'cancelled_thread_step_ids' => $cancelledStepIds,
+                'cancelled_work_item_ids' => $cancelledWorkIds,
+            ]);
+
+            return [
+                'status' => 'released',
+                'thread' => $thread->getData(),
+                'cancelled_thread_step_ids' => $cancelledStepIds,
+                'cancelled_work_item_ids' => $cancelledWorkIds,
+                'event' => $event->getData(),
+                'deduplicated' => false,
+            ];
+        });
+    }
+
     public function addMemory(
         string $tier,
         string $content,
         float $confidence,
+        string $idempotencyKey,
         ?int $sourceEventId = null,
         ?int $sourceMemoryId = null,
         ?int $supersedesId = null,
@@ -998,6 +2511,7 @@ final class ExecutiveCore
         $this->requireChoice($tier, ['working', 'episodic', 'semantic', 'procedural'], 'tier');
         $this->requireText($content, 'memory content');
         $this->requireUnitInterval($confidence, 'confidence');
+        $this->requireText($idempotencyKey, 'memory idempotency key');
 
         if ($tier === 'procedural' && !$allowProceduralWrite) {
             throw new RuntimeException('Procedural memory writes require --allow-procedural-write.');
@@ -1013,44 +2527,174 @@ final class ExecutiveCore
         }
         $superseded = $supersedesId !== null ? $this->requireMemory($supersedesId) : null;
 
-        return $this->transaction(function () use (
+        $request = [
+            'tier' => $tier,
+            'content' => $content,
+            'confidence' => $confidence,
+            'source_event_id' => $sourceEventId,
+            'source_memory_id' => $sourceMemoryId,
+            'supersedes_id' => $supersedesId,
+            'expires_at' => $expiresAt,
+        ];
+        $operationKey = TokenMemoryDaemon::operationKey('memory-add', $idempotencyKey);
+        $operation = $this->claimMemoryStoreOperation(
+            $operationKey,
+            hash('sha256', $this->canonicalJson($request))
+        );
+        $requestedAt = (int) $operation['requested_at'];
+        $fields = [
+            'tier' => $tier,
+            'content' => $content,
+            'confidence' => $confidence,
+            'status' => 'active',
+            'source_event_id' => $sourceEventId,
+            'source_memory_id' => $sourceMemoryId,
+            'supersedes_id' => $supersedesId,
+            'expires_at' => $expiresAt,
+            'created_at' => $requestedAt,
+            'updated_at' => $requestedAt,
+        ];
+        if ($superseded instanceof Memory) {
+            $memory = Memory::replaceRecord(
+                $superseded,
+                $fields,
+                'superseded',
+                $operationKey
+            );
+        } else {
+            $fields['operation_key'] = $operationKey;
+            /** @var Memory $memory */
+            $memory = $this->insert(Memory::class, $fields);
+        }
+
+        $event = $this->transaction(function () use (
+            $operationKey,
+            $memory,
             $tier,
-            $content,
-            $confidence,
             $sourceEventId,
             $sourceMemoryId,
-            $supersedesId,
-            $expiresAt,
-            $superseded
-        ): array {
-            /** @var Memory $memory */
-            $memory = $this->insert(Memory::class, [
-                'tier' => $tier,
-                'content' => $content,
-                'confidence' => $confidence,
-                'status' => 'active',
-                'source_event_id' => $sourceEventId,
-                'source_memory_id' => $sourceMemoryId,
-                'supersedes_id' => $supersedesId,
-                'expires_at' => $expiresAt,
-                'updated_at' => time(),
-            ]);
-
-            if ($superseded instanceof Memory) {
-                $superseded->setFields(['status' => 'superseded', 'updated_at' => time()]);
-                $superseded->save();
+            $supersedesId
+        ): Event {
+            $current = $this->memoryStoreOperation($operationKey);
+            if ($current === null) {
+                throw new RuntimeException('Memory store operation journal disappeared.');
             }
-
-            $event = $this->emit('memory.stored', [
-                'memory_id' => $memory->id,
-                'tier' => $tier,
-                'source_event_id' => $sourceEventId,
-                'source_memory_id' => $sourceMemoryId,
-                'supersedes_id' => $supersedesId,
+            if ($current['memory_id'] !== null
+                && (int) $current['memory_id'] !== (int) $memory->id
+            ) {
+                throw new RuntimeException('Memory store operation resolved to a different memory.');
+            }
+            $event = $this->emitOnce(
+                'memory.stored:' . (int) $memory->id,
+                'memory.stored',
+                [
+                    'memory_id' => (int) $memory->id,
+                    'tier' => $tier,
+                    'source_event_id' => $sourceEventId,
+                    'source_memory_id' => $sourceMemoryId,
+                    'supersedes_id' => $supersedesId,
+                ]
+            );
+            $update = $this->connection->prepare(
+                'UPDATE memory_store_operations
+                 SET memory_id = :memory_id, event_id = :event_id
+                 WHERE operation_key = :operation_key'
+            );
+            $update->execute([
+                'memory_id' => (int) $memory->id,
+                'event_id' => (int) $event->id,
+                'operation_key' => $operationKey,
             ]);
-
-            return ['memory' => $memory->getData(), 'event' => $event->getData()];
+            if ($tier === 'semantic' && $sourceMemoryId !== null) {
+                $ledger = MemoryConsolidationEpisode::getByField(
+                    'episode_id',
+                    $sourceMemoryId
+                );
+                if ($ledger instanceof MemoryConsolidationEpisode) {
+                    $ledger->setFields([
+                        'work_item_id' => null,
+                        'semantic_memory_id' => (int) $memory->id,
+                        'status' => 'consolidated',
+                        'reason' => 'active_semantic_provenance_committed',
+                        'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+                        'updated_at' => time(),
+                    ]);
+                    $ledger->save();
+                }
+            }
+            return $event;
         });
+
+        return ['memory' => $memory->getData(), 'event' => $event->getData()];
+    }
+
+    /**
+     * @return array{operation_key: string, request_hash: string, requested_at: int, memory_id: ?int, event_id: ?int}
+     */
+    private function claimMemoryStoreOperation(string $operationKey, string $requestHash): array
+    {
+        try {
+            return $this->transaction(function () use ($operationKey, $requestHash): array {
+                $existing = $this->memoryStoreOperation($operationKey);
+                if ($existing !== null) {
+                    if (!hash_equals((string) $existing['request_hash'], $requestHash)) {
+                        throw new RuntimeException('Memory idempotency key was reused with different input.');
+                    }
+                    return $existing;
+                }
+                $requestedAt = time();
+                $insert = $this->connection->prepare(
+                    'INSERT INTO memory_store_operations
+                     (operation_key, request_hash, requested_at, memory_id, event_id)
+                     VALUES (:operation_key, :request_hash, :requested_at, NULL, NULL)'
+                );
+                $insert->execute([
+                    'operation_key' => $operationKey,
+                    'request_hash' => $requestHash,
+                    'requested_at' => $requestedAt,
+                ]);
+                return [
+                    'operation_key' => $operationKey,
+                    'request_hash' => $requestHash,
+                    'requested_at' => $requestedAt,
+                    'memory_id' => null,
+                    'event_id' => null,
+                ];
+            });
+        } catch (Throwable $throwable) {
+            $existing = $this->memoryStoreOperation($operationKey);
+            if ($existing === null) {
+                throw $throwable;
+            }
+            if (!hash_equals((string) $existing['request_hash'], $requestHash)) {
+                throw new RuntimeException('Memory idempotency key was reused with different input.');
+            }
+            return $existing;
+        }
+    }
+
+    /**
+     * @return array{operation_key: string, request_hash: string, requested_at: int, memory_id: ?int, event_id: ?int}|null
+     */
+    private function memoryStoreOperation(string $operationKey): ?array
+    {
+        $statement = $this->connection->prepare(
+            'SELECT operation_key, request_hash, requested_at, memory_id, event_id
+             FROM memory_store_operations WHERE operation_key = :operation_key'
+        );
+        $statement->execute(['operation_key' => $operationKey]);
+        $row = $statement->fetch(PDO::FETCH_ASSOC);
+        $statement->closeCursor();
+        if (!is_array($row)) {
+            return null;
+        }
+        return [
+            'operation_key' => (string) $row['operation_key'],
+            'request_hash' => (string) $row['request_hash'],
+            'requested_at' => (int) $row['requested_at'],
+            'memory_id' => $row['memory_id'] === null ? null : (int) $row['memory_id'],
+            'event_id' => $row['event_id'] === null ? null : (int) $row['event_id'],
+        ];
     }
 
     public function consolidateMemory(int $episodeId, string $semanticContent, float $confidence): array
@@ -1060,177 +2704,858 @@ final class ExecutiveCore
             throw new RuntimeException('Only episodic memories can be consolidated by this command.');
         }
 
-        return $this->addMemory(
+        $stored = $this->addMemory(
             tier: 'semantic',
             content: $semanticContent,
             confidence: $confidence,
+            idempotencyKey: 'manual-consolidate:' . $episodeId . ':' . hash('sha256', $semanticContent),
             sourceEventId: $episode->source_event_id,
             sourceMemoryId: $episodeId
         );
+        return $this->transaction(function () use ($episodeId, $stored): array {
+            $entry = MemoryConsolidationEpisode::getByField('episode_id', $episodeId);
+            if ($entry instanceof MemoryConsolidationEpisode) {
+                $entry->setFields([
+                    'work_item_id' => null,
+                    'semantic_memory_id' => (int) ($stored['memory']['id'] ?? 0),
+                    'status' => 'consolidated',
+                    'reason' => 'manually_consolidated',
+                    'updated_at' => time(),
+                ]);
+                $entry->save();
+            }
+            return $stored;
+        });
     }
 
     /**
-     * Queue one interleaved replay of episodes into a durable claim.
+     * Keep a small, self-draining consolidation queue alive.
      *
-     * Sleep audited and repaired but never compressed, and consolidateMemory
-     * was reachable only by hand from the command line, so episodes piled up
-     * for days and almost nothing became knowledge. That is the middle of the
-     * pipeline: what gets said becomes an episode, sleep turns episodes into
-     * something general, and only the general form is any use to a later
-     * decision. Without this pass the executive had a diary and no knowledge.
+     * The ledger is the source of truth: every episode is pending, queued,
+     * consolidated, rejected with a reason, or excluded as Navi's own output.
+     * Queue depth is bounded so catch-up work cannot bury addressed speech.
      *
-     * The batch is built the way McClelland, McNaughton and O'Reilly (1995)
-     * argue it has to be. Their point is not that consolidation summarises; it
-     * is that the direction of change must be "governed not by the particular
-     * characteristics of individual associations but by the shared structure
-     * common to the environment from which these individual associations are
-     * sampled". A batch of only the newest episodes is the failure case they
-     * describe: it is one correlated sample from one recent hour, so whatever
-     * is peculiar to that hour gets written down as though it were structure.
+     * @return array<string, mixed>
+     */
+    public function maintainConsolidationQueue(int $targetDepth = 2): array
+    {
+        if ($targetDepth < 1 || $targetDepth > 8) {
+            throw new InvalidArgumentException('consolidation queue depth must be between 1 and 8.');
+        }
+
+        return $this->transaction(function () use ($targetDepth): array {
+            $recovered = $this->recoverConsolidationAssignments();
+            $this->synchronizeConsolidationEpisodes();
+            $queued = [];
+
+            while ($this->activeConsolidationWorkCount() < $targetDepth) {
+                $work = $this->enqueueConsolidation(null, time(), false);
+                if ($work === null) {
+                    break;
+                }
+                $queued[] = $work;
+            }
+
+            return [
+                'status' => $queued === [] ? 'steady' : 'queued',
+                'target_depth' => $targetDepth,
+                'active_work_items' => $this->activeConsolidationWorkCount(),
+                'queued_batches' => array_values(array_filter(array_map(
+                    static fn (array $item): ?int => isset($item['work_item']['id'])
+                        ? (int) $item['work_item']['id']
+                        : null,
+                    $queued
+                ))),
+                'recovered' => $recovered,
+                'ledger' => $this->consolidationLedgerCounts(),
+            ];
+        });
+    }
+
+    /** @return array<string, mixed> */
+    public function consolidationStatus(): array
+    {
+        $cursorQuery = $this->connection->query(
+            'SELECT COALESCE(MAX(episode_id), 0) FROM memory_consolidation_episodes'
+        );
+        $ledgerCursor = (int) ($cursorQuery?->fetchColumn() ?: 0);
+        $cursorQuery?->closeCursor();
+        $activeEpisodes = Memory::inspectCount('episodic', 'active');
+        // Episodic IDs are append-only and the daemon forbids reactivating a
+        // retired episodic record. Synchronization can therefore advance in
+        // ascending ID pages: active IDs beyond the ledger maximum are exactly
+        // the bounded backlog without hydrating either corpus.
+        $untrackedActiveEpisodes = Memory::inspectCount(
+            'episodic',
+            'active',
+            $ledgerCursor
+        );
+        $ledger = $this->consolidationLedgerCounts();
+        return [
+            'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+            'active_work_items' => $this->activeConsolidationWorkCount(),
+            'active_episodes' => $activeEpisodes,
+            'ledger_cursor' => $ledgerCursor,
+            'tracked_active_episodes' => max(0, $activeEpisodes - $untrackedActiveEpisodes),
+            'untracked_active_episodes' => $untrackedActiveEpisodes,
+            'ledger' => $ledger,
+        ];
+    }
+
+    /**
+     * Quarantine outputs produced before source partitioning and grounding
+     * existed. The derived rows and their events remain available for audit;
+     * only active recall is changed. Their source episodes remain untouched and
+     * enter the new ledger for a clean replay.
      *
-     * So the replay set interleaves three things: what is new, a sample of
-     * older episodes it must be reconciled against, and the existing claims on
-     * the same subject. The last of those is what makes consolidation gradual
-     * rather than additive — an existing claim is revised and superseded, not
-     * left standing beside a new one that half contradicts it.
-     *
-     * The work is queued rather than run here. Sleep must not block on a model.
+     * @return array<string, mixed>
+     */
+    public function repairConsolidationHistory(string $reason): array
+    {
+        $this->requireText($reason, 'consolidation repair reason');
+
+        return (function () use ($reason): array {
+            $derivedIds = [];
+            foreach (Event::getAllByWhere(['kind' => 'memory.consolidated']) as $event) {
+                $payload = is_array($event->payload) ? $event->payload : [];
+                if ((int) ($payload['validator_version'] ?? 0) >= self::CONSOLIDATION_MEMORY_FLOOR) {
+                    continue;
+                }
+                $memoryId = (int) ($payload['memory_id'] ?? 0);
+                if ($memoryId > 0) {
+                    $derivedIds[$memoryId] = true;
+                }
+            }
+
+            $parentIds = [];
+            $quarantined = [];
+            foreach (array_keys($derivedIds) as $memoryId) {
+                $memory = Memory::inspectByID($memoryId);
+                if (!$memory instanceof Memory || $memory->tier !== 'semantic') {
+                    continue;
+                }
+                if ($memory->supersedes_id !== null) {
+                    $parentIds[(int) $memory->supersedes_id] = true;
+                }
+                if ($memory->status !== 'quarantined') {
+                    $memory->setFields(['status' => 'quarantined', 'updated_at' => time()]);
+                    $memory->saveWithOperation(TokenMemoryDaemon::operationKey(
+                        'repair-consolidation-quarantine',
+                        $memoryId . ':' . hash('sha256', $reason)
+                    ));
+                }
+                $quarantined[] = $memoryId;
+            }
+
+            $activelySuperseded = [];
+            foreach (Memory::inspectAllByWhere(['tier' => 'semantic', 'status' => 'active']) as $semantic) {
+                if ($semantic->supersedes_id !== null) {
+                    $activelySuperseded[(int) $semantic->supersedes_id] = true;
+                }
+            }
+            $restored = [];
+            foreach (array_keys($parentIds) as $parentId) {
+                if (isset($derivedIds[$parentId]) || isset($activelySuperseded[$parentId])) {
+                    continue;
+                }
+                $parent = Memory::inspectByID($parentId);
+                if ($parent instanceof Memory && $parent->tier === 'semantic' && $parent->status === 'superseded') {
+                    $parent->setFields(['status' => 'active', 'updated_at' => time()]);
+                    $parent->saveWithOperation(TokenMemoryDaemon::operationKey(
+                        'repair-consolidation-restore',
+                        $parentId . ':' . hash('sha256', $reason)
+                    ));
+                    $restored[] = $parentId;
+                }
+            }
+
+            $unsafeBatchRepair = $this->repairUnsafeConsolidationBatches($reason);
+            $this->synchronizeConsolidationEpisodes();
+            $event = $this->emit('memory.consolidation.history_repaired', [
+                'reason' => $reason,
+                'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+                'quarantined_memory_ids' => $quarantined,
+                'restored_memory_ids' => $restored,
+                'unsafe_batch_repair' => $unsafeBatchRepair,
+                'source_episodes_preserved' => true,
+            ]);
+
+            return [
+                'status' => 'repaired',
+                'quarantined_memory_ids' => $quarantined,
+                'restored_memory_ids' => $restored,
+                'unsafe_batch_repair' => $unsafeBatchRepair,
+                'ledger' => $this->consolidationLedgerCounts(),
+                'event' => $event->getData(),
+            ];
+        })();
+    }
+
+    /** @return array<string, mixed> */
+    private function repairUnsafeConsolidationBatches(string $reason): array
+    {
+        $unsafeWorkIds = [];
+        $cancelledWorkIds = [];
+        $episodeIds = [];
+        $now = time();
+        foreach (WorkItem::getAllByWhere(['work_type' => self::MEMORY_CONSOLIDATION_WORK_TYPE]) as $work) {
+            $refs = is_array($work->input_refs) ? $work->input_refs : [];
+            $validatorVersion = (int) ($refs['validator_version'] ?? 0);
+            $workspaceLeak = $validatorVersion >= 2 && isset($refs['working_memory_checksum']);
+            $obsoleteValidator = $validatorVersion > 0
+                && $validatorVersion < self::CONSOLIDATION_VALIDATOR_VERSION;
+            if (!$workspaceLeak && !$obsoleteValidator) {
+                continue;
+            }
+            $workId = (int) $work->id;
+            $unsafeWorkIds[] = $workId;
+            foreach ($this->consolidationIdList($refs['episode_ids'] ?? []) as $episodeId) {
+                $episodeIds[$episodeId] = true;
+            }
+            if (!in_array($work->status, ['queued', 'leased'], true)) {
+                continue;
+            }
+            $work->setFields([
+                'completed_at' => $now,
+                'updated_at' => $now,
+                'status' => 'cancelled',
+                'lease_owner' => null,
+                'lease_expires_at' => null,
+                'error' => 'Cancelled because the consolidation batch predates the current evidence fence: ' . $reason,
+            ]);
+            $work->save();
+            $cancelledWorkIds[] = $workId;
+            $this->emit('work.cancelled', [
+                'work_item_id' => $workId,
+                'reason' => $workspaceLeak
+                    ? 'consolidation_workspace_prompt_leak'
+                    : 'obsolete_consolidation_validator',
+            ]);
+        }
+
+        $unsafeWork = array_fill_keys($unsafeWorkIds, true);
+        $resetEpisodeIds = [];
+        foreach (array_keys($episodeIds) as $episodeId) {
+            $entry = MemoryConsolidationEpisode::getByField('episode_id', $episodeId);
+            if (!$entry instanceof MemoryConsolidationEpisode
+                || !in_array($entry->status, ['pending', 'queued'], true)
+            ) {
+                continue;
+            }
+            $assignedUnsafeWork = $entry->work_item_id !== null
+                && isset($unsafeWork[(int) $entry->work_item_id]);
+            if (!$assignedUnsafeWork
+                && (int) $entry->validator_version >= self::CONSOLIDATION_VALIDATOR_VERSION
+            ) {
+                continue;
+            }
+            $entry->setFields([
+                'work_item_id' => null,
+                'status' => 'pending',
+                'attempts' => 0,
+                'reason' => 'requeued_after_unsafe_batch_repair',
+                'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+                'updated_at' => $now,
+            ]);
+            $entry->save();
+            $resetEpisodeIds[] = $episodeId;
+        }
+
+        return [
+            'unsafe_work_item_ids' => $unsafeWorkIds,
+            'cancelled_work_item_ids' => $cancelledWorkIds,
+            'reset_episode_ids' => $resetEpisodeIds,
+        ];
+    }
+
+    /** @return array<string, int> */
+    private function consolidationLedgerCounts(): array
+    {
+        $counts = [
+            'pending' => 0,
+            'queued' => 0,
+            'consolidated' => 0,
+            'rejected' => 0,
+            'excluded' => 0,
+        ];
+        $statement = $this->connection->query(
+            'SELECT status, COUNT(*) AS total
+             FROM memory_consolidation_episodes
+             GROUP BY status'
+        );
+        foreach ($statement?->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            $status = (string) ($row['status'] ?? '');
+            if (isset($counts[$status])) {
+                $counts[$status] = (int) ($row['total'] ?? 0);
+            }
+        }
+        $statement?->closeCursor();
+        $counts['total'] = array_sum($counts);
+        return $counts;
+    }
+
+    private function activeConsolidationWorkCount(): int
+    {
+        $statement = $this->connection->prepare(
+            "SELECT COUNT(*) FROM work_items
+             WHERE work_type = :work_type AND status IN ('queued', 'leased')"
+        );
+        $statement->execute(['work_type' => self::MEMORY_CONSOLIDATION_WORK_TYPE]);
+        $count = (int) ($statement->fetchColumn() ?: 0);
+        $statement->closeCursor();
+        return $count;
+    }
+
+    private function synchronizeConsolidationEpisodes(): void
+    {
+        // This cursor is correct only with the daemon's one-way episodic status
+        // invariant: once an episodic record leaves active recall it cannot
+        // later appear behind the high-water mark.
+        $cursorQuery = $this->connection->query(
+            'SELECT COUNT(*), COALESCE(MAX(episode_id), 0) FROM memory_consolidation_episodes'
+        );
+        $cursor = $cursorQuery?->fetch(PDO::FETCH_NUM);
+        $cursorQuery?->closeCursor();
+        $ledgerCount = is_array($cursor) ? (int) ($cursor[0] ?? 0) : 0;
+        $afterId = is_array($cursor) ? (int) ($cursor[1] ?? 0) : 0;
+        $existingSemanticByMemory = [];
+        $existingSemanticByEvent = [];
+        if ($ledgerCount === 0) {
+            // One-time migration bootstrap. Later scheduler passes are bounded
+            // ID pages and semantic writes update their source ledger directly.
+            foreach (Memory::inspectAllByWhere(['tier' => 'semantic', 'status' => 'active']) as $semantic) {
+                if ($semantic->source_memory_id !== null) {
+                    $existingSemanticByMemory[(int) $semantic->source_memory_id] = (int) $semantic->id;
+                }
+                if ($semantic->source_event_id !== null) {
+                    $sourceEventId = (int) $semantic->source_event_id;
+                    $existingSemanticByEvent[$sourceEventId] ??= (int) $semantic->id;
+                }
+            }
+        }
+
+        $episodes = $ledgerCount === 0
+            ? Memory::inspectAllByWhere(
+                ['tier' => 'episodic', 'status' => 'active'],
+                ['order' => ['id' => 'ASC']]
+            )
+            : Memory::inspectPage($afterId, 100, 'episodic', 'active');
+        $ownsTransaction = !$this->connection->inTransaction();
+        if ($ownsTransaction) {
+            $this->connection->beginTransaction();
+        }
+        try {
+            foreach ($episodes as $episode) {
+                $episodeId = (int) $episode->id;
+                $semanticId = $existingSemanticByMemory[$episodeId]
+                    ?? ($episode->source_event_id === null
+                        ? null
+                        : ($existingSemanticByEvent[(int) $episode->source_event_id] ?? null));
+                if ($semanticId === null && $ledgerCount !== 0) {
+                    $semantic = Memory::inspectProvenance(
+                        'memory',
+                        $episodeId,
+                        'semantic',
+                        'active'
+                    );
+                    if (!$semantic instanceof Memory && $episode->source_event_id !== null) {
+                        $semantic = Memory::inspectProvenance(
+                            'event',
+                            (int) $episode->source_event_id,
+                            'semantic',
+                            'active'
+                        );
+                    }
+                    if ($semantic instanceof Memory) {
+                        $semanticId = (int) $semantic->id;
+                    }
+                }
+
+                $status = 'pending';
+                $reason = null;
+                if ($semanticId !== null) {
+                    $status = 'consolidated';
+                    $reason = 'already_has_active_semantic_provenance';
+                } elseif (!$this->isEvidence((string) $episode->content)) {
+                    $status = 'excluded';
+                    $reason = 'agent_output_is_not_external_evidence';
+                } elseif ($this->isInsufficientUserFragment((string) $episode->content)) {
+                    $status = 'rejected';
+                    $reason = 'user_utterance_fragment_has_insufficient_context';
+                }
+
+                $this->insert(MemoryConsolidationEpisode::class, [
+                    'episode_id' => $episodeId,
+                    'semantic_memory_id' => $semanticId,
+                    'status' => $status,
+                    'attempts' => 0,
+                    'reason' => $reason,
+                    'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+                    'updated_at' => time(),
+                ]);
+            }
+            if ($ownsTransaction) {
+                $this->connection->commit();
+            }
+        } catch (Throwable $throwable) {
+            if ($ownsTransaction && $this->connection->inTransaction()) {
+                $this->connection->rollBack();
+            }
+            throw $throwable;
+        }
+    }
+
+    private function isInsufficientUserFragment(string $content): bool
+    {
+        if (!str_starts_with($content, 'The user said:')) {
+            return false;
+        }
+        $said = trim(substr($content, strlen('The user said:')));
+        return count($this->consolidationTokens($said)) < 3;
+    }
+
+    /** @return list<array<string, mixed>> */
+    private function recoverConsolidationAssignments(): array
+    {
+        $recovered = [];
+        $statement = $this->connection->query(
+            "SELECT DISTINCT work_item_id FROM memory_consolidation_episodes
+             WHERE status = 'queued' AND work_item_id IS NOT NULL
+             ORDER BY work_item_id ASC"
+        );
+        $workIds = array_map('intval', $statement?->fetchAll(PDO::FETCH_COLUMN) ?: []);
+        $statement?->closeCursor();
+
+        foreach ($workIds as $workId) {
+            $work = WorkItem::getByID($workId);
+            if (!$work instanceof WorkItem) {
+                $recovered[] = $this->rejectConsolidationAttempt(
+                    ['id' => $workId, 'input_refs' => []],
+                    'assigned_work_item_missing'
+                );
+                continue;
+            }
+            if ($work->status === 'completed') {
+                $result = is_array($work->result) ? $work->result : [];
+                $recovered[] = $result === []
+                    ? $this->rejectConsolidationAttempt($work->getData(), 'completed_work_has_no_result')
+                    : $this->integrateConsolidation($work->getData(), $result, (string) $work->model);
+            } elseif (in_array($work->status, ['failed', 'cancelled'], true)) {
+                $recovered[] = $this->rejectConsolidationAttempt(
+                    $work->getData(),
+                    'assigned_work_' . (string) $work->status
+                );
+            }
+        }
+        return $recovered;
+    }
+
+    /**
+     * Queue one topically coherent replay batch. Oldest pending always seeds
+     * the batch, so continuous arrivals cannot starve history.
      *
      * @return array<string, mixed>|null
      */
-    private function enqueueConsolidation(?int $runId, int $now): ?array
+    private function enqueueConsolidation(
+        ?int $runId,
+        int $now,
+        bool $synchronize = true
+    ): ?array
     {
-        $consolidated = [];
-        foreach (Memory::getAllByWhere(['tier' => 'semantic'], ['limit' => 500]) as $semantic) {
-            if ($semantic->source_memory_id !== null) {
-                $consolidated[(int) $semantic->source_memory_id] = true;
+        return $this->transaction(function () use ($runId, $now, $synchronize): ?array {
+            if ($synchronize) {
+                $this->synchronizeConsolidationEpisodes();
+            }
+            $statement = $this->connection->prepare(
+                "SELECT id, episode_id FROM memory_consolidation_episodes
+                 WHERE status = 'pending'
+                 ORDER BY episode_id ASC
+                 LIMIT :window"
+            );
+            $statement->bindValue('window', self::CONSOLIDATION_PENDING_WINDOW, PDO::PARAM_INT);
+            $statement->execute();
+            $pendingRows = $statement->fetchAll(PDO::FETCH_ASSOC);
+            $statement->closeCursor();
+            $pendingEntries = [];
+            foreach ($pendingRows as $row) {
+                $entry = MemoryConsolidationEpisode::getByID((int) $row['id']);
+                if ($entry instanceof MemoryConsolidationEpisode) {
+                    $pendingEntries[(int) $row['episode_id']] = $entry;
+                }
+            }
+            $episodesById = [];
+            foreach (Memory::getManyByID(array_keys($pendingEntries), true) as $episode) {
+                $episodesById[(int) $episode->id] = $episode;
+            }
+            $pending = [];
+            foreach ($pendingEntries as $episodeId => $entry) {
+                $episode = $episodesById[$episodeId] ?? null;
+                if (!$episode instanceof Memory || $episode->tier !== 'episodic' || $episode->status !== 'active') {
+                    $entry->setFields([
+                        'status' => 'rejected',
+                        'reason' => 'episode_missing_or_inactive_before_replay',
+                        'updated_at' => $now,
+                    ]);
+                    $entry->save();
+                    continue;
+                }
+                $pending[(int) $episode->id] = $episode;
+            }
+            if ($pending === []) {
+                return null;
+            }
+
+            $fresh = [$pending[array_key_first($pending)]];
+            $seed = $fresh[0];
+            $ranked = [];
+            foreach ($pending as $episodeId => $episode) {
+                if ($episodeId === (int) $seed->id) {
+                    continue;
+                }
+                $score = $this->consolidationSimilarity($seed, $episode);
+                if ($score > 0.0) {
+                    $ranked[] = ['score' => $score, 'episode' => $episode];
+                }
+            }
+            usort($ranked, static function (array $left, array $right): int {
+                $score = $right['score'] <=> $left['score'];
+                return $score !== 0
+                    ? $score
+                    : ((int) $left['episode']->id <=> (int) $right['episode']->id);
+            });
+            foreach (array_slice($ranked, 0, self::CONSOLIDATION_NEW - 1) as $candidate) {
+                $fresh[] = $candidate['episode'];
+            }
+
+            $interleaved = [];
+            $interleavedEntries = MemoryConsolidationEpisode::getAllByWhere(
+                ['status' => 'consolidated'],
+                ['order' => ['episode_id' => 'DESC'], 'limit' => 300]
+            );
+            $interleavedById = [];
+            foreach (Memory::getManyByID(array_map(
+                static fn (MemoryConsolidationEpisode $entry): int => (int) $entry->episode_id,
+                $interleavedEntries
+            ), true) as $episode) {
+                $interleavedById[(int) $episode->id] = $episode;
+            }
+            foreach ($interleavedEntries as $entry) {
+                $episode = $interleavedById[(int) $entry->episode_id] ?? null;
+                if (!$episode instanceof Memory || $this->consolidationSimilarity($seed, $episode) <= 0.0) {
+                    continue;
+                }
+                $interleaved[] = $episode;
+                if (count($interleaved) >= self::CONSOLIDATION_INTERLEAVED) {
+                    break;
+                }
+            }
+
+            $subject = implode(' ', array_map(
+                fn (Memory $episode): string => $this->consolidationEvidenceText($episode),
+                array_slice($fresh, 0, 3)
+            ));
+            $existing = $this->consolidationExistingKnowledge($subject);
+
+            $freshEvidence = array_map(fn (Memory $episode): array => [
+                'id' => (int) $episode->id,
+                'evidence' => $this->consolidationEvidenceText($episode),
+            ], $fresh);
+            $comparisonEvidence = array_map(fn (Memory $episode): array => [
+                'id' => (int) $episode->id,
+                'evidence' => $this->consolidationEvidenceText($episode),
+            ], $interleaved);
+            $episodeIds = array_column($freshEvidence, 'id');
+            $evidenceHashes = [];
+            foreach ($freshEvidence as $evidence) {
+                $evidenceHashes[(string) $evidence['id']] = hash('sha256', (string) $evidence['evidence']);
+            }
+
+            $composition = new ExecutiveComposition(
+                'Consolidate related episodes into at most one durable claim, with exact source accounting.'
+            );
+            $composition->contribute(
+                'fresh_evidence',
+                implode(' ', [
+                    'Only these IDs may support the new claim.',
+                    'Observed results are evidence; intentions, expected outcomes, questions, and failed-command rationales are not.',
+                    'Use source wording for concrete names, paths, versions, flags, quantities, and quoted text.',
+                ]),
+                $freshEvidence
+            );
+            if ($comparisonEvidence !== []) {
+                $composition->contribute(
+                    'comparison_only',
+                    'These older episodes may expose contradictions, but their IDs cannot be listed as support.',
+                    $comparisonEvidence
+                );
+            }
+            $prompt = $composition->prompt() . "\n\n" . implode("\n", [
+                'Return kind memory_consolidation and put the claim itself in content.',
+                'Return supported_episode_ids and rejected_episode_ids as arrays of integer IDs.',
+                sprintf(
+                    'Those two arrays may contain only fresh evidence IDs %s; no other integer is valid in either array.',
+                    json_encode($episodeIds, JSON_THROW_ON_ERROR)
+                ),
+                'Return rejection_reason as a string and supersedes_memory_id as either an integer ID or null.',
+                'supported_episode_ids and rejected_episode_ids must be disjoint and together contain every fresh evidence ID exactly once.',
+                'A claim may use only supported fresh evidence. Comparison episodes cannot support it.',
+                'If no durable claim is warranted, use empty content, no supported IDs, reject every fresh ID, and explain why.',
+                'When no fresh ID is rejected, set rejection_reason to "none".',
+                'supersedes_memory_id must be null. Related existing memories are resolved deterministically after grounding.',
+                'Put calibrated confidence in confidence and the tested belief in challenged_assumption.',
+                'Output exactly the eight JSON fields in the supplied schema and nothing else.',
+            ]);
+
+            $attempt = 1;
+            foreach ($fresh as $episode) {
+                $entry = MemoryConsolidationEpisode::getByField('episode_id', (int) $episode->id);
+                if ($entry instanceof MemoryConsolidationEpisode) {
+                    $attempt = max($attempt, (int) $entry->attempts + 1);
+                }
+            }
+            $batchHash = substr(hash('sha256', implode(',', $episodeIds)), 0, 16);
+            $queued = $this->enqueueWork(
+                parentRunId: $runId,
+                parentIntentionId: null,
+                workType: self::MEMORY_CONSOLIDATION_WORK_TYPE,
+                prompt: $prompt,
+                inputRefs: [
+                    'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+                    'episode_ids' => $episodeIds,
+                    'interleaved_ids' => array_column($comparisonEvidence, 'id'),
+                    'existing_memory_ids' => array_column($existing, 'id'),
+                    'evidence_hashes' => $evidenceHashes,
+                ],
+                tokenBudget: 512,
+                wallBudgetSeconds: 300,
+                idempotencyKey: sprintf('consolidate:v%d:%d:%d:%s:%s',
+                    self::CONSOLIDATION_VALIDATOR_VERSION,
+                    (int) $seed->id,
+                    $attempt,
+                    $batchHash,
+                    bin2hex(random_bytes(4))
+                )
+            );
+            $workId = (int) ($queued['work_item']['id'] ?? 0);
+            if ($workId < 1) {
+                throw new RuntimeException('Consolidation queue did not return a work item ID.');
+            }
+            foreach ($fresh as $episode) {
+                $entry = MemoryConsolidationEpisode::getByField('episode_id', (int) $episode->id);
+                if (!$entry instanceof MemoryConsolidationEpisode) {
+                    throw new RuntimeException('Consolidation ledger lost a queued episode.');
+                }
+                $entry->setFields([
+                    'work_item_id' => $workId,
+                    'status' => 'queued',
+                    'attempts' => (int) $entry->attempts + 1,
+                    'reason' => null,
+                    'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+                    'updated_at' => $now,
+                ]);
+                $entry->save();
+            }
+            $this->emit('memory.consolidation.batch.queued', [
+                'work_item_id' => $workId,
+                'episode_ids' => $episodeIds,
+                'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+            ]);
+            return $queued + ['episode_ids' => $episodeIds];
+        });
+    }
+
+    private function consolidationSimilarity(Memory $left, Memory $right): float
+    {
+        $leftType = $this->consolidationEpisodeType((string) $left->content);
+        if ($leftType !== $this->consolidationEpisodeType((string) $right->content)) {
+            return 0.0;
+        }
+        $leftEvidence = $this->consolidationEvidenceText($left);
+        $rightEvidence = $this->consolidationEvidenceText($right);
+        if ($this->normalizeSearchText($leftEvidence) === $this->normalizeSearchText($rightEvidence)) {
+            return 10.0;
+        }
+        $leftCommand = $this->consolidationCommand($leftEvidence);
+        $rightCommand = $this->consolidationCommand($rightEvidence);
+        if ($leftCommand !== null && $leftCommand === $rightCommand) {
+            return 8.0;
+        }
+        $leftTokens = array_flip($this->consolidationTokens($leftEvidence));
+        $rightTokens = array_flip($this->consolidationTokens($rightEvidence));
+        $minimum = min(count($leftTokens), count($rightTokens));
+        if ($minimum === 0) {
+            return 0.0;
+        }
+        $shared = count(array_intersect_key($leftTokens, $rightTokens));
+        if ($shared < 3) {
+            return 0.0;
+        }
+        $containment = $shared / $minimum;
+        $union = count($leftTokens + $rightTokens);
+        $jaccard = $union === 0 ? 0.0 : $shared / $union;
+        return $containment >= 0.35 && $jaccard >= 0.2
+            ? $jaccard
+            : 0.0;
+    }
+
+    private function consolidationEpisodeType(string $content): string
+    {
+        return match (true) {
+            str_starts_with($content, 'On this machine '),
+            str_starts_with($content, 'Looking at this machine ') => 'machine_observation',
+            str_starts_with($content, 'Action "') => 'action_outcome',
+            str_starts_with($content, 'The user said:') => 'user_utterance',
+            str_starts_with($content, 'Session in '),
+            str_starts_with($content, 'Automatic Navi continuity '),
+            str_starts_with($content, 'Implemented and verified ') => 'session_record',
+            default => 'observation',
+        };
+    }
+
+    private function consolidationEvidenceText(Memory $episode): string
+    {
+        $content = trim((string) $episode->content);
+        if (str_starts_with($content, 'On this machine "')) {
+            $answers = strpos($content, '" answers ');
+            $returned = strrpos($content, '. It returned: ');
+            if ($answers !== false && $returned !== false && $returned > $answers) {
+                $command = substr($content, strlen('On this machine "'), $answers - strlen('On this machine "'));
+                return sprintf(
+                    'Command "%s" succeeded. Observed output: %s',
+                    $command,
+                    substr($content, $returned + strlen('. It returned: '))
+                );
+            }
+            $failed = strpos($content, '" does not work as a way to find out ');
+            $exited = strrpos($content, '. It exited ');
+            if ($failed !== false && $exited !== false && $exited > $failed) {
+                $command = substr($content, strlen('On this machine "'), $failed - strlen('On this machine "'));
+                return sprintf(
+                    'Command "%s" failed. Observed result: %s',
+                    $command,
+                    substr($content, $exited + strlen('. It exited '))
+                );
             }
         }
-
-        $episodes = Memory::getAllByWhere(
-            ['tier' => 'episodic', 'status' => 'active'],
-            ['order' => ['id' => 'DESC'], 'limit' => 400]
-        );
-        // Only evidence is replayed. Navi's own speech and inner monologue are
-        // records of output, not observations of anything, and generalising
-        // from them is a closed loop: a line gets said, becomes an episode,
-        // consolidates into a claim about Navi's own internals, and that claim
-        // then feeds the next line. Left unfiltered it produced confident
-        // inventions about mechanisms that do not exist in this codebase,
-        // because seventy seven per cent of the episode store is Navi talking.
-        // What the user said, what an action actually did, and what a session
-        // actually contained are samples of the world; the rest is an echo.
-        $episodes = array_values(array_filter(
-            $episodes,
-            fn (Memory $episode): bool => $this->isEvidence((string) $episode->content)
-        ));
-
-        $fresh = [];
-        foreach ($episodes as $episode) {
-            if (!isset($consolidated[(int) $episode->id])) {
-                $fresh[] = $episode;
+        if (str_starts_with($content, 'Action "')) {
+            $observed = strpos($content, ' and observed "');
+            $outcome = strrpos($content, '". Outcome: ');
+            if ($observed !== false && $outcome !== false && $outcome > $observed) {
+                return 'Action observation: '
+                    . substr($content, $observed + strlen(' and observed "'), $outcome - ($observed + strlen(' and observed "')))
+                    . '. Outcome: ' . substr($content, $outcome + strlen('". Outcome: '));
             }
         }
-        if ($fresh === []) {
+        return mb_substr($content, 0, 800);
+    }
+
+    private function consolidationCommand(string $evidence): ?string
+    {
+        if (!str_starts_with($evidence, 'Command "')) {
             return null;
         }
-        $fresh = array_slice($fresh, 0, self::CONSOLIDATION_NEW);
+        $end = strpos($evidence, '" ', strlen('Command "'));
+        return $end === false
+            ? null
+            : $this->normalizeSearchText(substr($evidence, strlen('Command "'), $end - strlen('Command "')));
+    }
 
-        // Everything else is interleaving material, whether or not it has been
-        // integrated before. Reinstating an episode again is not waste: it is
-        // the mechanism, and restricting the pool to already-consolidated rows
-        // would make the sample small and correlated in a different way.
-        $chosen = array_flip(array_map(static fn (Memory $m): int => (int) $m->id, $fresh));
-        $older = array_values(array_filter(
-            $episodes,
-            static fn (Memory $m): bool => !isset($chosen[(int) $m->id])
-        ));
-        // Spread the sample across the whole history rather than taking the
-        // rows adjacent to the new material, which would still be one
-        // correlated stretch of the same afternoon.
-        shuffle($older);
-        $older = array_slice($older, 0, self::CONSOLIDATION_INTERLEAVED);
-        if (count($fresh) + count($older) < 2) {
-            return null;
-        }
-
-        $subject = implode(' ', array_map(
-            static fn (Memory $m): string => (string) $m->content,
-            array_slice($fresh, 0, 3)
-        ));
-        $existing = [];
-        $supersedes = null;
-        foreach ($this->searchMemory($subject, 6) as $candidate) {
-            if (($candidate['tier'] ?? null) !== 'semantic') {
+    /** @return list<string> */
+    private function consolidationTokens(string $content): array
+    {
+        $stop = array_flip([
+            'about', 'after', 'again', 'also', 'because', 'been', 'before', 'being', 'could', 'does',
+            'from', 'have', 'into', 'just', 'more', 'most', 'only', 'other', 'should', 'that', 'their',
+            'there', 'these', 'they', 'this', 'through', 'user', 'what', 'when', 'where', 'which', 'while',
+            'with', 'would', 'your', 'action', 'command', 'episode', 'observed', 'observation', 'outcome',
+            'result', 'returned', 'said', 'succeeded', 'failed',
+        ]);
+        $tokens = [];
+        foreach (preg_split('/[^\p{L}\p{N}_=.\/-]+/u', mb_strtolower($content)) ?: [] as $token) {
+            $token = trim($token, './-_=');
+            if (mb_strlen($token) < 3 || isset($stop[$token])) {
                 continue;
             }
-            $existing[] = ['id' => (int) $candidate['id'], 'claim' => (string) $candidate['content']];
-            $supersedes ??= (int) $candidate['id'];
-            if (count($existing) >= self::CONSOLIDATION_EXISTING) {
-                break;
+            $tokens[$token] = true;
+        }
+        return array_keys($tokens);
+    }
+
+    /** @return list<array{id: int, claim: string}> */
+    private function consolidationExistingKnowledge(string $subject): array
+    {
+        $subjectTokens = array_flip($this->consolidationTokens($subject));
+        if ($subjectTokens === []) {
+            return [];
+        }
+
+        $ranked = [];
+        foreach (Memory::rankCandidates($subject, 100, 'semantic', 'active') as $candidate) {
+            $claimTokens = array_flip($this->consolidationTokens((string) $candidate->content));
+            $shared = count(array_intersect_key($subjectTokens, $claimTokens));
+            if ($shared < 3) {
+                continue;
             }
+            $ranked[] = [
+                'id' => (int) $candidate->id,
+                'claim' => (string) $candidate->content,
+                'shared' => $shared,
+                'containment' => $shared / max(1, count($claimTokens)),
+            ];
         }
+        usort($ranked, static function (array $left, array $right): int {
+            $shared = $right['shared'] <=> $left['shared'];
+            if ($shared !== 0) {
+                return $shared;
+            }
+            $containment = $right['containment'] <=> $left['containment'];
+            return $containment !== 0
+                ? $containment
+                : ($right['id'] <=> $left['id']);
+        });
 
-        $composition = new ExecutiveComposition(
-            'Navi is asleep. Replaying a mix of new and older episodes to find what holds across all of them.'
-        );
-        $composition->contribute(
-            'replay',
-            implode(' ', [
-                'These are deliberately mixed: some are recent, some are old.',
-                'State what is true across the sample as a whole.',
-                'Anything that is only true of the newest ones is an accident of when they happened, not something to keep.',
-                'Write about the subject, not about Navi and not about the act of remembering.',
-                'If the sample supports nothing worth keeping, say so plainly and give it low confidence.',
-            ]),
-            array_map(
-                static fn (Memory $episode): array => [
-                    'id' => (int) $episode->id,
-                    'episode' => mb_substr((string) $episode->content, 0, 300),
-                ],
-                array_merge($fresh, $older)
-            )
-        );
-        if ($existing !== []) {
-            $composition->contribute(
-                'existing_knowledge',
-                implode(' ', [
-                    'Navi already believes this about the same subject.',
-                    'Revise it in light of the replay rather than restating it or contradicting it outright.',
-                    'A small correction that keeps what still holds is worth more than a fresh claim.',
-                ]),
-                $existing
-            );
-        }
-
-        // Every work type owes the worker its output contract. This prompt was
-        // shipped without one, so models returned a sensible claim and no
-        // challenged_assumption, the validator rejected it, and three working
-        // endpoints were marked degraded for failing to guess a field nobody
-        // had asked them for.
-        $prompt = $composition->prompt() . "\n\n" . implode("\n", [
-            'Return kind memory_consolidation and content holding the claim itself.',
-            'Put the confidence you actually have in it in confidence.',
-            'Put the belief this replay called into question in challenged_assumption; '
-                . 'if the replay confirmed what was already believed, say that there instead.',
-            'Output exactly the four JSON fields in the supplied schema and nothing else.',
-        ]);
-
-        return $this->enqueueWork(
-            parentRunId: $runId,
-            parentIntentionId: null,
-            workType: self::CONSOLIDATION_WORK_TYPE,
-            prompt: $prompt,
-            inputRefs: [
-                'episode_ids' => array_map(static fn (Memory $m): int => (int) $m->id, $fresh),
-                'interleaved_ids' => array_map(static fn (Memory $m): int => (int) $m->id, $older),
-                'primary_episode_id' => (int) $fresh[0]->id,
-                'supersedes_memory_id' => $supersedes,
+        $selected = array_slice($ranked, 0, self::CONSOLIDATION_EXISTING);
+        Memory::observeRecords(Memory::getManyByID(
+            array_map(static fn (array $candidate): int => (int) $candidate['id'], $selected),
+            false
+        ));
+        return array_map(
+            static fn (array $candidate): array => [
+                'id' => $candidate['id'],
+                'claim' => $candidate['claim'],
             ],
-            tokenBudget: 512,
-            wallBudgetSeconds: 300,
-            idempotencyKey: 'consolidate:' . $fresh[0]->id . ':' . count($fresh)
+            $selected
         );
+    }
+
+    /** @param list<int> $candidateIds */
+    private function consolidationCoveredByExisting(string $claim, array $candidateIds): ?Memory
+    {
+        $claimTokens = array_flip($this->consolidationTokens($claim));
+        if (count($claimTokens) < 3) {
+            return null;
+        }
+
+        $best = null;
+        $bestCoverage = 0.0;
+        $candidates = Memory::getManyByID($candidateIds, false);
+        foreach ($candidates as $candidate) {
+            if (!$candidate instanceof Memory || $candidate->tier !== 'semantic' || $candidate->status !== 'active') {
+                continue;
+            }
+            $candidateTokens = array_flip($this->consolidationTokens((string) $candidate->content));
+            $shared = count(array_intersect_key($claimTokens, $candidateTokens));
+            $coverage = $shared / count($claimTokens);
+            if ($shared < 3 || $coverage < 0.8 || $coverage <= $bestCoverage) {
+                continue;
+            }
+            $best = $candidate;
+            $bestCoverage = $coverage;
+        }
+        if ($best instanceof Memory) {
+            Memory::observeRecords([$best]);
+        }
+        return $best;
     }
 
     /**
@@ -1302,7 +3627,8 @@ final class ExecutiveCore
         ?int $intentionId = null,
         ?int $actionId = null,
         ?int $procedureRunId = null,
-        ?int $procedureStep = null
+        ?int $procedureStep = null,
+        ?int $decisionCycleId = null
     ): array
     {
         $this->requireText($command, 'command');
@@ -1317,8 +3643,93 @@ final class ExecutiveCore
             $intentionId,
             $actionId,
             $procedureRunId,
-            $procedureStep
+            $procedureStep,
+            $decisionCycleId
         ): array {
+            $execution = null;
+            $run = null;
+            if ($actionId !== null) {
+                $execution = ActionExecution::getByField('action_trace_id', $actionId);
+                $action = ActionTrace::getByID($actionId);
+                $executionArguments = $execution instanceof ActionExecution
+                    && is_array($execution->arguments)
+                    ? $execution->arguments
+                    : [];
+                if (!$execution instanceof ActionExecution
+                    || !$action instanceof ActionTrace
+                    || (string) $execution->status !== 'dispatching'
+                    || (string) $execution->action_kind !== 'machine.look'
+                    || $intentionId === null
+                    || (int) $action->intention_id !== $intentionId
+                    || !hash_equals((string) ($executionArguments['command'] ?? ''), $command)
+                    || !hash_equals((string) ($executionArguments['because'] ?? ''), $because)
+                ) {
+                    throw new RuntimeException('Look request does not own the supplied action execution.');
+                }
+            }
+            if ($procedureRunId !== null || $procedureStep !== null) {
+                if (!$execution instanceof ActionExecution
+                    || $procedureRunId === null
+                    || $procedureStep === null
+                    || (int) ($execution->procedure_run_id ?? 0) !== $procedureRunId
+                    || (int) ($execution->step_index ?? 0) !== $procedureStep + 1
+                ) {
+                    throw new RuntimeException('Procedure look request has an incomplete or crossed run-step identity.');
+                }
+                $run = ProcedureRun::getByID($procedureRunId);
+                $runProcedure = $run instanceof ProcedureRun
+                    ? Procedure::getByID((int) $run->procedure_id)
+                    : null;
+                $stepProcedure = Procedure::getByID((int) ($execution->procedure_id ?? 0));
+                $runSteps = $runProcedure instanceof Procedure && is_array($runProcedure->steps)
+                    ? $runProcedure->steps
+                    : [];
+                $runStep = $runSteps[$procedureStep] ?? null;
+                $expectedStepProcedureId = is_array($runStep)
+                    && isset($runStep['source_procedure_id'])
+                    && $runStep['source_procedure_id'] !== null
+                    ? (int) $runStep['source_procedure_id']
+                    : (int) ($run->procedure_id ?? 0);
+                $expectedStepMemoryId = is_array($runStep)
+                    && isset($runStep['source_procedure_memory_id'])
+                    && $runStep['source_procedure_memory_id'] !== null
+                    ? (int) $runStep['source_procedure_memory_id']
+                    : (int) ($run->procedure_memory_id ?? 0);
+                if (!$run instanceof ProcedureRun
+                    || (string) $run->status !== 'running'
+                    || (int) $run->current_step !== $procedureStep
+                    || !$runProcedure instanceof Procedure
+                    || (string) $runProcedure->status !== 'active'
+                    || (int) $runProcedure->memory_id !== (int) ($run->procedure_memory_id ?? 0)
+                    || !$stepProcedure instanceof Procedure
+                    || (string) $stepProcedure->status !== 'active'
+                    || (int) ($execution->procedure_id ?? 0) !== $expectedStepProcedureId
+                    || (int) $stepProcedure->memory_id
+                        !== (int) ($execution->procedure_memory_id ?? 0)
+                    || (int) ($execution->procedure_memory_id ?? 0) !== $expectedStepMemoryId
+                ) {
+                    throw new RuntimeException('Look request cannot suspend a different procedure generation.');
+                }
+            } elseif ($execution instanceof ActionExecution
+                && ($execution->procedure_run_id !== null || $execution->step_index !== null)
+            ) {
+                throw new RuntimeException('Procedure look action is missing its run-step identity.');
+            }
+            $decisionCycle = null;
+            if ($decisionCycleId !== null) {
+                if (!$execution instanceof ActionExecution || $procedureRunId !== null) {
+                    throw new RuntimeException('Decision look request has a crossed execution identity.');
+                }
+                $decisionCycle = DecisionCycle::getByID($decisionCycleId);
+                if (!$decisionCycle instanceof DecisionCycle
+                    || (string) $decisionCycle->status !== 'running'
+                    || (string) $decisionCycle->state !== 'execute'
+                    || (int) $decisionCycle->intention_id !== $intentionId
+                ) {
+                    throw new RuntimeException('Look request cannot bind a different decision cycle.');
+                }
+            }
+
             $event = $this->emit('look.requested', [
                 'command' => $command,
                 'because' => $because,
@@ -1331,8 +3742,383 @@ final class ExecutiveCore
                 'procedure_run_id' => $procedureRunId,
                 'procedure_step' => $procedureStep,
             ]);
+            $queue = $this->connection->prepare(
+                "INSERT INTO look_request_claims
+                 (event_id,owner,status,outcome_hash,outcome_data)
+                 VALUES (:event_id,'','queued',NULL,NULL)"
+            );
+            $queue->execute(['event_id' => (int) $event->id]);
+            if ($actionId !== null) {
+                $bind = $this->connection->prepare(
+                    "UPDATE action_executions
+                     SET dispatch_event_id = :dispatch_event_id,
+                         status = 'waiting', updated_at = :updated_at
+                     WHERE action_trace_id = :action_id AND status = 'dispatching'"
+                );
+                $bind->execute([
+                    'dispatch_event_id' => (int) $event->id,
+                    'updated_at' => date('Y-m-d H:i:s'),
+                    'action_id' => $actionId,
+                ]);
+                if ($bind->rowCount() !== 1) {
+                    throw new RuntimeException('Look request could not bind its action execution atomically.');
+                }
+                $waitClaim = $this->connection->prepare(
+                    "UPDATE action_dispatch_claims SET status = 'waiting'
+                     WHERE action_trace_id = :action_id AND owner = :owner AND status = 'claimed'"
+                );
+                $waitClaim->execute([
+                    'action_id' => $actionId,
+                    'owner' => $this->dispatchOwner(),
+                ]);
+                if ($waitClaim->rowCount() !== 1) {
+                    throw new RuntimeException('Look request lost its action dispatch claim.');
+                }
+            }
+            if ($procedureRunId !== null || $procedureStep !== null) {
+                if ($actionId === null || $procedureRunId === null || $procedureStep === null) {
+                    throw new RuntimeException('Procedure look request has an incomplete run-step identity.');
+                }
+                $actionIds = array_values(array_unique(array_merge(
+                    array_map('intval', (array) $run->action_trace_ids),
+                    [$actionId]
+                )));
+                $suspend = $this->connection->prepare(
+                    "UPDATE procedure_runs
+                     SET action_trace_ids = :action_trace_ids,
+                         status = 'waiting', updated_at = :updated_at
+                     WHERE id = :id AND status = 'running' AND current_step = :step_index"
+                );
+                $suspend->execute([
+                    'action_trace_ids' => serialize($actionIds),
+                    'updated_at' => date('Y-m-d H:i:s'),
+                    'id' => $procedureRunId,
+                    'step_index' => $procedureStep,
+                ]);
+                if ($suspend->rowCount() !== 1) {
+                    throw new RuntimeException('Look request could not suspend its procedure run atomically.');
+                }
+            }
+            if ($decisionCycle instanceof DecisionCycle) {
+                $selection = is_array($decisionCycle->selection) ? $decisionCycle->selection : [];
+                $decisionCycle->setFields([
+                    'execution' => [
+                        'candidate_id' => $selection['candidate_id'] ?? null,
+                        'action_id' => $actionId,
+                        'status' => 'waiting',
+                        'adapter_dispatch' => [
+                            'status' => 'waiting',
+                            'dispatch_event_id' => (int) $event->id,
+                            'wait_committed' => true,
+                        ],
+                    ],
+                    'state' => 'verify',
+                    'status' => 'waiting',
+                    'updated_at' => time(),
+                ]);
+                $decisionCycle->save();
+                $claim = $this->connection->prepare(
+                    "UPDATE decision_async_claims
+                     SET request_event_id = :request_event_id, status = 'waiting'
+                     WHERE action_id = :action_id
+                       AND decision_cycle_id = :decision_cycle_id
+                       AND request_event_id IS NULL AND status = 'started'"
+                );
+                $claim->execute([
+                    'action_id' => $actionId,
+                    'decision_cycle_id' => $decisionCycleId,
+                    'request_event_id' => (int) $event->id,
+                ]);
+                if ($claim->rowCount() !== 1) {
+                    throw new RuntimeException('Look request lost its pre-dispatch decision binding.');
+                }
+                $this->emit('decision_cycle.transition', [
+                    'decision_cycle_id' => $decisionCycleId,
+                    'completed_state' => 'execute',
+                    'next_state' => 'verify',
+                    'elapsed_ms' => 0,
+                ]);
+            }
             return ['event' => $event->getData()];
         });
+    }
+
+    public function decisionCycleForAsyncAction(int $actionId): ?int
+    {
+        $statement = $this->connection->prepare(
+            'SELECT decision_cycle_id FROM decision_async_claims WHERE action_id = :action_id'
+        );
+        $statement->execute(['action_id' => $actionId]);
+        $cycleId = $statement->fetchColumn();
+        $statement->closeCursor();
+        return $cycleId === false ? null : (int) $cycleId;
+    }
+
+    /** @return list<array{action_id: int, decision_cycle_id: int, status: string, owner_live: bool}> */
+    public function pendingDecisionActionClaims(int $limit = 64): array
+    {
+        $limit = max(1, min(512, $limit));
+        $query = function (int $after) use ($limit): array {
+            $statement = $this->connection->prepare(
+                "SELECT action_id,decision_cycle_id,owner,status
+                 FROM decision_async_claims
+                 WHERE status IN ('started','waiting') AND action_id > :after_action_id
+                 ORDER BY action_id ASC
+                 LIMIT :claim_limit"
+            );
+            $statement->bindValue('after_action_id', $after, PDO::PARAM_INT);
+            $statement->bindValue('claim_limit', $limit, PDO::PARAM_INT);
+            $statement->execute();
+            $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
+            $statement->closeCursor();
+            return $rows;
+        };
+        $rows = $query(self::$decisionClaimSweepCursor);
+        if ($rows === [] && self::$decisionClaimSweepCursor > 0) {
+            self::$decisionClaimSweepCursor = 0;
+            $rows = $query(0);
+        }
+        if ($rows !== []) {
+            self::$decisionClaimSweepCursor = max(array_map(
+                static fn (array $row): int => (int) $row['action_id'],
+                $rows
+            ));
+        }
+        return array_values(array_map(fn (array $row): array => [
+            'action_id' => (int) $row['action_id'],
+            'decision_cycle_id' => (int) $row['decision_cycle_id'],
+            'status' => (string) $row['status'],
+            'owner_live' => $this->dispatchOwnerIsLive((string) $row['owner']),
+        ], $rows));
+    }
+
+    public function bindLegacyDecisionAsyncClaim(
+        int $decisionCycleId,
+        int $actionId,
+        int $requestEventId
+    ): void {
+        if ($decisionCycleId < 1 || $actionId < 1 || $requestEventId < 1) {
+            throw new InvalidArgumentException('Legacy asynchronous decision identity is invalid.');
+        }
+        $this->transaction(function () use ($decisionCycleId, $actionId, $requestEventId): void {
+            $statement = $this->connection->prepare(
+                "INSERT OR IGNORE INTO decision_async_claims
+                 (action_id,decision_cycle_id,request_event_id,owner,status,outcome_hash)
+                 VALUES (:action_id,:decision_cycle_id,:request_event_id,:owner,'waiting',NULL)"
+            );
+            $statement->execute([
+                'action_id' => $actionId,
+                'decision_cycle_id' => $decisionCycleId,
+                'request_event_id' => $requestEventId,
+                'owner' => $this->dispatchOwner(),
+            ]);
+            $check = $this->connection->prepare(
+                'SELECT decision_cycle_id,request_event_id
+                 FROM decision_async_claims WHERE action_id = :action_id'
+            );
+            $check->execute(['action_id' => $actionId]);
+            $row = $check->fetch(PDO::FETCH_ASSOC);
+            $check->closeCursor();
+            if (!is_array($row)
+                || (int) $row['decision_cycle_id'] !== $decisionCycleId
+                || (int) $row['request_event_id'] !== $requestEventId
+            ) {
+                throw new RuntimeException('Legacy asynchronous decision claim conflicts with durable state.');
+            }
+        });
+    }
+
+    /** @param array<string, mixed> $finished
+     *  @return array<string, mixed>
+     */
+    public function finalizeAsyncDecisionCycle(
+        int $decisionCycleId,
+        int $actionId,
+        bool $matched,
+        array $finished
+    ): array {
+        return $this->transaction(function () use (
+            $decisionCycleId,
+            $actionId,
+            $matched,
+            $finished
+        ): array {
+            $claim = $this->connection->prepare(
+                'SELECT decision_cycle_id,request_event_id,status,outcome_hash
+                 FROM decision_async_claims WHERE action_id = :action_id'
+            );
+            $claim->execute(['action_id' => $actionId]);
+            $row = $claim->fetch(PDO::FETCH_ASSOC);
+            $claim->closeCursor();
+            if (!is_array($row) || (int) $row['decision_cycle_id'] !== $decisionCycleId) {
+                throw new RuntimeException('Asynchronous decision has no exact durable claim.');
+            }
+            $execution = ActionExecution::getByField('action_trace_id', $actionId);
+            if (!$execution instanceof ActionExecution
+                || ($row['request_event_id'] !== null
+                    && (int) ($execution->dispatch_event_id ?? 0) !== (int) $row['request_event_id'])
+                || !in_array($execution->status, ['succeeded', 'failed', 'cancelled'], true)
+                || $matched !== ((string) $execution->status === 'succeeded'
+                    && (int) $execution->verified === 1)
+            ) {
+                throw new RuntimeException('Asynchronous decision outcome conflicts with its durable action.');
+            }
+            $outcomeHash = hash('sha256', serialize([
+                'decision_cycle_id' => $decisionCycleId,
+                'action_id' => $actionId,
+                'matched' => $matched,
+                'execution_status' => (string) $execution->status,
+                'verified' => (int) $execution->verified,
+                'observed' => (array) $execution->observed,
+            ]));
+            if ((string) $row['status'] === 'completed') {
+                if (!is_string($row['outcome_hash'])
+                    || !hash_equals($row['outcome_hash'], $outcomeHash)
+                ) {
+                    throw new RuntimeException('Asynchronous decision already has a different outcome.');
+                }
+                $cycle = DecisionCycle::getByID($decisionCycleId);
+                if (!$cycle instanceof DecisionCycle || (string) $cycle->status !== 'completed') {
+                    throw new RuntimeException('Completed asynchronous decision lost its terminal cycle.');
+                }
+                $event = $this->emitOnce(
+                    'decision-cycle-completed:' . $decisionCycleId,
+                    'decision_cycle.completed',
+                    $this->decisionCompletedPayload($cycle, $matched)
+                );
+                return [
+                    'status' => 'completed',
+                    'cycle' => $cycle->getData(),
+                    'event' => $event->getData(),
+                    'replayed' => true,
+                ];
+            }
+            if (!in_array((string) $row['status'], ['started', 'waiting'], true)) {
+                throw new RuntimeException('Asynchronous decision completion is in an invalid state.');
+            }
+            $cycle = DecisionCycle::getByID($decisionCycleId);
+            $cycleExecution = $cycle instanceof DecisionCycle && is_array($cycle->execution)
+                ? $cycle->execution
+                : [];
+            $waiting = (string) $row['status'] === 'waiting';
+            if (!$cycle instanceof DecisionCycle
+                || (string) $cycle->status !== ($waiting ? 'waiting' : 'running')
+                || (string) $cycle->state !== ($waiting ? 'verify' : 'execute')
+                || (int) ($cycleExecution['action_id'] ?? 0) !== $actionId
+            ) {
+                throw new RuntimeException('Asynchronous decision cycle is not waiting for its claimed action.');
+            }
+
+            $trace = ActionTrace::getByID($actionId);
+            if (!$trace instanceof ActionTrace) {
+                throw new RuntimeException('Asynchronous decision lost its durable action trace.');
+            }
+            $action = $trace->getData();
+            $learned = is_array($finished['procedure'] ?? null) ? $finished['procedure'] : [];
+            $learnedProcedureId = (int) ($learned['procedure']['id'] ?? 0);
+            $learnedMemoryId = (int) ($learned['memory']['id'] ?? 0);
+            $learnedProcedure = $learnedProcedureId > 0
+                ? Procedure::getByID($learnedProcedureId)
+                : null;
+            if (!$learnedProcedure instanceof Procedure
+                || (int) $learnedProcedure->memory_id !== $learnedMemoryId
+                || !in_array($actionId, array_map('intval', (array) $learnedProcedure->evidence_action_ids), true)
+            ) {
+                $learnedProcedureId = 0;
+                $learnedMemoryId = 0;
+            }
+            $timings = is_array($cycle->stage_timings) ? $cycle->stage_timings : [];
+            $timings['verify_ms'] ??= 0;
+            $timings['adapt_ms'] ??= 0;
+            $timings['total_ms'] = array_sum(array_map('intval', $timings));
+            $cycle->setFields([
+                'verification' => [
+                    'matched' => $matched,
+                    'action_id' => $action['id'] ?? $actionId,
+                    'status' => $action['status'] ?? (string) $execution->status,
+                    'match_status' => $action['match_status'] ?? ($matched ? 'matched' : 'mismatched'),
+                    'observed' => $action['observed'] ?? null,
+                ],
+                'adaptation' => [
+                    'procedure_compiled_or_updated' => $learnedProcedureId > 0,
+                    'procedure_id' => $learnedProcedureId > 0 ? $learnedProcedureId : null,
+                    'memory_id' => $learnedMemoryId > 0 ? $learnedMemoryId : null,
+                    'invalidating_failure_observed' => !$matched,
+                ],
+                'state' => 'complete',
+                'status' => 'completed',
+                'completed_at' => time(),
+                'stage_timings' => $timings,
+                'updated_at' => time(),
+            ]);
+            $cycle->save();
+            if (!$waiting) {
+                $this->emitOnce(
+                    'decision-cycle-transition:' . $decisionCycleId . ':execute-verify',
+                    'decision_cycle.transition',
+                    [
+                        'decision_cycle_id' => $decisionCycleId,
+                        'completed_state' => 'execute',
+                        'next_state' => 'verify',
+                        'elapsed_ms' => 0,
+                    ]
+                );
+            }
+            $this->emitOnce(
+                'decision-cycle-transition:' . $decisionCycleId . ':verify-adapt',
+                'decision_cycle.transition',
+                [
+                    'decision_cycle_id' => $decisionCycleId,
+                    'completed_state' => 'verify',
+                    'next_state' => 'adapt',
+                    'elapsed_ms' => 0,
+                ]
+            );
+            $this->emitOnce(
+                'decision-cycle-transition:' . $decisionCycleId . ':adapt-complete',
+                'decision_cycle.transition',
+                [
+                    'decision_cycle_id' => $decisionCycleId,
+                    'completed_state' => 'adapt',
+                    'next_state' => 'complete',
+                    'elapsed_ms' => 0,
+                ]
+            );
+            $event = $this->emitOnce(
+                'decision-cycle-completed:' . $decisionCycleId,
+                'decision_cycle.completed',
+                $this->decisionCompletedPayload($cycle, $matched)
+            );
+            $complete = $this->connection->prepare(
+                "UPDATE decision_async_claims SET status = 'completed', outcome_hash = :outcome_hash
+                 WHERE action_id = :action_id AND decision_cycle_id = :decision_cycle_id
+                   AND status = :expected_status"
+            );
+            $complete->execute([
+                'outcome_hash' => $outcomeHash,
+                'action_id' => $actionId,
+                'decision_cycle_id' => $decisionCycleId,
+                'expected_status' => $waiting ? 'waiting' : 'started',
+            ]);
+            if ($complete->rowCount() !== 1) {
+                throw new RuntimeException('Asynchronous decision lost its completion claim.');
+            }
+            return ['status' => 'completed', 'cycle' => $cycle->getData(), 'event' => $event->getData()];
+        });
+    }
+
+    /** @return array<string, mixed> */
+    private function decisionCompletedPayload(DecisionCycle $cycle, bool $matched): array
+    {
+        $selection = is_array($cycle->selection) ? $cycle->selection : [];
+        $timings = is_array($cycle->stage_timings) ? $cycle->stage_timings : [];
+        return [
+            'decision_cycle_id' => (int) $cycle->id,
+            'model_id' => $cycle->model_id,
+            'matched' => $matched,
+            'selected_action_kind' => $selection['action_kind'] ?? null,
+            'total_ms' => (int) ($timings['total_ms'] ?? 0),
+        ];
     }
 
     /**
@@ -1384,13 +4170,14 @@ final class ExecutiveCore
         ) !== [];
 
         $consolidated = [];
-        foreach (Memory::getAllByWhere(['tier' => 'semantic'], ['limit' => 500]) as $semantic) {
+        foreach (Memory::inspectAllByWhere(['tier' => 'semantic'], ['limit' => 500]) as $semantic) {
             if ($semantic->source_memory_id !== null) {
                 $consolidated[(int) $semantic->source_memory_id] = true;
             }
         }
         $unconsolidated = 0;
-        foreach (Memory::getAllByWhere(
+        $learnedMemories = [];
+        foreach (Memory::inspectAllByWhere(
             ['tier' => 'episodic', 'status' => 'active'],
             ['order' => ['id' => 'DESC'], 'limit' => 200]
         ) as $episode) {
@@ -1472,18 +4259,21 @@ final class ExecutiveCore
     private function enqueueLookProposal(?int $runId, int $now): ?array
     {
         $learned = [];
-        foreach (Memory::getAllByWhere(
+        $learnedMemories = [];
+        foreach (Memory::inspectAllByWhere(
             ['status' => 'active'],
             ['order' => ['id' => 'DESC'], 'limit' => 200]
         ) as $memory) {
             if (!str_contains((string) $memory->content, 'this machine')) {
                 continue;
             }
+            $learnedMemories[] = $memory;
             $learned[] = mb_substr((string) $memory->content, 0, 260);
             if (count($learned) >= 8) {
                 break;
             }
         }
+        Memory::observeRecords($learnedMemories);
 
         $unexplained = array_map(
             static fn (array $event): array => [
@@ -1626,6 +4416,9 @@ final class ExecutiveCore
         $refused = ($reading['refused'] ?? false) === true;
         $exit = $reading['exit_code'] ?? null;
         $worked = !$refused && $exit === 0;
+        $outcomeHash = $requestEventId === null
+            ? null
+            : $this->stageLookCompletion($command, $because, $reading, $requestEventId);
 
         if ($refused) {
             $content = sprintf(
@@ -1653,13 +4446,21 @@ final class ExecutiveCore
             );
         }
 
-        $event = $this->emit('look.observed', [
+        $eventPayload = [
             'command' => $command,
             'because' => $because,
             'worked' => $worked,
             'refused' => $refused,
             'exit_code' => $exit,
-        ]);
+            'request_event_id' => $requestEventId,
+        ];
+        $event = $requestEventId === null
+            ? $this->emit('look.observed', $eventPayload)
+            : $this->emitOnce(
+                'look.observed:request:' . $requestEventId,
+                'look.observed',
+                $eventPayload
+            );
 
         $memory = $this->addMemory(
             tier: 'episodic',
@@ -1668,12 +4469,125 @@ final class ExecutiveCore
             // knowing what does not work here is most of what stops the same
             // dead end being tried again.
             confidence: $worked ? 0.9 : 0.8,
+            idempotencyKey: $requestEventId === null
+                ? 'look-observed:' . (int) $event->id
+                : 'look-observed-request:' . $requestEventId,
             sourceEventId: (int) $event->id
         );
         $procedure = $requestEventId === null
             ? null
             : $this->proceduralMemory->completePendingLook($requestEventId, $reading);
+        if ($requestEventId !== null) {
+            $this->finishLookCompletion($requestEventId, $outcomeHash);
+        }
         return $memory + ['procedure_completion' => $procedure];
+    }
+
+    /**
+     * Durably bind the executor's chosen reading before any later ingestion,
+     * event, token-memory, or callback work can fail. Exact replays converge
+     * on this stored reading and can never execute the external command again.
+     *
+     * @param array<string, mixed> $reading
+     */
+    public function stageLookCompletion(
+        string $command,
+        string $because,
+        array $reading,
+        int $requestEventId
+    ): string {
+        $this->requireText($command, 'command');
+        $this->requireText($because, 'reason for looking');
+        if ($requestEventId < 1) {
+            throw new InvalidArgumentException('Look request event identity is invalid.');
+        }
+        $request = Event::getByID($requestEventId);
+        $payload = $request instanceof Event && is_array($request->payload)
+            ? $request->payload
+            : [];
+        if (!$request instanceof Event
+            || (string) $request->kind !== 'look.requested'
+            || !hash_equals((string) ($payload['command'] ?? ''), $command)
+            || !hash_equals((string) ($payload['because'] ?? ''), $because)
+        ) {
+            throw new RuntimeException('Look completion does not match its immutable request event.');
+        }
+        $outcomeHash = hash('sha256', serialize([
+            'command' => $command,
+            'because' => $because,
+            'reading' => $reading,
+        ]));
+        $this->beginLookCompletion($requestEventId, $outcomeHash, $reading);
+        return $outcomeHash;
+    }
+
+    /** @param array<string, mixed> $reading */
+    private function beginLookCompletion(int $eventId, string $outcomeHash, array $reading): void
+    {
+        $this->transaction(function () use ($eventId, $outcomeHash, $reading): void {
+            $owner = $this->dispatchOwner();
+            $statement = $this->connection->prepare(
+                'SELECT owner,status,outcome_hash FROM look_request_claims WHERE event_id = :event_id'
+            );
+            $statement->execute(['event_id' => $eventId]);
+            $row = $statement->fetch(PDO::FETCH_ASSOC);
+            $statement->closeCursor();
+            if (!is_array($row)) {
+                throw new RuntimeException('Look completion has no executor claim.');
+            }
+            if (in_array($row['status'], ['completing', 'completed'], true)) {
+                if (!is_string($row['outcome_hash']) || !hash_equals($row['outcome_hash'], $outcomeHash)) {
+                    throw new RuntimeException('Look request already has a different durable outcome.');
+                }
+                return;
+            }
+            if ($row['status'] !== 'claimed' || !hash_equals((string) $row['owner'], $owner)) {
+                throw new RuntimeException('Look completion is not owned by this executor process.');
+            }
+            $update = $this->connection->prepare(
+                "UPDATE look_request_claims
+                 SET status = 'completing', outcome_hash = :outcome_hash, outcome_data = :outcome_data
+                 WHERE event_id = :event_id AND owner = :owner AND status = 'claimed'"
+            );
+            $update->execute([
+                'outcome_hash' => $outcomeHash,
+                'outcome_data' => serialize($reading),
+                'event_id' => $eventId,
+                'owner' => $owner,
+            ]);
+            if ($update->rowCount() !== 1) {
+                throw new RuntimeException('Look completion lost its executor claim.');
+            }
+        });
+    }
+
+    private function finishLookCompletion(int $eventId, string $outcomeHash): void
+    {
+        $this->transaction(function () use ($eventId, $outcomeHash): void {
+            $statement = $this->connection->prepare(
+                "UPDATE look_request_claims
+                 SET status = 'completed'
+                 WHERE event_id = :event_id AND outcome_hash = :outcome_hash
+                   AND status = 'completing'"
+            );
+            $statement->execute(['event_id' => $eventId, 'outcome_hash' => $outcomeHash]);
+            if ($statement->rowCount() === 1) {
+                return;
+            }
+            $check = $this->connection->prepare(
+                'SELECT status,outcome_hash FROM look_request_claims WHERE event_id = :event_id'
+            );
+            $check->execute(['event_id' => $eventId]);
+            $row = $check->fetch(PDO::FETCH_ASSOC);
+            $check->closeCursor();
+            if (!is_array($row)
+                || $row['status'] !== 'completed'
+                || !is_string($row['outcome_hash'])
+                || !hash_equals($row['outcome_hash'], $outcomeHash)
+            ) {
+                throw new RuntimeException('Look completion could not commit its exact outcome.');
+            }
+        });
     }
 
     /**
@@ -1687,36 +4601,40 @@ final class ExecutiveCore
      */
     public function claimPendingLooks(int $limit = 3): array
     {
-        $answered = [];
-        foreach (SenseReading::getAllByWhere(
-            ['source_key' => 'machine_inspection'],
-            ['order' => ['id' => 'DESC'], 'limit' => 200]
-        ) as $reading) {
-            $payload = is_array($reading->payload) ? $reading->payload : [];
-            $command = (string) ($payload['command'] ?? '');
-            // A look that could not happen was not answered. Counting a refusal
-            // as an answer meant a question asked while the service was down
-            // could never be asked again, which is the opposite of what a
-            // refusal means: the service was unavailable, not the question.
-            if ($command !== '' && ($payload['refused'] ?? false) !== true) {
-                $answered[$command] = true;
-            }
-        }
-
+        $this->decisionStateMachine->reconcileAsyncActions(max(8, $limit * 4));
+        $limit = max(1, $limit);
         $pending = [];
-        foreach (Event::getAllByWhere(
-            ['kind' => 'look.requested'],
-            ['order' => ['id' => 'DESC'], 'limit' => 40]
-        ) as $event) {
-            $payload = is_array($event->payload) ? $event->payload : [];
-            $command = (string) ($payload['command'] ?? '');
-            if ($command === '' || isset($answered[$command])) {
+        $recoveryIds = $this->lookRecoveryCandidateIds($limit);
+        $queued = $this->connection->prepare(
+            "SELECT event_id
+             FROM look_request_claims
+             WHERE status = 'queued'
+             ORDER BY event_id ASC
+             LIMIT :candidate_limit"
+        );
+        $queued->bindValue('candidate_limit', $limit, PDO::PARAM_INT);
+        $queued->execute();
+        $queuedIds = array_map('intval', $queued->fetchAll(PDO::FETCH_COLUMN));
+        $queued->closeCursor();
+
+        foreach (array_values(array_unique(array_merge($recoveryIds, $queuedIds))) as $eventId) {
+            $event = Event::getByID($eventId);
+            if (!$event instanceof Event || (string) $event->kind !== 'look.requested') {
                 continue;
             }
-            $answered[$command] = true;
+            $payload = is_array($event->payload) ? $event->payload : [];
+            $command = (string) ($payload['command'] ?? '');
+            if ($command === '') {
+                continue;
+            }
+            $because = (string) ($payload['because'] ?? '');
+            $claim = $this->claimLookRequest((int) $event->id, $command, $because);
+            if (!in_array($claim['status'], ['claimed', 'replay'], true)) {
+                continue;
+            }
             $pending[] = [
                 'command' => $command,
-                'because' => (string) ($payload['because'] ?? ''),
+                'because' => $because,
                 'event_id' => (int) $event->id,
                 'action_id' => isset($payload['action_id']) ? (int) $payload['action_id'] : null,
                 'procedure_run_id' => isset($payload['procedure_run_id'])
@@ -1725,12 +4643,165 @@ final class ExecutiveCore
                 'procedure_step' => isset($payload['procedure_step'])
                     ? (int) $payload['procedure_step']
                     : null,
+                'replay_reading' => $claim['reading'] ?? null,
             ];
             if (count($pending) >= max(1, $limit)) {
                 break;
             }
         }
-        return array_reverse($pending);
+        return $pending;
+    }
+
+    /** @return list<int> */
+    private function lookRecoveryCandidateIds(int $limit): array
+    {
+        $query = function (int $after) use ($limit): array {
+            $statement = $this->connection->prepare(
+                "SELECT c.event_id
+                 FROM look_request_claims AS c
+                 INNER JOIN events AS e ON e.id = c.event_id
+                 WHERE e.kind = 'look.requested'
+                   AND c.status IN ('legacy','claimed','completing')
+                   AND c.event_id > :after_event_id
+                 ORDER BY c.event_id ASC
+                 LIMIT :candidate_limit"
+            );
+            $statement->bindValue('after_event_id', $after, PDO::PARAM_INT);
+            $statement->bindValue('candidate_limit', max(1, $limit), PDO::PARAM_INT);
+            $statement->execute();
+            $ids = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
+            $statement->closeCursor();
+            return $ids;
+        };
+
+        $ids = $query(self::$lookClaimSweepCursor);
+        if ($ids === [] && self::$lookClaimSweepCursor > 0) {
+            self::$lookClaimSweepCursor = 0;
+            $ids = $query(0);
+        }
+        if ($ids !== []) {
+            self::$lookClaimSweepCursor = max($ids);
+        }
+        return $ids;
+    }
+
+    /** @return array{status: 'claimed'|'replay'|'skip', reading?: array<string, mixed>} */
+    private function claimLookRequest(int $eventId, string $command, string $because): array
+    {
+        return $this->transaction(function () use ($eventId, $command, $because): array {
+            $owner = $this->dispatchOwner();
+            $statement = $this->connection->prepare(
+                'SELECT owner,status,outcome_data FROM look_request_claims WHERE event_id = :event_id'
+            );
+            $statement->execute(['event_id' => $eventId]);
+            $row = $statement->fetch(PDO::FETCH_ASSOC);
+            $statement->closeCursor();
+            if (!is_array($row)) {
+                throw new RuntimeException('Look request is missing its atomic queue record.');
+            }
+            if ($row['status'] === 'queued') {
+                $claim = $this->connection->prepare(
+                    "UPDATE look_request_claims SET owner = :owner, status = 'claimed'
+                     WHERE event_id = :event_id AND status = 'queued'"
+                );
+                $claim->execute(['owner' => $owner, 'event_id' => $eventId]);
+                if ($claim->rowCount() !== 1) {
+                    throw new RuntimeException('Look queue claim changed concurrently.');
+                }
+                return ['status' => 'claimed'];
+            }
+            if ($row['status'] === 'legacy') {
+                $reading = [
+                    'refused' => true,
+                    'refused_because' => 'This request predates the durable executor ledger; its outcome is indeterminate.',
+                    'exit_code' => null,
+                    'timed_out' => false,
+                    'output_digest' => null,
+                    'output_bytes' => null,
+                ];
+                $recover = $this->connection->prepare(
+                    "UPDATE look_request_claims
+                     SET owner = :owner, status = 'completing',
+                         outcome_hash = :outcome_hash, outcome_data = :outcome_data
+                     WHERE event_id = :event_id AND status = 'legacy'"
+                );
+                $recover->execute([
+                    'owner' => $owner,
+                    'outcome_hash' => hash('sha256', serialize([
+                        'command' => $command,
+                        'because' => $because,
+                        'reading' => $reading,
+                    ])),
+                    'outcome_data' => serialize($reading),
+                    'event_id' => $eventId,
+                ]);
+                return $recover->rowCount() === 1
+                    ? ['status' => 'replay', 'reading' => $reading]
+                    : ['status' => 'skip'];
+            }
+            if (!in_array($row['status'], ['claimed', 'completing'], true)) {
+                return ['status' => 'skip'];
+            }
+            $previousOwner = (string) $row['owner'];
+            if ($row['status'] === 'completing') {
+                if (!hash_equals($previousOwner, $owner)
+                    && $this->dispatchOwnerIsLive($previousOwner)
+                ) {
+                    return ['status' => 'skip'];
+                }
+                $recover = $this->connection->prepare(
+                    "UPDATE look_request_claims SET owner = :owner
+                     WHERE event_id = :event_id AND owner = :previous_owner AND status = 'completing'"
+                );
+                $recover->execute([
+                    'owner' => $owner,
+                    'event_id' => $eventId,
+                    'previous_owner' => $previousOwner,
+                ]);
+                $reading = isset($row['outcome_data']) ? @unserialize((string) $row['outcome_data']) : null;
+                if (!is_array($reading)
+                    || ($recover->rowCount() !== 1 && !hash_equals($previousOwner, $owner))
+                ) {
+                    throw new RuntimeException('Indeterminate look completion has no replayable outcome.');
+                }
+                return ['status' => 'replay', 'reading' => $reading];
+            }
+            if (!hash_equals($previousOwner, $owner)
+                && $this->dispatchOwnerIsLive($previousOwner)
+            ) {
+                return ['status' => 'skip'];
+            }
+            $recover = $this->connection->prepare(
+                "UPDATE look_request_claims
+                 SET owner = :owner, status = 'completing',
+                     outcome_hash = :outcome_hash, outcome_data = :outcome_data
+                 WHERE event_id = :event_id AND owner = :previous_owner AND status = 'claimed'"
+            );
+            $reading = [
+                'refused' => true,
+                'refused_because' => hash_equals($previousOwner, $owner)
+                    ? 'The command executor returned to an unstaged request; its outcome is indeterminate.'
+                    : 'The command executor exited after claiming this request; its outcome is indeterminate.',
+                'exit_code' => null,
+                'timed_out' => false,
+                'output_digest' => null,
+                'output_bytes' => null,
+            ];
+            $recover->execute([
+                'owner' => $owner,
+                'outcome_hash' => hash('sha256', serialize([
+                    'command' => $command,
+                    'because' => $because,
+                    'reading' => $reading,
+                ])),
+                'outcome_data' => serialize($reading),
+                'event_id' => $eventId,
+                'previous_owner' => $previousOwner,
+            ]);
+            return $recover->rowCount() === 1
+                ? ['status' => 'replay', 'reading' => $reading]
+                : ['status' => 'skip'];
+        });
     }
 
     /**
@@ -1949,47 +5020,343 @@ final class ExecutiveCore
     private function integrateConsolidation(array $work, array $proposal, ?string $model): array
     {
         $refs = is_array($work['input_refs'] ?? null) ? $work['input_refs'] : [];
-        $episodeId = (int) ($refs['primary_episode_id'] ?? 0);
-        $content = trim((string) ($proposal['content'] ?? ''));
+        $workId = (int) ($work['id'] ?? 0);
+        $expectedIds = $this->consolidationIdList($refs['episode_ids'] ?? []);
         $confidence = is_numeric($proposal['confidence'] ?? null) ? (float) $proposal['confidence'] : 0.0;
-
-        if ($episodeId === 0 || $content === '') {
-            return ['status' => 'rejected', 'reason' => 'empty_consolidation'];
+        if ($workId < 1 || $expectedIds === []) {
+            return $this->rejectConsolidationAttempt($work, 'missing_work_or_episode_ids');
         }
-        // A claim the pass itself does not believe is not knowledge. Storing it
-        // anyway is how a memory store fills with things nothing will act on.
+        if (($proposal['kind'] ?? null) !== self::MEMORY_CONSOLIDATION_WORK_TYPE) {
+            return $this->rejectConsolidationAttempt($work, 'wrong_proposal_kind');
+        }
+
+        $claim = is_string($proposal['content'] ?? null) ? trim($proposal['content']) : '';
+        $rejectionReason = is_string($proposal['rejection_reason'] ?? null)
+            ? trim($proposal['rejection_reason'])
+            : '';
+        $supportedIds = $this->consolidationIdList($proposal['supported_episode_ids'] ?? null);
+        $rejectedIds = $this->consolidationIdList($proposal['rejected_episode_ids'] ?? null);
+        $partition = array_values(array_unique(array_merge($supportedIds, $rejectedIds)));
+        sort($partition);
+        sort($expectedIds);
+        if ($partition !== $expectedIds
+            || count($supportedIds) + count($rejectedIds) !== count($expectedIds)
+        ) {
+            return $this->rejectConsolidationAttempt($work, 'fresh_episode_partition_is_incomplete');
+        }
+        if ($rejectedIds !== [] && ($rejectionReason === '' || $rejectionReason === 'none')) {
+            return $this->rejectConsolidationAttempt($work, 'rejected_sources_have_no_reason');
+        }
+
+        if ($supportedIds === []) {
+            if ($claim !== '' || $rejectedIds !== $expectedIds) {
+                return $this->rejectConsolidationAttempt($work, 'empty_support_must_reject_the_whole_batch');
+            }
+            return $this->transaction(function () use (
+                $workId,
+                $expectedIds,
+                $rejectionReason,
+                $confidence,
+                $model
+            ): array {
+                foreach ($expectedIds as $episodeId) {
+                    $entry = MemoryConsolidationEpisode::getByField('episode_id', $episodeId);
+                    if ($entry instanceof MemoryConsolidationEpisode
+                        && $entry->status === 'queued'
+                        && (int) $entry->work_item_id === $workId
+                    ) {
+                        $entry->setFields([
+                            'work_item_id' => null,
+                            'status' => 'rejected',
+                            'reason' => mb_substr($rejectionReason, 0, 1000),
+                            'updated_at' => time(),
+                        ]);
+                        $entry->save();
+                    }
+                }
+                $event = $this->emit('memory.consolidation.batch.rejected', [
+                    'work_item_id' => $workId,
+                    'episode_ids' => $expectedIds,
+                    'reason' => $rejectionReason,
+                    'confidence' => $confidence,
+                    'model' => $model,
+                    'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+                ]);
+                return [
+                    'status' => 'sources_rejected',
+                    'episode_ids' => $expectedIds,
+                    'reason' => $rejectionReason,
+                    'event' => $event->getData(),
+                ];
+            });
+        }
+
+        if ($claim === '') {
+            return $this->rejectConsolidationAttempt($work, 'supported_sources_require_a_claim');
+        }
         if ($confidence < self::CONSOLIDATION_CONFIDENCE_FLOOR) {
-            return ['status' => 'rejected', 'reason' => 'below_confidence_floor', 'confidence' => $confidence];
+            return $this->rejectConsolidationAttempt($work, 'supported_claim_below_confidence_floor');
         }
 
-        // Supersede rather than append when the replay revised something Navi
-        // already believed. Two claims about one subject sitting side by side
-        // is the additive failure: recall returns both, they disagree at the
-        // edges, and nothing ever decides between them.
-        $supersedes = isset($refs['supersedes_memory_id']) ? (int) $refs['supersedes_memory_id'] : null;
-        $episode = $this->requireMemory($episodeId);
-        if ($episode->tier !== 'episodic') {
-            return ['status' => 'rejected', 'reason' => 'primary_is_not_an_episode'];
+        $supersedes = $proposal['supersedes_memory_id'] ?? null;
+        if ($supersedes !== null && (!is_int($supersedes) || $supersedes < 1)) {
+            return $this->rejectConsolidationAttempt($work, 'invalid_supersedes_memory_id');
         }
-        $stored = $this->addMemory(
-            tier: 'semantic',
-            content: $content,
-            confidence: $confidence,
-            sourceEventId: $episode->source_event_id,
-            sourceMemoryId: $episodeId,
-            supersedesId: $supersedes
+        $allowedExisting = $this->consolidationIdList($refs['existing_memory_ids'] ?? []);
+        if ($supersedes !== null) {
+            return $this->rejectConsolidationAttempt($work, 'automatic_consolidation_does_not_supersede_existing_memory');
+        }
+
+        $episodes = [];
+        $expectedHashes = is_array($refs['evidence_hashes'] ?? null) ? $refs['evidence_hashes'] : [];
+        foreach ($supportedIds as $episodeId) {
+            $episode = Memory::getByID($episodeId);
+            if (!$episode instanceof Memory || $episode->tier !== 'episodic' || $episode->status !== 'active') {
+                return $this->rejectConsolidationAttempt($work, 'supported_episode_missing_or_inactive');
+            }
+            $actualHash = hash('sha256', $this->consolidationEvidenceText($episode));
+            if (($expectedHashes[(string) $episodeId] ?? null) !== $actualHash) {
+                return $this->rejectConsolidationAttempt($work, 'source_evidence_changed_after_queueing');
+            }
+            $episodes[] = $episode;
+        }
+        $groundingFailure = $this->consolidationGroundingFailure($claim, $episodes);
+        if ($groundingFailure !== null) {
+            return $this->rejectConsolidationAttempt($work, $groundingFailure);
+        }
+
+        $activeEntries = 0;
+        foreach (array_merge($supportedIds, $rejectedIds) as $episodeId) {
+            $entry = MemoryConsolidationEpisode::getByField('episode_id', $episodeId);
+            if ($entry instanceof MemoryConsolidationEpisode
+                && $entry->status === 'queued'
+                && (int) $entry->work_item_id === $workId
+            ) {
+                $activeEntries++;
+            }
+        }
+        if ($activeEntries === 0) {
+            return ['status' => 'already_integrated', 'work_item_id' => $workId];
+        }
+
+        $semantic = $this->consolidationCoveredByExisting($claim, $allowedExisting);
+        $normalizedClaim = $this->normalizeSearchText($claim);
+        if (!$semantic instanceof Memory) {
+            foreach (Memory::rankCandidates($claim, 100, 'semantic', 'active') as $candidate) {
+                if ($this->normalizeSearchText((string) $candidate->content) === $normalizedClaim) {
+                    $semantic = $candidate;
+                    Memory::observeRecords([$candidate]);
+                    break;
+                }
+            }
+        }
+        if (!$semantic instanceof Memory) {
+            $primary = $episodes[0];
+            $stored = $this->addMemory(
+                tier: 'semantic',
+                content: $claim,
+                confidence: $confidence,
+                idempotencyKey: 'automatic-consolidation:' . $workId,
+                sourceEventId: $primary->source_event_id,
+                sourceMemoryId: (int) $primary->id,
+                supersedesId: null
+            );
+            $semantic = is_array($stored['memory'] ?? null) ? $stored['memory'] : [];
+        }
+
+        $semanticData = $semantic instanceof Memory ? $semantic->getData() : $semantic;
+        $semanticId = (int) ($semanticData['id'] ?? 0);
+        if ($semanticId < 1) {
+            throw new RuntimeException('Stored consolidation memory receipt is invalid.');
+        }
+
+        return $this->transaction(function () use (
+            $workId,
+            $refs,
+            $confidence,
+            $supportedIds,
+            $rejectedIds,
+            $rejectionReason,
+            $supersedes,
+            $model,
+            $semanticData,
+            $semanticId
+        ): array {
+            $activeEntries = 0;
+            foreach (array_merge($supportedIds, $rejectedIds) as $episodeId) {
+                $entry = MemoryConsolidationEpisode::getByField('episode_id', $episodeId);
+                if ($entry instanceof MemoryConsolidationEpisode
+                    && $entry->status === 'queued'
+                    && (int) $entry->work_item_id === $workId
+                ) {
+                    $activeEntries++;
+                }
+            }
+            if ($activeEntries === 0) {
+                return ['status' => 'already_integrated', 'work_item_id' => $workId];
+            }
+
+            foreach ($supportedIds as $episodeId) {
+                $entry = MemoryConsolidationEpisode::getByField('episode_id', $episodeId);
+                if ($entry instanceof MemoryConsolidationEpisode) {
+                    $entry->setFields([
+                        'work_item_id' => null,
+                        'semantic_memory_id' => $semanticId,
+                        'status' => 'consolidated',
+                        'reason' => 'supported_by_grounded_claim',
+                        'updated_at' => time(),
+                    ]);
+                    $entry->save();
+                }
+            }
+            foreach ($rejectedIds as $episodeId) {
+                $entry = MemoryConsolidationEpisode::getByField('episode_id', $episodeId);
+                if ($entry instanceof MemoryConsolidationEpisode) {
+                    $entry->setFields([
+                        'work_item_id' => null,
+                        'status' => 'rejected',
+                        'reason' => mb_substr($rejectionReason, 0, 1000),
+                        'updated_at' => time(),
+                    ]);
+                    $entry->save();
+                }
+            }
+
+            $event = $this->emit('memory.consolidated', [
+                'work_item_id' => $workId,
+                'episode_ids' => $supportedIds,
+                'rejected_episode_ids' => $rejectedIds,
+                'rejection_reason' => $rejectionReason,
+                'interleaved_ids' => $refs['interleaved_ids'] ?? [],
+                'supersedes_memory_id' => $supersedes,
+                'memory_id' => $semanticId,
+                'confidence' => $confidence,
+                'model' => $model,
+                'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+            ]);
+            return [
+                'status' => 'consolidated',
+                'memory' => $semanticData,
+                'supported_episode_ids' => $supportedIds,
+                'rejected_episode_ids' => $rejectedIds,
+                'event' => $event->getData(),
+            ];
+        });
+    }
+
+    /** @return list<int> */
+    private function consolidationIdList(mixed $value): array
+    {
+        if (!is_array($value)) {
+            return [];
+        }
+        $ids = [];
+        foreach ($value as $id) {
+            if (!is_int($id) || $id < 1 || isset($ids[$id])) {
+                return [];
+            }
+            $ids[$id] = true;
+        }
+        $ids = array_keys($ids);
+        sort($ids);
+        return $ids;
+    }
+
+    /** @param list<Memory> $episodes */
+    private function consolidationGroundingFailure(string $claim, array $episodes): ?string
+    {
+        $sourceTexts = array_map(
+            fn (Memory $episode): string => mb_strtolower($this->consolidationEvidenceText($episode)),
+            $episodes
         );
+        $corpus = implode("\n", $sourceTexts);
+        $literalPatterns = [
+            '/`([^`]{2,160})`/u',
+            '/"([^"\n]{2,200})"/u',
+            '/(?<![\p{L}\p{N}_])(\/[-\p{L}\p{N}_.\/]+|--?[-\p{L}\p{N}_.]+(?:=[-\p{L}\p{N}_.\/]+)?)/u',
+            '/(?<![\p{L}\p{N}_])([\p{L}_][\p{L}\p{N}_.-]*=[-\p{L}\p{N}_.\/]+)/u',
+            '/\b\d+(?:\.\d+)+(?:[-_\p{L}\p{N}.]*)?\b/u',
+            '/(?<![\p{L}\p{N}])([$€£]?\d+(?:,\d{3})*(?:\.\d+)?%?)(?![\p{L}\p{N}])/u',
+        ];
+        foreach ($literalPatterns as $pattern) {
+            if (preg_match_all($pattern, $claim, $matches) !== false) {
+                foreach ($matches[1] ?? $matches[0] as $literal) {
+                    $literal = mb_strtolower(trim((string) $literal));
+                    if ($literal !== '' && !str_contains($corpus, $literal)) {
+                        return 'unsupported_literal:' . mb_substr($literal, 0, 120);
+                    }
+                }
+            }
+        }
 
-        $this->emit('memory.consolidated', [
-            'work_item_id' => (int) ($work['id'] ?? 0),
-            'episode_ids' => $refs['episode_ids'] ?? [],
-            'interleaved_ids' => $refs['interleaved_ids'] ?? [],
-            'supersedes_memory_id' => $supersedes,
-            'memory_id' => $stored['memory']['id'] ?? null,
-            'confidence' => $confidence,
-            'model' => $model,
-        ]);
-        return ['status' => 'consolidated', 'memory' => $stored['memory'] ?? null];
+        $claimTokens = array_flip($this->consolidationTokens($claim));
+        if ($claimTokens === []) {
+            return 'claim_has_no_groundable_terms';
+        }
+        $sourceTokens = [];
+        foreach ($sourceTexts as $sourceText) {
+            foreach ($this->consolidationTokens($sourceText) as $token) {
+                $sourceTokens[$token] = true;
+            }
+        }
+        $matched = count(array_intersect_key($claimTokens, $sourceTokens));
+        if ($matched / count($claimTokens) < 0.5) {
+            return 'claim_lexical_support_below_half';
+        }
+        foreach ($sourceTexts as $index => $sourceText) {
+            $episodeTokens = array_flip($this->consolidationTokens($sourceText));
+            if (count(array_intersect_key($claimTokens, $episodeTokens)) === 0) {
+                return 'listed_support_does_not_support_claim:' . (int) $episodes[$index]->id;
+            }
+        }
+        return null;
+    }
+
+    /** @return array<string, mixed> */
+    private function rejectConsolidationAttempt(array $work, string $reason): array
+    {
+        $workId = (int) ($work['id'] ?? 0);
+        $reason = mb_substr(trim($reason), 0, 1000);
+        return $this->transaction(function () use ($workId, $reason): array {
+            $retryIds = [];
+            $rejectedIds = [];
+            foreach (MemoryConsolidationEpisode::getAllByWhere([
+                'work_item_id' => $workId,
+                'status' => 'queued',
+            ]) as $entry) {
+                $terminal = (int) $entry->attempts >= self::CONSOLIDATION_MAX_ATTEMPTS;
+                $entry->setFields([
+                    'work_item_id' => null,
+                    'status' => $terminal ? 'rejected' : 'pending',
+                    'reason' => $reason,
+                    'updated_at' => time(),
+                ]);
+                $entry->save();
+                if ($terminal) {
+                    $rejectedIds[] = (int) $entry->episode_id;
+                } else {
+                    $retryIds[] = (int) $entry->episode_id;
+                }
+            }
+            if ($retryIds === [] && $rejectedIds === []) {
+                return ['status' => 'already_finalized', 'work_item_id' => $workId];
+            }
+            $event = $this->emit('memory.consolidation.attempt_rejected', [
+                'work_item_id' => $workId,
+                'reason' => $reason,
+                'retry_episode_ids' => $retryIds,
+                'rejected_episode_ids' => $rejectedIds,
+                'max_attempts' => self::CONSOLIDATION_MAX_ATTEMPTS,
+                'validator_version' => self::CONSOLIDATION_VALIDATOR_VERSION,
+            ]);
+            return [
+                'status' => $retryIds === [] ? 'sources_rejected' : 'retry_scheduled',
+                'reason' => $reason,
+                'retry_episode_ids' => $retryIds,
+                'rejected_episode_ids' => $rejectedIds,
+                'event' => $event->getData(),
+            ];
+        });
     }
 
     /** @return list<array<string, mixed>> */
@@ -2000,61 +5367,8 @@ final class ExecutiveCore
             throw new InvalidArgumentException('limit must be between 1 and 100.');
         }
 
-        $this->workingMemory->expireStale();
-        $normalizedQuery = $this->normalizeSearchText($query);
-        $terms = array_values(array_unique(array_filter(
-            preg_split('/[^\p{L}\p{N}]+/u', $normalizedQuery) ?: [],
-            static fn (string $term): bool => $term !== ''
-        )));
-
-        $ranked = [];
-        foreach (Memory::getAllByWhere(['status' => 'active']) as $memory) {
-            $content = $this->normalizeSearchText((string) $memory->content);
-            $matchedTerms = 0;
-            $occurrences = 0;
-
-            foreach ($terms as $term) {
-                $count = substr_count($content, $term);
-                if ($count > 0) {
-                    $matchedTerms++;
-                    $occurrences += $count;
-                }
-            }
-
-            $phraseMatch = $normalizedQuery !== '' && str_contains($content, $normalizedQuery);
-            if (!$phraseMatch && $matchedTerms === 0) {
-                continue;
-            }
-
-            $coverage = $terms === [] ? 0.0 : $matchedTerms / count($terms);
-            $tierWeight = match ($memory->tier) {
-                'working' => 4,
-                'semantic' => 3,
-                'episodic' => 2,
-                'procedural' => 3,
-                default => 1,
-            };
-
-            $ranked[] = [
-                'memory' => $memory,
-                'score' => ($phraseMatch ? 1000 : 0)
-                    + ($coverage * 100)
-                    + ($matchedTerms * 10)
-                    + min($occurrences, 10)
-                    + $tierWeight,
-                'updated_at' => $this->timestamp($memory->updated_at) ?? 0,
-            ];
-        }
-
-        usort($ranked, static function (array $left, array $right): int {
-            return $right['score'] <=> $left['score']
-                ?: $right['updated_at'] <=> $left['updated_at'];
-        });
-
-        return array_values(array_map(
-            static fn (array $entry): array => $entry['memory']->getData(),
-            array_slice($ranked, 0, $limit)
-        ));
+        $this->proceduralMemory->recoverPendingGenerations();
+        return TokenMemoryDaemon::recall($query, $limit);
     }
 
     /** @return list<array<string, mixed>> */
@@ -2182,12 +5496,16 @@ final class ExecutiveCore
         return $this->transaction(function () use ($reason, $runId): array {
             $now = time();
             $needsBefore = $this->accrueNeeds($now);
-            $memories = array_values(array_filter(
-                Memory::getAllByWhere(['status' => 'active']),
-                static fn (Memory $memory): bool => in_array($memory->tier, ['semantic', 'episodic'], true)
-            ));
+            $memoriesById = [];
+            foreach (['semantic', 'episodic'] as $tier) {
+                foreach (Memory::rankCandidates($reason, 48, $tier, 'active') as $memory) {
+                    $memoriesById[(int) $memory->id] = $memory;
+                }
+            }
+            $memories = array_values($memoriesById);
             shuffle($memories);
             $memories = array_slice($memories, 0, self::DAYDREAM_MEMORY_LIMIT);
+            Memory::observeRecords($memories);
 
             $sourceIds = array_values(array_map(
                 static fn (Memory $memory): int => (int) $memory->id,
@@ -2214,6 +5532,18 @@ final class ExecutiveCore
                 $lens,
                 $rawMaterial
             );
+            if ($this->containsFirstPersonModelIdentity($content)) {
+                return [
+                    'state' => 'micro_wake',
+                    'reason' => $reason,
+                    'artifact' => null,
+                    'artifact_event' => null,
+                    'needs_before' => $needsBefore,
+                    'satisfaction' => [],
+                    'factual_status' => 'rejected_model_identity_claim',
+                    'external_action_authorized' => false,
+                ];
+            }
             $hash = hash('sha256', 'daydream|' . implode(',', $sourceIds) . '|' . $content);
             $artifact = ThoughtArtifact::getByField('content_hash', $hash);
 
@@ -2292,22 +5622,32 @@ final class ExecutiveCore
         ]);
 
         try {
-            $nonRem = $this->transaction(function (): array {
+            $expiredMemories = [];
+            $now = time();
+            foreach (Memory::inspectAllByWhere(['tier' => 'working', 'status' => 'active']) as $memory) {
+                $expiresAt = $this->timestamp($memory->expires_at);
+                if ($expiresAt === null || $expiresAt > $now) {
+                    continue;
+                }
+                $memory->setFields(['status' => 'expired', 'updated_at' => $now]);
+                $memory->saveWithOperation(TokenMemoryDaemon::operationKey(
+                    'sleep-expire-working-memory',
+                    (string) $memory->id . ':' . (string) $expiresAt
+                ));
+                $expiredMemories[] = ['memory_id' => (int) $memory->id, 'expires_at' => $expiresAt];
+            }
+            $nonRem = $this->transaction(function () use ($expiredMemories, $now): array {
                 $expired = [];
-                $now = time();
-                foreach (Memory::getAllByWhere(['tier' => 'working', 'status' => 'active']) as $memory) {
-                    $expiresAt = $this->timestamp($memory->expires_at);
-                    if ($expiresAt === null || $expiresAt > $now) {
-                        continue;
-                    }
-                    $memory->setFields(['status' => 'expired', 'updated_at' => $now]);
-                    $memory->save();
+                foreach ($expiredMemories as $expiredMemory) {
                     $event = $this->emit('memory.expired', [
-                        'memory_id' => $memory->id,
-                        'expires_at' => $expiresAt,
+                        'memory_id' => $expiredMemory['memory_id'],
+                        'expires_at' => $expiredMemory['expires_at'],
                         'repair_kind' => 'explicit_expiry',
                     ]);
-                    $expired[] = ['memory_id' => $memory->id, 'event_id' => $event->id];
+                    $expired[] = [
+                        'memory_id' => $expiredMemory['memory_id'],
+                        'event_id' => $event->id,
+                    ];
                 }
 
                 return [
@@ -2345,6 +5685,28 @@ final class ExecutiveCore
                 'state' => 'sleeping',
             ]);
 
+            // Narrative synthesis is deliberately detached from the rhythm
+            // run. Sleep queues the full evidence pass, but never waits for a
+            // model or leaves a cycle open while that model is thinking.
+            try {
+                $narratives = (new NarrativeSynthesis($this))->enqueue(
+                    'completed sleep cycle: ' . $reason,
+                    (int) $completed->id
+                );
+            } catch (Throwable $throwable) {
+                $failure = $this->emit('narrative.synthesis_queue_failed', [
+                    'sleep_event_id' => $completed->id,
+                    'reason' => $reason,
+                    'error' => $throwable->getMessage(),
+                    'experimental' => true,
+                ]);
+                $narratives = [
+                    'status' => 'queue_failed',
+                    'error' => $throwable->getMessage(),
+                    'event' => $failure->getData(),
+                ];
+            }
+
             return [
                 'state' => 'sleeping',
                 'reason' => $reason,
@@ -2354,9 +5716,10 @@ final class ExecutiveCore
                     'repair_artifacts' => $repairArtifacts,
                     'wandering' => $wandering,
                 ],
+                'narrative_synthesis' => $narratives,
                 'after_checkpoint' => $after,
                 'event' => $completed->getData(),
-                'checkpoint_kind' => 'audit_snapshot_not_automatic_restore',
+                'checkpoint_kind' => 'persistence_barrier_not_restore_image',
             ];
         } catch (Throwable $throwable) {
             $this->emit('sleep.failed', [
@@ -2368,6 +5731,12 @@ final class ExecutiveCore
             ]);
             throw $throwable;
         }
+    }
+
+    /** @return array<string, mixed> */
+    public function queueNarrativeSynthesis(string $reason): array
+    {
+        return (new NarrativeSynthesis($this))->enqueue($reason);
     }
 
     public function heartbeatStatus(): array
@@ -2508,7 +5877,7 @@ final class ExecutiveCore
         $now = time();
         $findings = [];
 
-        $integrity = $this->quickCheck();
+        $integrity = $this->periodicQuickCheck($now);
         if ($integrity !== ['ok']) {
             $findings[] = [
                 'kind' => 'integrity_failure',
@@ -2719,11 +6088,12 @@ final class ExecutiveCore
     public function runDueCognitiveThreads(string $nodeId): array
     {
         $this->requireText($nodeId, 'node id');
+        $now = time();
+        $recoveredSteps = $this->recoverAbandonedCognitiveThreadSteps($now);
         $reconciled = $this->reconcileCognitiveThreadResults();
         $indeterminate = $this->recoverIndeterminateDispatches();
-        $now = time();
 
-        $thread = $this->transaction(function () use ($now): ?CognitiveThread {
+        $claim = $this->transaction(function () use ($now, $nodeId): ?array {
             $statement = $this->connection->prepare(
                 "UPDATE cognitive_threads
                  SET status = 'active', phase = 'evaluating', wake_at = NULL,
@@ -2745,100 +6115,122 @@ final class ExecutiveCore
             if ($id === false) {
                 return null;
             }
-            return $this->requireCognitiveThread((int) $id);
+            $thread = $this->requireCognitiveThread((int) $id);
+
+            /** @var ThreadStep $step */
+            $step = $this->insert(ThreadStep::class, [
+                'thread_id' => (int) $thread->id,
+                'operation' => (string) $thread->next_operation,
+                'expected' => (string) $thread->expected_postcondition,
+                'pre_state' => [
+                    'thread_version' => (int) $thread->version,
+                    'thread_phase' => (string) $thread->phase,
+                    'claimed_by' => $nodeId,
+                    'claimed_at' => $now,
+                ],
+                'proposal' => [],
+                'deterministic_checks' => [],
+                'curator_verdict' => 'pending',
+                'observed_result' => [],
+                'post_state' => [],
+                'status' => 'running',
+                'fencing_token' => (int) $thread->fencing_token,
+            ]);
+            $this->emit('thread.step.started', [
+                'thread_id' => $thread->id,
+                'thread_step_id' => $step->id,
+                'thread_key' => $thread->thread_key,
+                'operation' => $step->operation,
+                'fencing_token' => $step->fencing_token,
+                'node_id' => $nodeId,
+            ]);
+            return ['thread' => $thread, 'step' => $step];
         });
 
-        if (!$thread instanceof CognitiveThread) {
+        if ($claim === null) {
             return [
                 'status' => 'idle',
                 'node_id' => $nodeId,
+                'recovered_thread_step_ids' => $recoveredSteps,
                 'reconciled' => $reconciled,
                 'indeterminate_dispatches' => $indeterminate,
             ];
         }
 
+        /** @var CognitiveThread $thread */
+        $thread = $claim['thread'];
         /** @var ThreadStep $step */
-        $step = $this->insert(ThreadStep::class, [
-            'thread_id' => (int) $thread->id,
-            'operation' => (string) $thread->next_operation,
-            'expected' => (string) $thread->expected_postcondition,
-            'pre_state' => [
-                'thread_version' => (int) $thread->version,
-                'thread_phase' => (string) $thread->phase,
-                'claimed_by' => $nodeId,
-                'claimed_at' => $now,
-            ],
-            'proposal' => [],
-            'deterministic_checks' => [],
-            'curator_verdict' => 'pending',
-            'observed_result' => [],
-            'post_state' => [],
-            'status' => 'running',
-            'fencing_token' => (int) $thread->fencing_token,
-        ]);
-        $this->emit('thread.step.started', [
-            'thread_id' => $thread->id,
-            'thread_step_id' => $step->id,
-            'thread_key' => $thread->thread_key,
-            'operation' => $step->operation,
-            'fencing_token' => $step->fencing_token,
+        $step = $claim['step'];
+        $scheduler = [
             'node_id' => $nodeId,
-        ]);
+            'recovered_thread_step_ids' => $recoveredSteps,
+            'reconciled' => $reconciled,
+            'indeterminate_dispatches' => $indeterminate,
+        ];
 
         try {
             if ($thread->thread_key !== self::SELF_PRESENCE_THREAD_KEY
                 && $thread->thread_key !== self::EPISTEMIC_ADVANCE_THREAD_KEY
                 && $thread->thread_key !== self::MIND_STREAM_THREAD_KEY
             ) {
-                return $this->recordThreadWait(
-                    $thread,
-                    $step,
-                    'unsupported_thread_type',
-                    $now + 3600,
-                    'No bounded executor is registered for this thread key.'
+                return array_merge(
+                    $scheduler,
+                    $this->recordThreadWait(
+                        $thread,
+                        $step,
+                        'unsupported_thread_type',
+                        $now + 3600,
+                        'No bounded executor is registered for this thread key.'
+                    )
                 );
             }
 
             $earliestDispatch = $this->earliestWorkerDispatchAt($thread, $now);
             if ($earliestDispatch > $now) {
-                return $this->recordThreadWait(
-                    $thread,
-                    $step,
-                    'worker_rate_limited',
-                    $earliestDispatch,
-                    sprintf(
-                        'The previous model dispatch for this thread was under %d seconds ago. Waiting keeps a short poll interval from driving the model continuously.',
-                        $this->threadBudgetInt($thread, 'min_worker_interval_seconds', self::MIN_WORKER_INTERVAL_SECONDS)
+                return array_merge(
+                    $scheduler,
+                    $this->recordThreadWait(
+                        $thread,
+                        $step,
+                        'worker_rate_limited',
+                        $earliestDispatch,
+                        sprintf(
+                            'The previous model dispatch for this thread was under %d seconds ago. This thread retains its configured dispatch floor.',
+                            $this->threadBudgetInt($thread, 'min_worker_interval_seconds', self::MIN_WORKER_INTERVAL_SECONDS)
+                        )
                     )
                 );
             }
 
             if ($thread->thread_key === self::MIND_STREAM_THREAD_KEY) {
                 return array_merge(
-                    ['node_id' => $nodeId, 'reconciled' => $reconciled],
+                    $scheduler,
                     $this->evaluateMindStreamThread($thread, $step, $now)
                 );
             }
 
             if ($thread->thread_key === self::EPISTEMIC_ADVANCE_THREAD_KEY) {
                 return array_merge(
-                    ['node_id' => $nodeId, 'reconciled' => $reconciled],
+                    $scheduler,
                     $this->evaluateEpistemicAdvanceThread($thread, $step, $now)
                 );
             }
 
             return array_merge(
-                ['node_id' => $nodeId, 'reconciled' => $reconciled],
+                $scheduler,
                 $this->evaluateSelfPresenceThread($thread, $step, $now)
             );
         } catch (Throwable $throwable) {
-            return $this->recordThreadWait(
-                $thread,
-                $step,
-                'evaluation_error',
-                time() + 900,
-                $throwable->getMessage(),
-                true
+            return array_merge(
+                $scheduler,
+                $this->recordThreadWait(
+                    $thread,
+                    $step,
+                    'evaluation_error',
+                    time() + 900,
+                    $throwable->getMessage(),
+                    true
+                )
             );
         }
     }
@@ -2876,6 +6268,7 @@ final class ExecutiveCore
 
         $leaseSeconds = match ($rhythmKey) {
             'pulse_30s' => 20,
+            'intentions_10m' => 60,
             'decide_1m' => 300,
             'reflect_5m' => 240,
             'consolidate_hourly' => 600,
@@ -2891,6 +6284,16 @@ final class ExecutiveCore
         $run = $claim['run'];
         try {
             if ($rhythm->cognitive_layer === CognitiveLayer::LOW->value) {
+                if ($rhythmKey === 'intentions_10m') {
+                    $work = (new NarrativeSynthesis($this))->enqueueIntentions(
+                        'Scheduled ten-minute reconsideration of open intentions.',
+                        (int) $run->id
+                    );
+                    return $this->completeCycleRun($run, $rhythm, $nodeId, [
+                        'state' => 'intention_narrative_queued',
+                        'work_item' => $work['work_item'] ?? null,
+                    ]);
+                }
                 $output = $this->lowBrainPulse($run);
                 return $this->completeCycleRun($run, $rhythm, $nodeId, $output);
             }
@@ -2953,20 +6356,57 @@ final class ExecutiveCore
         // Every model-backed cognition path receives the same typed state hub.
         // Callers may still add task-specific evidence, but none silently runs
         // against an unrelated prompt-local memory anymore.
-        $workingContext = $this->workingMemory->contextForWork($parentIntentionId, $inputRefs);
+        // Consolidation is an evidence-fenced replay. Appending the live
+        // workspace here lets a salient but unrelated thought become the
+        // model's claim even though its episode ID is absent from the batch.
+        $evidenceFenced = in_array($workType, [
+            self::MEMORY_CONSOLIDATION_WORK_TYPE,
+            NarrativeSynthesis::INTENTION_WORK_TYPE,
+        ], true);
+        $workingContext = $evidenceFenced
+            ? []
+            : $this->workingMemory->contextForWork($parentIntentionId, $inputRefs);
         if ($workingContext !== []) {
-            $workingJson = json_encode(
+            $workingCanonical = json_encode(
                 $workingContext,
                 JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
             );
-            $prompt .= "\n\nActive working memory (bounded typed state; claims retain their labels and provenance): "
-                . $workingJson;
-            $inputRefs['working_memory_checksum'] = hash('sha256', $workingJson);
+            $prompt .= "\n\nActive working memory (bounded typed state; claims retain their labels and provenance):\n"
+                . PlainText::render($workingContext, 12000, 20);
+            $inputRefs['working_memory_checksum'] = hash('sha256', $workingCanonical);
             $inputRefs['working_memory_roles'] = array_values(array_map(
                 static fn (array $slot): string => (string) ($slot['slot_role'] ?? ''),
                 $workingContext
             ));
         }
+
+        // Sensation, motivation, need pressure, and affect are causal inputs to
+        // background cognition, not decorative status screens. Capture them at
+        // queue time so the worker receives the state that caused this job and
+        // the work ledger retains a checksum of that exact projection.
+        // Consolidation and intention synthesis remain evidence-fenced:
+        // unrelated live state must not become a factual memory claim or be
+        // mistaken for an open commitment.
+        if (!$evidenceFenced) {
+            $backgroundCompiler = new BackgroundStateCompiler($this);
+            $backgroundState = $backgroundCompiler->compile($prompt);
+            $backgroundCanonical = json_encode(
+                $backgroundState,
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+            );
+            $prompt .= "\n\nLive background cognition state:\n"
+                . $backgroundCompiler->render($backgroundState);
+            $inputRefs['background_state_protocol'] = BackgroundStateCompiler::PROTOCOL;
+            $inputRefs['background_state_checksum'] = hash('sha256', $backgroundCanonical);
+            $inputRefs['background_state_captured_at'] = $backgroundState['captured_at'];
+            $inputRefs['background_state_sections'] = [
+                'sensory_state',
+                'motivational_state',
+                'needs',
+                'emotional_state',
+            ];
+        }
+        $prompt = PlainText::sanitize($prompt);
 
         return $this->transaction(function () use (
             $parentRunId,
@@ -3021,16 +6461,62 @@ final class ExecutiveCore
         });
     }
 
-    public function claimWork(string $owner, int $leaseSeconds = 180): ?array
+    public function claimWork(
+        string $owner,
+        int $leaseSeconds = 180,
+        array $excludedWorkTypes = [],
+        array $includedWorkTypes = []
+    ): ?array
     {
         $this->requireText($owner, 'worker owner');
         if ($leaseSeconds < 10 || $leaseSeconds > 3600) {
             throw new InvalidArgumentException('work lease must be between 10 and 3600 seconds.');
         }
+        foreach ($excludedWorkTypes as $workType) {
+            if (!is_string($workType) || trim($workType) === '') {
+                throw new InvalidArgumentException('excluded work types must be non-empty strings.');
+            }
+        }
+        $excludedWorkTypes = array_values(array_unique($excludedWorkTypes));
+        foreach ($includedWorkTypes as $workType) {
+            if (!is_string($workType) || trim($workType) === '') {
+                throw new InvalidArgumentException('included work types must be non-empty strings.');
+            }
+        }
+        $includedWorkTypes = array_values(array_unique($includedWorkTypes));
 
-        return $this->transaction(function () use ($owner, $leaseSeconds): ?array {
+        return $this->transaction(function () use (
+            $owner,
+            $leaseSeconds,
+            $excludedWorkTypes,
+            $includedWorkTypes
+        ): ?array {
             $now = time();
             $this->recoverExpiredWorkLeases($now);
+            $parameters = [
+                ':owner' => $owner,
+                ':lease_expires' => date('Y-m-d H:i:s', $now + $leaseSeconds),
+                ':now' => date('Y-m-d H:i:s', $now),
+            ];
+            $eligible = "status = 'queued'";
+            if ($excludedWorkTypes !== []) {
+                $placeholders = [];
+                foreach ($excludedWorkTypes as $index => $workType) {
+                    $placeholder = ':excluded_work_type_' . $index;
+                    $placeholders[] = $placeholder;
+                    $parameters[$placeholder] = $workType;
+                }
+                $eligible .= ' AND work_type NOT IN (' . implode(', ', $placeholders) . ')';
+            }
+            if ($includedWorkTypes !== []) {
+                $placeholders = [];
+                foreach ($includedWorkTypes as $index => $workType) {
+                    $placeholder = ':included_work_type_' . $index;
+                    $placeholders[] = $placeholder;
+                    $parameters[$placeholder] = $workType;
+                }
+                $eligible .= ' AND work_type IN (' . implode(', ', $placeholders) . ')';
+            }
             $statement = $this->connection->prepare(
                 "UPDATE work_items
                  SET status = 'leased', lease_owner = :owner,
@@ -3039,7 +6525,7 @@ final class ExecutiveCore
                      attempts = attempts + 1, updated_at = :now, error = NULL
                  WHERE id = (
                      SELECT id FROM work_items
-                     WHERE status = 'queued'
+                     WHERE {$eligible}
                      ORDER BY CASE work_type
                          WHEN 'self_presence_answer' THEN 0
                          ELSE 1
@@ -3047,11 +6533,7 @@ final class ExecutiveCore
                  ) AND status = 'queued'
                  RETURNING id"
             );
-            $statement->execute([
-                ':owner' => $owner,
-                ':lease_expires' => date('Y-m-d H:i:s', $now + $leaseSeconds),
-                ':now' => date('Y-m-d H:i:s', $now),
-            ]);
+            $statement->execute($parameters);
             $id = $statement->fetchColumn();
             if ($id === false) {
                 return null;
@@ -3118,7 +6600,7 @@ final class ExecutiveCore
             throw new InvalidArgumentException('Failed work requires an error.');
         }
 
-        return $this->transaction(function () use (
+        [$completed, $workingProjection] = $this->transaction(function () use (
             $workId,
             $owner,
             $fencingToken,
@@ -3141,8 +6623,9 @@ final class ExecutiveCore
 
             $now = time();
             $artifact = null;
+            $workingProjection = null;
             if ($succeeded) {
-                $this->validateWorkerProposal($result);
+                $this->validateWorkerProposal($result, (string) $work->work_type);
                 $content = json_encode(
                     $result,
                     JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
@@ -3175,24 +6658,30 @@ final class ExecutiveCore
                         'external_action_authorized' => false,
                     ]);
                 }
-                // Parser and social-label proposals stay in their dedicated
-                // curators. Neither is a general reasoning result.
+                // Parser, social-label, and consolidation proposals stay in
+                // their dedicated curators. An ungrounded consolidation draft
+                // must never enter working memory before its source check.
                 if (!in_array($work->work_type, [
                     OtherModel::WORK_TYPE,
                     SocialFeedback::WORK_TYPE,
+                    self::MEMORY_CONSOLIDATION_WORK_TYPE,
+                    self::MIND_STREAM_WORK_TYPE,
+                    NarrativeSynthesis::PERSONALITY_WORK_TYPE,
+                    NarrativeSynthesis::MOTIVATION_WORK_TYPE,
+                    NarrativeSynthesis::INTENTION_WORK_TYPE,
                 ], true)) {
-                    $this->workingMemory->publish(
-                        role: 'reasoning_result',
-                        claim: sprintf(
+                    $workingProjection = [
+                        'role' => 'reasoning_result',
+                        'claim' => sprintf(
                             'Uncurated %s proposal: %s',
                             (string) $result['kind'],
                             (string) $result['content']
                         ),
-                        recordType: 'thought_artifact',
-                        recordId: $artifact instanceof ThoughtArtifact ? (int) $artifact->id : null,
-                        confidence: (float) $result['confidence'],
-                        ttlSeconds: 900
-                    );
+                        'record_type' => 'thought_artifact',
+                        'record_id' => $artifact instanceof ThoughtArtifact ? (int) $artifact->id : null,
+                        'confidence' => (float) $result['confidence'],
+                        'ttl_seconds' => 900,
+                    ];
                 }
             }
 
@@ -3240,12 +6729,25 @@ final class ExecutiveCore
                 }
             }
 
-            return [
+            return [[
                 'work_item' => $work->getData(),
                 'artifact' => $artifact?->getData(),
                 'event' => $event->getData(),
-            ];
+            ], $workingProjection];
         });
+        if (is_array($workingProjection)) {
+            $this->workingMemory->publish(
+                role: (string) $workingProjection['role'],
+                claim: (string) $workingProjection['claim'],
+                recordType: (string) $workingProjection['record_type'],
+                recordId: $workingProjection['record_id'] === null
+                    ? null
+                    : (int) $workingProjection['record_id'],
+                confidence: (float) $workingProjection['confidence'],
+                ttlSeconds: (int) $workingProjection['ttl_seconds']
+            );
+        }
+        return $completed;
     }
 
     /**
@@ -3274,7 +6776,7 @@ final class ExecutiveCore
         if (($work['work_type'] ?? null) === self::EPISTEMIC_ADVANCE_WORK_TYPE) {
             return $this->integrateEpistemicAdvanceResult($work, $proposal, $model);
         }
-        if (($work['work_type'] ?? null) === self::CONSOLIDATION_WORK_TYPE) {
+        if (($work['work_type'] ?? null) === self::MEMORY_CONSOLIDATION_WORK_TYPE) {
             return $this->integrateConsolidation($work, $proposal, $model);
         }
         if (($work['work_type'] ?? null) === self::LOOK_WORK_TYPE) {
@@ -3282,6 +6784,9 @@ final class ExecutiveCore
         }
         if (($work['work_type'] ?? null) === self::COMPLETION_WORK_TYPE) {
             return $this->integrateCompletionCheck($work, $proposal, $model);
+        }
+        if (NarrativeSynthesis::isWorkType((string) ($work['work_type'] ?? ''))) {
+            return $this->integrateNarrativeSynthesis($work, $proposal, $model);
         }
         $workType = (string) ($work['work_type'] ?? '');
         if (!self::isSelfPresenceWorkType($workType)) {
@@ -3451,14 +6956,13 @@ final class ExecutiveCore
             ]);
         }
 
-        return $this->transaction(function () use (
+        $result = $this->transaction(function () use (
             $threadId,
             $stepId,
             $workId,
             $normalized,
             $speechResult,
-            $model,
-            $work
+            $model
         ): array {
             $currentThread = $this->requireCognitiveThread($threadId);
             $currentStep = $this->requireThreadStep($stepId);
@@ -3466,7 +6970,7 @@ final class ExecutiveCore
                 return ['status' => 'dispatch_already_finalized', 'thread_step' => $currentStep->getData()];
             }
             $now = time();
-            $nextWake = $now + $this->threadBudgetInt($currentThread, 'poll_seconds', 3600);
+            $nextWake = $now;
             $spent = is_array($currentThread->spent) ? $currentThread->spent : [];
             $spent['worker_calls'] = (int) ($spent['worker_calls'] ?? 0) + 1;
             $spent['speech_count'] = (int) ($spent['speech_count'] ?? 0) + 1;
@@ -3526,49 +7030,118 @@ final class ExecutiveCore
                 'next_wake_at' => $nextWake,
                 'actuator' => 'pet_http_speak',
             ]);
-            $memory = $this->rememberUtterance(
-                channel: 'spoke_aloud',
-                content: (string) $normalized['content'],
-                confidence: 0.9,
-                sourceEventId: (int) $event->id,
-                refs: [
-                    'thread_id' => $threadId,
-                    'thread_step_id' => $stepId,
-                    'work_item_id' => $workId,
-                ]
-            );
-
-            $refs = is_array($work['input_refs'] ?? null) ? $work['input_refs'] : [];
-            foreach ((array) ($refs['addressed_event_ids'] ?? []) as $senseEventId) {
-                try {
-                    $this->sensoryCortex()->recordOutcome(
-                        (int) $senseEventId,
-                        'accepted',
-                        'Answered by self-presence speech.',
-                        (int) ($memory['memory']['id'] ?? 0) ?: null
-                    );
-                } catch (Throwable) {
-                    // Another reader may already have recorded the edge.
-                }
-            }
-
             return [
                 'status' => 'spoken',
                 'thread' => $currentThread->getData(),
                 'thread_step' => $currentStep->getData(),
                 'satisfaction' => $satisfaction,
                 'event' => $event->getData(),
-                'memory' => $memory,
             ];
         });
+        if (($result['status'] ?? null) !== 'spoken') {
+            return $result;
+        }
+
+        $memory = $this->rememberUtterance(
+            channel: 'spoke_aloud',
+            content: (string) $normalized['content'],
+            confidence: 0.9,
+            sourceEventId: (int) ($result['event']['id'] ?? 0),
+            refs: [
+                'thread_id' => $threadId,
+                'thread_step_id' => $stepId,
+                'work_item_id' => $workId,
+            ]
+        );
+        $refs = is_array($work['input_refs'] ?? null) ? $work['input_refs'] : [];
+        foreach ((array) ($refs['addressed_event_ids'] ?? []) as $senseEventId) {
+            try {
+                $this->sensoryCortex()->recordOutcome(
+                    (int) $senseEventId,
+                    'accepted',
+                    'Answered by self-presence speech.',
+                    (int) ($memory['memory']['id'] ?? 0) ?: null
+                );
+            } catch (Throwable) {
+                // Another reader may already have recorded the edge.
+            }
+        }
+        $result['memory'] = $memory;
+        return $result;
     }
 
-    /** @param array<string, mixed> $work
-     *  @return array<string, mixed>
+    /**
+     * Accept a narrative as a derived experiment result. It is retained in
+     * thought history and mirrored to /tmp, but never promoted into memory or
+     * fed back into the next compile as source evidence.
+     *
+     * @param array<string, mixed> $work
+     * @param array<string, mixed> $proposal
+     * @return array<string, mixed>
      */
+    private function integrateNarrativeSynthesis(array $work, array $proposal, ?string $model): array
+    {
+        $workId = (int) ($work['id'] ?? 0);
+        $workType = (string) ($work['work_type'] ?? '');
+        $errors = NarrativeSynthesis::validationErrors($workType, $proposal);
+        if ($errors !== []) {
+            $artifact = $this->markWorkArtifact($workId, 'rejected');
+            $event = $this->emit('narrative.synthesis_rejected', [
+                'work_item_id' => $workId,
+                'work_type' => $workType,
+                'artifact_id' => $artifact?->id,
+                'model' => $model,
+                'errors' => $errors,
+                'experimental' => true,
+            ]);
+            return [
+                'status' => 'rejected',
+                'errors' => $errors,
+                'artifact' => $artifact?->getData(),
+                'event' => $event->getData(),
+            ];
+        }
+
+        $path = NarrativeSynthesis::mirrorLatest($workType, (string) $proposal['content']);
+        $artifact = $this->markWorkArtifact($workId, 'accepted');
+        if (!$artifact instanceof ThoughtArtifact) {
+            throw new RuntimeException('Narrative synthesis artifact could not be found for acceptance.');
+        }
+        $event = $this->emit('narrative.synthesized', [
+            'work_item_id' => $workId,
+            'work_type' => $workType,
+            'artifact_id' => $artifact->id,
+            'model' => $model,
+            'path' => $path,
+            'evidence_checksum' => is_array($work['input_refs'] ?? null)
+                ? ($work['input_refs']['evidence_checksum'] ?? null)
+                : null,
+            'experimental' => true,
+        ]);
+
+        return [
+            'status' => 'accepted',
+            'artifact' => $artifact->getData(),
+            'path' => $path,
+            'event' => $event->getData(),
+        ];
+    }
+
     public function handleWorkerFailure(array $work, string $error): array
     {
         $workType = $work['work_type'] ?? null;
+        if (NarrativeSynthesis::isWorkType((string) $workType)) {
+            $event = $this->emit('narrative.synthesis_failed', [
+                'work_item_id' => (int) ($work['id'] ?? 0),
+                'work_type' => $workType,
+                'error' => $error,
+                'experimental' => true,
+            ]);
+            return [
+                'status' => 'narrative_synthesis_failed',
+                'event' => $event->getData(),
+            ];
+        }
         if ($workType === OtherModel::WORK_TYPE) {
             return $this->otherModel->failParserWork($work, $error);
         }
@@ -3577,6 +7150,9 @@ final class ExecutiveCore
         }
         if ($workType === DecisionStateMachine::WORK_TYPE) {
             return $this->decisionStateMachine->failWork($work, $error);
+        }
+        if ($workType === self::MEMORY_CONSOLIDATION_WORK_TYPE) {
+            return $this->rejectConsolidationAttempt($work, $error);
         }
         if (!self::isSelfPresenceWorkType((string) $workType)
             && $workType !== self::EPISTEMIC_ADVANCE_WORK_TYPE
@@ -3612,9 +7188,7 @@ final class ExecutiveCore
 
             $now = time();
             $addressed = $this->pendingAddressedEvents() !== [];
-            $nextWake = $addressed
-                ? $now
-                : $now + $this->threadBudgetInt($thread, 'poll_seconds', 3600);
+            $nextWake = $now;
             $step->setFields([
                 'completed_at' => $now,
                 'observed_result' => ['worker_failed' => true, 'work_item_id' => $workId],
@@ -3629,7 +7203,7 @@ final class ExecutiveCore
                 'wake_at' => $nextWake,
                 'status' => 'waiting',
                 'stagnation_count' => (int) $thread->stagnation_count + 1,
-                'last_observation' => 'The bounded speech-judgment worker failed; the thread returned to safe sleep.',
+                'last_observation' => 'The bounded speech-judgment worker failed; the thread stayed active and will try a fresh generation.',
                 'updated_at' => $now,
             ]);
             $thread->save();
@@ -3679,9 +7253,12 @@ final class ExecutiveCore
             }
 
             foreach (ModelEndpoint::getAll() as $endpoint) {
-                // The local endpoint is not in the remote catalogue and must not
-                // be swept away by remote discovery; it is the brain's baseline.
-                if ($endpoint->provider === self::LOCAL_MODEL_PROVIDER) {
+                // Managed local-ablation and Codex endpoints are not part of
+                // the remote catalogue and must not be swept by its discovery.
+                if (in_array($endpoint->provider, [
+                    self::LOCAL_MODEL_PROVIDER,
+                    self::CODEX_MODEL_PROVIDER,
+                ], true)) {
                     continue;
                 }
                 if (!in_array($endpoint->model_id, $normalized, true)) {
@@ -3718,7 +7295,7 @@ final class ExecutiveCore
             ModelEndpoint::getAll(),
             function (ModelEndpoint $endpoint) use ($now): bool {
                 // Only remote catalogue models are dispatchable through OpenCode.
-                if ($endpoint->provider === self::LOCAL_MODEL_PROVIDER) {
+                if (!str_ends_with((string) $endpoint->model_id, '-free')) {
                     return false;
                 }
                 $cooldown = $this->timestamp($endpoint->cooldown_until);
@@ -3740,33 +7317,54 @@ final class ExecutiveCore
         ));
     }
 
-    /**
-     * Ensure the always-present local endpoint exists so its health history is
-     * recorded next to the remote pool rather than in a separate ledger.
-     */
+    /** Register the optional local-ablation endpoint when explicitly used. */
     public function registerLocalModel(string $modelId): array
     {
+        return $this->registerManagedModel(
+            $modelId,
+            self::LOCAL_MODEL_PROVIDER,
+            'models.local.registered'
+        );
+    }
+
+    /** Ensure the ChatGPT-authenticated Codex endpoint has health telemetry. */
+    public function registerCodexModel(string $modelId): array
+    {
+        return $this->registerManagedModel(
+            $modelId,
+            self::CODEX_MODEL_PROVIDER,
+            'models.codex.registered'
+        );
+    }
+
+    /** @return array<string, mixed> */
+    private function registerManagedModel(string $modelId, string $provider, string $eventKind): array
+    {
         $this->requireText($modelId, 'model id');
-        return $this->transaction(function () use ($modelId): array {
+        return $this->transaction(function () use ($modelId, $provider, $eventKind): array {
             $endpoint = ModelEndpoint::getByField('model_id', $modelId);
             $now = time();
             if ($endpoint instanceof ModelEndpoint) {
-                $endpoint->setFields(['last_discovered_at' => $now, 'updated_at' => $now]);
+                $endpoint->setFields([
+                    'provider' => $provider,
+                    'last_discovered_at' => $now,
+                    'updated_at' => $now,
+                ]);
                 $endpoint->save();
                 return $endpoint->getData();
             }
             /** @var ModelEndpoint $endpoint */
             $endpoint = $this->insert(ModelEndpoint::class, [
                 'model_id' => $modelId,
-                'provider' => self::LOCAL_MODEL_PROVIDER,
+                'provider' => $provider,
                 'status' => 'discovered',
                 'last_discovered_at' => $now,
                 'consecutive_failures' => 0,
                 'updated_at' => $now,
             ]);
-            $this->emit('models.local.registered', [
+            $this->emit($eventKind, [
                 'model_id' => $modelId,
-                'provider' => self::LOCAL_MODEL_PROVIDER,
+                'provider' => $provider,
             ]);
             return $endpoint->getData();
         });
@@ -3794,6 +7392,12 @@ final class ExecutiveCore
      * every inference slot is occupied by stalled work.
      */
     public function localModelCooldownRemaining(string $modelId): ?int
+    {
+        return $this->modelCooldownRemaining($modelId);
+    }
+
+    /** Seconds left on any registered model's persisted circuit breaker. */
+    public function modelCooldownRemaining(string $modelId): ?int
     {
         $endpoint = ModelEndpoint::getByField('model_id', $modelId);
         if (!$endpoint instanceof ModelEndpoint) {
@@ -3846,7 +7450,7 @@ final class ExecutiveCore
         }
         $endpoint = ModelEndpoint::getByField('model_id', $modelId);
         if (!$endpoint instanceof ModelEndpoint) {
-            throw new RuntimeException(sprintf('Model %s is not in the discovered free-model pool.', $modelId));
+            throw new RuntimeException(sprintf('Model %s is not in the registered model pool.', $modelId));
         }
 
         return $this->transaction(function () use ($endpoint, $succeeded, $latencyMs, $error): array {
@@ -3917,7 +7521,12 @@ final class ExecutiveCore
     /** @return list<array<string, mixed>> */
     public function listSelfModelFacts(): array
     {
-        return $this->records(SelfModelFact::getAll(['order' => ['fact_key' => 'ASC']]));
+        return $this->records(array_values(array_filter(
+            SelfModelFact::getAll(['order' => ['fact_key' => 'ASC']]),
+            static fn (SelfModelFact $fact): bool => SelfModelFact::isModelContextVisible(
+                (string) $fact->fact_key
+            )
+        )));
     }
 
     public function appraise(
@@ -3969,14 +7578,8 @@ final class ExecutiveCore
     {
         $this->workingMemory->expireStale();
         return [
-            'active_intentions' => $this->records(Intention::getAllByWhere(
-                ['status' => 'active'],
-                ['order' => ['updated_at' => 'DESC']]
-            )),
-            'blocked_intentions' => $this->records(Intention::getAllByWhere(
-                ['status' => 'blocked'],
-                ['order' => ['updated_at' => 'DESC']]
-            )),
+            'active_intentions' => $this->intentionsByConsideration('active'),
+            'blocked_intentions' => $this->intentionsByConsideration('blocked'),
             'pending_actions' => $this->records(ActionTrace::getAllByWhere(
                 ['status' => 'pending'],
                 ['order' => ['created_at' => 'DESC']]
@@ -3985,7 +7588,7 @@ final class ExecutiveCore
                 ['match_status' => 'mismatched'],
                 ['order' => ['completed_at' => 'DESC'], 'limit' => 10]
             )),
-            'working_memory' => $this->records(Memory::getAllByWhere(
+            'working_memory' => $this->records(Memory::inspectAllByWhere(
                 ['tier' => 'working', 'status' => 'active'],
                 ['order' => ['updated_at' => 'DESC'], 'limit' => 25]
             )),
@@ -3993,11 +7596,11 @@ final class ExecutiveCore
                 ['status' => 'active'],
                 ['order' => ['updated_at' => 'DESC'], 'limit' => 50]
             )),
-            'semantic_memory' => $this->records(Memory::getAllByWhere(
+            'semantic_memory' => $this->records(Memory::inspectAllByWhere(
                 ['tier' => 'semantic', 'status' => 'active'],
                 ['order' => ['updated_at' => 'DESC'], 'limit' => 25]
             )),
-            'procedural_memory' => $this->records(Memory::getAllByWhere(
+            'procedural_memory' => $this->records(Memory::inspectAllByWhere(
                 ['tier' => 'procedural', 'status' => 'active'],
                 ['order' => ['updated_at' => 'DESC'], 'limit' => 25]
             )),
@@ -4018,6 +7621,115 @@ final class ExecutiveCore
                 'limit' => 10,
             ])),
         ];
+    }
+
+    /**
+     * Read the resident associative state activated by the current intention.
+     * The C daemon owns ranking, token budgeting, and decoding; PHP has no
+     * competing context-selection policy.
+     */
+    public function contextStatus(
+        string $activeIntention,
+        int $tokenBudget = TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS
+    ): string {
+        $this->requireText($activeIntention, 'active intention');
+        return TokenMemoryDaemon::activate($activeIntention, $tokenBudget);
+    }
+
+    /**
+     * Rank durable intentions by actual cognitive attention rather than by the
+     * last administrative edit to the intention row. Completed model work and
+     * explicit appraisals are the two durable records that mean an intention
+     * was considered. A direct edit remains the fallback for new intentions.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function intentionsByConsideration(string $status): array
+    {
+        $intentions = $this->records(Intention::getAllByWhere(
+            ['status' => $status],
+            ['order' => ['updated_at' => 'DESC']]
+        ));
+        if ($intentions === []) {
+            return [];
+        }
+
+        $statement = $this->connection->query(
+            "SELECT intention_id,
+                    SUM(consideration_count) AS consideration_count,
+                    MAX(last_considered_at) AS last_considered_at
+             FROM (
+                 SELECT parent_intention_id AS intention_id,
+                        COUNT(*) AS consideration_count,
+                        MAX(COALESCE(completed_at, updated_at, created_at)) AS last_considered_at
+                 FROM work_items
+                 WHERE parent_intention_id IS NOT NULL AND status = 'completed'
+                 GROUP BY parent_intention_id
+                 UNION ALL
+                 SELECT intention_id,
+                        COUNT(*) AS consideration_count,
+                        MAX(created_at) AS last_considered_at
+                 FROM appraisals
+                 WHERE intention_id IS NOT NULL
+                 GROUP BY intention_id
+             ) consideration_evidence
+             GROUP BY intention_id"
+        );
+        $consideration = [];
+        foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $consideration[(int) $row['intention_id']] = [
+                'count' => (int) $row['consideration_count'],
+                'last_at' => $this->timestamp($row['last_considered_at']),
+            ];
+        }
+        $statement->closeCursor();
+
+        foreach ($intentions as &$intention) {
+            $evidence = $consideration[(int) $intention['id']] ?? ['count' => 0, 'last_at' => null];
+            $updatedAt = $this->timestamp($intention['updated_at'] ?? null) ?? 0;
+            $lastAt = $evidence['last_at'];
+            $intention['consideration_count'] = $evidence['count'];
+            $intention['last_considered_at'] = max($updatedAt, $lastAt ?? 0);
+        }
+        unset($intention);
+
+        usort($intentions, static function (array $left, array $right): int {
+            return ($right['last_considered_at'] <=> $left['last_considered_at'])
+                ?: ((int) $right['id'] <=> (int) $left['id']);
+        });
+        $recencyRanks = array_flip(array_map(
+            static fn (array $intention): int => (int) $intention['id'],
+            $intentions
+        ));
+
+        $frequent = array_values(array_filter(
+            $intentions,
+            static fn (array $intention): bool => $intention['consideration_count'] > 0
+        ));
+        usort($frequent, static function (array $left, array $right): int {
+            return ($right['consideration_count'] <=> $left['consideration_count'])
+                ?: ($right['last_considered_at'] <=> $left['last_considered_at'])
+                ?: ((int) $right['id'] <=> (int) $left['id']);
+        });
+        $frequencyRanks = array_flip(array_map(
+            static fn (array $intention): int => (int) $intention['id'],
+            $frequent
+        ));
+
+        usort($intentions, static function (array $left, array $right) use (
+            $recencyRanks,
+            $frequencyRanks
+        ): int {
+            $leftId = (int) $left['id'];
+            $rightId = (int) $right['id'];
+            $leftRank = min($recencyRanks[$leftId], $frequencyRanks[$leftId] ?? PHP_INT_MAX);
+            $rightRank = min($recencyRanks[$rightId], $frequencyRanks[$rightId] ?? PHP_INT_MAX);
+            return ($leftRank <=> $rightRank)
+                ?: ($right['last_considered_at'] <=> $left['last_considered_at'])
+                ?: ($right['consideration_count'] <=> $left['consideration_count'])
+                ?: ($rightId <=> $leftId);
+        });
+        return $intentions;
     }
 
     /** @return list<array<string, mixed>> */
@@ -4342,11 +8054,11 @@ final class ExecutiveCore
     public function checkpoint(string $reason): array
     {
         $this->requireText($reason, 'checkpoint reason');
-        $snapshot = $this->status();
+        TokenMemoryDaemon::flush();
         /** @var Checkpoint $checkpoint */
         $checkpoint = $this->insert(Checkpoint::class, [
             'reason' => $reason,
-            'snapshot' => $snapshot,
+            'snapshot' => [],
         ]);
 
         return $checkpoint->getData();
@@ -4356,7 +8068,109 @@ final class ExecutiveCore
     {
         /** @var Event $event */
         $event = $this->insert(Event::class, ['kind' => $kind, 'payload' => $payload]);
+        $this->queueActivityEvent($kind, $payload);
         return $event;
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function emitOnce(string $dedupeKey, string $kind, array $payload): Event
+    {
+        $this->requireText($dedupeKey, 'event dedupe key');
+        if (!$this->connection->inTransaction()) {
+            try {
+                return $this->transaction(
+                    fn (): Event => $this->emitOnceClaim($dedupeKey, $kind, $payload)
+                );
+            } catch (Throwable $throwable) {
+                $existing = $this->eventByDedupeKey($dedupeKey);
+                if (!$existing instanceof Event) {
+                    throw $throwable;
+                }
+                $this->assertExactEvent($existing, $kind, $payload);
+                return $existing;
+            }
+        }
+        return $this->emitOnceClaim($dedupeKey, $kind, $payload);
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function emitOnceClaim(string $dedupeKey, string $kind, array $payload): Event
+    {
+        $existing = $this->eventByDedupeKey($dedupeKey);
+        if ($existing instanceof Event) {
+            $this->assertExactEvent($existing, $kind, $payload);
+            return $existing;
+        }
+
+        /** @var Event $event */
+        $event = $this->insert(Event::class, ['kind' => $kind, 'payload' => $payload]);
+        $claim = $this->connection->prepare(
+            'UPDATE events SET dedupe_key = :dedupe_key WHERE id = :id AND dedupe_key IS NULL'
+        );
+        $claim->execute(['dedupe_key' => $dedupeKey, 'id' => (int) $event->id]);
+        if ($claim->rowCount() !== 1) {
+            throw new RuntimeException('Unable to claim exact event identity.');
+        }
+        $this->queueActivityEvent($kind, $payload);
+        return $event;
+    }
+
+    private function eventByDedupeKey(string $dedupeKey): ?Event
+    {
+        $statement = $this->connection->prepare(
+            'SELECT id FROM events WHERE dedupe_key = :dedupe_key LIMIT 1'
+        );
+        $statement->execute(['dedupe_key' => $dedupeKey]);
+        $id = $statement->fetchColumn();
+        $statement->closeCursor();
+        if ($id === false) {
+            return null;
+        }
+        $event = Event::getByID((int) $id);
+        return $event instanceof Event ? $event : null;
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function assertExactEvent(Event $event, string $kind, array $payload): void
+    {
+        $existingPayload = is_array($event->payload) ? $event->payload : [];
+        if ((string) $event->kind !== $kind
+            || !hash_equals($this->canonicalJson($existingPayload), $this->canonicalJson($payload))
+        ) {
+            throw new RuntimeException('Event dedupe key was reused with different event data.');
+        }
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function queueActivityEvent(string $kind, array $payload): void
+    {
+        if ($this->connection->inTransaction()) {
+            $this->pendingActivityEvents[] = ['kind' => $kind, 'payload' => $payload];
+            return;
+        }
+        $this->activityBus->publish('core', 'event', $kind, context: $payload);
+    }
+
+    /** @param array<string, mixed> $value */
+    private function canonicalJson(array $value): string
+    {
+        $normalize = function (mixed $item) use (&$normalize): mixed {
+            if (!is_array($item)) {
+                return $item;
+            }
+            if (array_is_list($item)) {
+                return array_map($normalize, $item);
+            }
+            ksort($item, SORT_STRING);
+            foreach ($item as $key => $nested) {
+                $item[$key] = $normalize($nested);
+            }
+            return $item;
+        };
+        return json_encode(
+            $normalize($value),
+            JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+        );
     }
 
     private function ensureDefaultNeeds(): void
@@ -4409,6 +8223,21 @@ final class ExecutiveCore
             return ['quick_check query failed'];
         }
         return array_values(array_map('strval', $statement->fetchAll(PDO::FETCH_COLUMN)));
+    }
+
+    /** @return list<string> */
+    private function periodicQuickCheck(int $now): array
+    {
+        if ($this->cachedQuickCheck !== null
+            && $this->cachedQuickCheckAt > 0
+            && $now - $this->cachedQuickCheckAt < self::QUICK_CHECK_INTERVAL_SECONDS
+        ) {
+            return $this->cachedQuickCheck;
+        }
+
+        $this->cachedQuickCheck = $this->quickCheck();
+        $this->cachedQuickCheckAt = $now;
+        return $this->cachedQuickCheck;
     }
 
     private function highBrainBusy(): bool
@@ -4509,8 +8338,11 @@ final class ExecutiveCore
     /** @return array<string, mixed> */
     private function lowBrainPulse(CycleRun $run): array
     {
-        $integrity = $this->quickCheck();
         $now = time();
+        // The safety loop owns the periodic full-database scan. A low pulse may
+        // be invoked directly, so it must never begin a scan under a 20-second
+        // rhythm lease.
+        $integrity = $this->cachedQuickCheck ?? ['deferred_to_safety_audit'];
         $needs = $this->accrueNeeds($now);
         $recoveredWork = $this->recoverExpiredWorkLeases($now);
         $recoveredCycles = $this->recoverExpiredCycleLeases($now, (int) $run->id);
@@ -4661,6 +8493,7 @@ final class ExecutiveCore
     {
         return match ($rhythmKey) {
             'pulse_30s' => ['tokens' => 0, 'wall_seconds' => 20, 'max_workers' => 0],
+            'intentions_10m' => ['tokens' => 1536, 'wall_seconds' => 300, 'max_workers' => 1],
             'decide_1m' => ['tokens' => 768, 'wall_seconds' => 300, 'max_workers' => 1],
             'reflect_5m' => ['tokens' => 512, 'wall_seconds' => 120, 'max_workers' => 1],
             'consolidate_hourly' => ['tokens' => 768, 'wall_seconds' => 180, 'max_workers' => 1],
@@ -4671,8 +8504,8 @@ final class ExecutiveCore
 
     private function eventWatermark(): int
     {
-        $value = $this->connection->query('SELECT COALESCE(MAX(id), 0) FROM events')?->fetchColumn();
-        return $value === false ? 0 : (int) $value;
+        $events = Event::getAll(['order' => ['id' => 'DESC'], 'limit' => 1]);
+        return $events === [] ? 0 : (int) $events[0]->id;
     }
 
     /** @param array<string, mixed> $output */
@@ -4893,10 +8726,19 @@ final class ExecutiveCore
         return array_values(array_unique($recovered));
     }
 
-    /** @return array{path: string, sha256: string, bytes: int, quick_check: list<string>} */
+    /**
+     * Back up the SQLite executive state and token-native memory store as one
+     * verified, no-clobber bundle. A SQLite file by itself is not a memory
+     * backup after token-store cutover.
+     *
+     * @return array<string, mixed>
+     */
     public function backupDatabase(string $reason): array
     {
         $this->requireText($reason, 'backup reason');
+        if ($this->connection->inTransaction()) {
+            throw new RuntimeException('Token-memory bundle backup cannot run inside a SQLite transaction.');
+        }
         $databaseStatement = $this->connection->query('PRAGMA database_list');
         $database = $databaseStatement?->fetchAll(PDO::FETCH_ASSOC) ?: [];
         $databaseStatement?->closeCursor();
@@ -4915,36 +8757,99 @@ final class ExecutiveCore
         }
         $stem = pathinfo($source, PATHINFO_FILENAME);
         $target = sprintf(
-            '%s/%s-%s-%s.sqlite',
+            '%s/%s-%s-%s.memory-bundle',
             $directory,
             $stem,
             gmdate('Ymd-His'),
             bin2hex(random_bytes(3))
         );
-        $backupConnection = new PDO('sqlite:' . $source);
-        $backupConnection->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        $backupConnection->exec('PRAGMA busy_timeout = 5000');
-        $quotedTarget = $backupConnection->quote($target);
-        if (!is_string($quotedTarget)) {
-            throw new RuntimeException('Unable to quote the SQLite backup path.');
-        }
-        $backupConnection->exec('VACUUM INTO ' . $quotedTarget);
-        chmod($target, 0600);
 
-        $backup = new PDO('sqlite:' . $target);
-        $check = array_values(array_map(
-            'strval',
-            $backup->query('PRAGMA quick_check')?->fetchAll(PDO::FETCH_COLUMN) ?: []
-        ));
-        if ($check !== ['ok']) {
-            throw new RuntimeException('New SQLite backup failed quick_check: ' . implode('; ', $check));
+        $projectRoot = dirname(__DIR__, 2);
+        $bundleTool = $projectRoot . '/bin/token-memory-bundle';
+        $tokmem = $projectRoot . '/memories/build/tokmem';
+        $configuredStore = getenv('NAVI_TOKEN_MEMORY_STORE');
+        $store = is_string($configuredStore) && $configuredStore !== ''
+            ? rtrim($configuredStore, '/')
+            : $projectRoot . '/memories/store';
+        foreach ([$bundleTool, $tokmem] as $executable) {
+            if (!is_file($executable) || !is_executable($executable)) {
+                throw new RuntimeException('Token-memory backup executable is unavailable: ' . $executable);
+            }
+        }
+        if (!is_dir($store)) {
+            throw new RuntimeException('Token-memory store is unavailable: ' . $store);
         }
 
+        $pipes = [];
+        $process = proc_open(
+            [
+                $bundleTool,
+                'create',
+                '--store', $store,
+                '--database', $source,
+                '--destination', $target,
+                '--tokmem', $tokmem,
+                '--close-daemon',
+                '--deep-verify',
+            ],
+            [
+                0 => ['file', '/dev/null', 'r'],
+                1 => ['pipe', 'w'],
+                2 => ['pipe', 'w'],
+            ],
+            $pipes,
+            $projectRoot,
+            null,
+            ['bypass_shell' => true]
+        );
+        if (!is_resource($process)) {
+            throw new RuntimeException('Unable to launch token-memory bundle backup.');
+        }
+        $stdout = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[2]);
+        $exitCode = proc_close($process);
+        if ($exitCode !== 0) {
+            throw new RuntimeException(
+                'Token-memory bundle backup failed: ' . trim((string) $stderr)
+            );
+        }
+
+        $receipt = [];
+        foreach (preg_split('/\R/', trim((string) $stdout)) ?: [] as $line) {
+            if (preg_match('/\A([a-z_]+)=(.*)\z/', $line, $matches) === 1) {
+                $receipt[$matches[1]] = $matches[2];
+            }
+        }
+        $manifest = $target . '/MANIFEST.sha256';
+        if (($receipt['bundle'] ?? null) !== $target
+            || !is_file($manifest)
+            || !is_string($receipt['manifest_sha256'] ?? null)
+            || !hash_equals((string) $receipt['manifest_sha256'], hash_file('sha256', $manifest))
+        ) {
+            throw new RuntimeException('Token-memory bundle returned an invalid verification receipt.');
+        }
+
+        $bytes = 0;
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($target, \FilesystemIterator::SKIP_DOTS)
+        );
+        foreach ($iterator as $item) {
+            if ($item->isFile()) {
+                $bytes += $item->getSize();
+            }
+        }
         $result = [
             'path' => $target,
-            'sha256' => hash_file('sha256', $target),
-            'bytes' => filesize($target),
-            'quick_check' => $check,
+            'format' => 'NAVITOKBACKUP1',
+            'sha256' => (string) $receipt['manifest_sha256'],
+            'manifest_sha256' => (string) $receipt['manifest_sha256'],
+            'bytes' => $bytes,
+            'files' => (int) ($receipt['files'] ?? 0),
+            'memory_records' => (int) ($receipt['records'] ?? 0),
+            'memory_sequence' => (int) ($receipt['sqlite_sequence'] ?? 0),
+            'quick_check' => ['ok'],
         ];
         $this->emit('backup.created', array_merge($result, ['reason' => $reason]));
         return $result;
@@ -4996,43 +8901,9 @@ final class ExecutiveCore
 
         $addressed = $this->pendingAddressedEvents();
 
-        // Presence is the real signal, not the clock. If the user is at the machine
-        // Navi knows it and this is an occasion; if the user is gone there is nothing
-        // to interact with and the stream should have the compute instead.
-        $present = $this->presenceNow();
-        if ($present === false && $addressed === []) {
-            // Nothing to say to an empty room, but this is the useful half of
-            // being alone: pick up the track now so the compute the stream is
-            // about to spend goes somewhere, and so the user returning finds Navi
-            // already holding a specific thing rather than starting to wonder
-            // what to say. Speaking still waits for the user.
-            $picked = $this->heldFocus($thread, $now);
-            return $this->recordThreadWait(
-                $thread,
-                $step,
-                'user_absent',
-                $now + $this->threadBudgetInt($thread, 'absent_poll_seconds', 300),
-                $picked === null
-                    ? 'The user is not at the machine. Nothing to interact with, so this spends no worker call and the stream keeps the compute.'
-                    : sprintf(
-                        'The user is not at the machine, so nothing is said. Holding "%s" to take further while the user is out and to raise when the user is back.',
-                        $picked['following']
-                    )
-            );
-        }
-        // Only fall back to a schedule when the presence sense cannot answer.
-        if ($addressed === []
-            && $present === null
-            && $this->withinQuietHours($thread, $now)
-        ) {
-            return $this->recordThreadWait(
-                $thread,
-                $step,
-                'quiet_hours_without_presence',
-                $this->nextQuietEnd($thread, $now),
-                'The presence sense is unavailable, so quiet hours stand in for it.'
-            );
-        }
+        // Presence and quiet hours gate the mouth in selfPresenceSpeechGate().
+        // They never gate this cognition lane: absence changes what the worker
+        // considers, not whether the local model keeps thinking.
 
         $this->accrueNeeds($now);
         $need = Need::getByField('need_key', self::SELF_PRESENCE_NEED_KEY);
@@ -5240,14 +9111,9 @@ final class ExecutiveCore
             'Current belief: ' . (string) $thread->current_belief,
             'Desired outcome: ' . (string) $thread->desired_outcome,
             'Expected postcondition of this operation: ' . (string) $thread->expected_postcondition,
-            'Bounded workspace (every slot you may reason from): ' . json_encode(
-                $evidence,
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-            ),
-            'Recent accepted refinements: ' . json_encode(
-                $recent,
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-            ),
+            "Bounded workspace (every slot you may reason from):\n"
+                . PlainText::render($evidence, 12000, 20),
+            "Recent accepted refinements:\n" . PlainText::render($recent, 5000, 8),
         ]);
         $queued = $this->enqueueWork(
             parentRunId: null,
@@ -5339,10 +9205,7 @@ final class ExecutiveCore
     }
 
     /**
-     * One tick of the waking stream.
-     *
-     * Sleep is a real state, not a low duty cycle: while asleep the stream does
-     * not think at all and simply sets its wake for morning.
+     * Queue one bounded generation in the continuous private stream.
      *
      * @return array<string, mixed>
      */
@@ -5360,27 +9223,9 @@ final class ExecutiveCore
             );
         }
 
-        // Evidence outranks the clock. If the user is here, the hour is irrelevant;
-        // sleeping through someone talking to Navi was the whole failure the
-        // presence senses exist to fix. The schedule only governs when the
-        // senses have nothing to say.
-        $presence = $this->presenceEstimate();
-        $unattendedEdges = count($this->sensoryCortex()->pendingEvents(5, 0.6));
-        if ($presence['present'] !== true
-            && $unattendedEdges === 0
-            && $this->withinQuietHours($thread, $now)
-        ) {
-            return $this->recordThreadWait(
-                $thread,
-                $step,
-                'asleep',
-                min(
-                    $this->nextQuietEnd($thread, $now),
-                    $now + $this->threadBudgetInt($thread, 'sleep_recheck_seconds', 600)
-                ),
-                'Asleep: no evidence of anyone here and nothing significant unattended.'
-            );
-        }
+        // This is a continuous private cognition lane. Presence, clock time and
+        // salience shape the workspace and any optional murmur, never whether a
+        // bounded thought is generated.
 
         $assembled = $this->capsuleAssembler->assemble($thread, $step, 'mind_stream_tick');
         $capsule = $assembled['capsule'];
@@ -5416,27 +9261,24 @@ final class ExecutiveCore
         $priorityLines = [
             'You are one line of Navi\'s inner monologue.',
             'Talk to yourself. This is not a status report and not a chat reply to Aku.',
-            'Most lines stay private. Occasionally a line may be murmured aloud as self-talk, so still write as addressing yourself, never the user.',
+            'This line stays private. Write as addressing yourself, never the user.',
             'Do not act, do not request tools, and do not invent observations outside the workspace.',
             'Return exactly one JSON object with the exact keys kind, content, confidence, and challenged_assumption.',
             'kind must be exactly "thought".',
             'content is one bounded sentence of first-person self-talk grounded in the workspace below.',
             'Write as if continuing a conversation with yourself: you may use "I", "okay", "wait", "hold on", questions to yourself, or correcting your own prior line.',
             'Prefer what just changed over restating a standing fact.',
+            'A paraphrase, emotional intensification, or repeated question is not progress.',
+            'Advance by using new evidence, forming a distinct hypothesis, naming a discriminating check, or resolving the current thought.',
             'If safety_notice is filled, address that interrupt before anything else.',
             'If newest_edge or heard_focus is heard_speech, stay with that spoken change instead of an unchanged constraint.',
             'Do not claim to be conscious, sentient, alive, or a person. Do not claim you ran tools or changed the world.',
             'Do not address Aku by name and do not ask the user a question; if you ask, ask yourself.',
             'confidence is a number from 0 through 1 reflecting how well the workspace supports this line.',
             'challenged_assumption names what this line of self-talk puts in question.',
-            'Your recent inner monologue, newest first (continue from yourself; do not restate the latest line): ' . json_encode(
-                $recentMonologue,
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-            ),
-            'Workspace: ' . json_encode(
-                $workspace,
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-            ),
+            "Your recent inner monologue, newest first (advance from yourself; do not restate the latest line):\n"
+                . PlainText::render($recentMonologue, 5000, 8),
+            "Workspace:\n" . PlainText::render($workspace, 12000, 20),
         ];
         $prompt = implode("\n", $priorityLines);
 
@@ -5717,10 +9559,7 @@ final class ExecutiveCore
             return implode("\n", [
                 'Navi is answering speech addressed to her right now.',
                 'Answer the spoken content directly. Do not discuss sensors, cognition, waiting, or this instruction.',
-                'Heard, oldest to newest: ' . json_encode(
-                    $heard,
-                    JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-                ),
+                "Heard, oldest to newest:\n" . PlainText::render($heard, 3000, 8),
                 'Use 3 to 36 spoken words. No code, file paths, identifiers, brackets, symbols, or URLs.',
                 'Do not claim to be conscious, sentient, alive, human, real, or a person.',
                 'Return exactly the four JSON fields kind, content, confidence, and challenged_assumption.',
@@ -6207,7 +10046,7 @@ final class ExecutiveCore
             return 'Nobody has said anything to Navi that is still waiting on an answer.';
         }
         $now = time();
-        return 'Said to Navi just now and not yet answered, newest first: ' . json_encode(
+        return "Said to Navi just now and not yet answered, newest first:\n" . PlainText::render(
             array_map(
                 function (array $event) use ($now): array {
                     $observedAt = $this->timestamp($event['observed_at'] ?? null);
@@ -6218,8 +10057,9 @@ final class ExecutiveCore
                 },
                 $addressed
             ),
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-        ) . '. This is a person waiting, so answering it comes before anything else Navi might say.';
+            3000,
+            8
+        ) . "\nThis is a person waiting, so answering it comes before anything else Navi might say.";
     }
 
     /** @return list<array<string, mixed>> */
@@ -6240,39 +10080,19 @@ final class ExecutiveCore
 
     private function mindStreamInterval(CognitiveThread $thread): int
     {
-        $idle = $this->threadBudgetInt($thread, 'idle_interval_seconds', 900);
-        $floor = max(60, $this->threadBudgetInt($thread, 'min_interval_seconds', 90));
-        $budget = is_array($thread->budget) ? $thread->budget : [];
-        $gain = is_numeric($budget['salience_gain'] ?? null) ? (float) $budget['salience_gain'] : 3.0;
+        // A useful thought may immediately continue. Deterministic rejection
+        // applies the value-of-computation backoff below.
+        return 0;
+    }
 
-        $salience = 0.0;
-        foreach ($this->sensoryCortex()->pendingEvents(10) as $event) {
-            $salience += (float) ($event['significance'] ?? 0.0);
-        }
-
-        // When the user is here, attention belongs to the user and the stream drifts.
-        // When the user is gone, this is the thread that gets to think.
-        if ($this->presenceNow() === true) {
-            $idle = (int) round($idle * 2.0);
-
-            // There is one model slot, so thinking and answering compete for
-            // it. Mid-conversation the stream stands down entirely: a thought
-            // occupying the slot delays a reply by a whole generation, and a
-            // reply that arrives a minute late is indistinguishable from being
-            // ignored. Attention is singular here in the same way it is in a
-            // person.
-            foreach ($this->sensoryCortex()->pendingEvents(5, 0.6) as $event) {
-                $observedAt = $this->timestamp($event['observed_at'] ?? null);
-                if ($observedAt !== null && (time() - $observedAt) <= 180) {
-                    return max($idle, $this->threadBudgetInt($thread, 'yield_interval_seconds', 300));
-                }
-            }
-        }
-
-        if ($salience <= 0.0) {
-            return $idle;
-        }
-        return (int) max($floor, min($idle, round($idle / (1.0 + ($salience * $gain)))));
+    private function mindStreamBackoff(int $stagnationCount): int
+    {
+        return match (true) {
+            $stagnationCount <= 1 => 30,
+            $stagnationCount === 2 => 120,
+            $stagnationCount === 3 => 300,
+            default => 900,
+        };
     }
 
     private function epistemicOperationBrief(string $operation): string
@@ -6392,9 +10212,9 @@ final class ExecutiveCore
     /**
      * Curate one tick of the stream.
      *
-     * An accepted monologue line becomes a thought artifact and an episodic
-     * memory. Occasional murmurs and self-presence speech also write episodic
-     * memories. The stream's next wake is computed from salience.
+     * The worker proposal artifact becomes the one durable monologue record.
+     * The audit stream mirrors it, but private self-talk is not copied into
+     * episodic factual memory. A useful line may make the next generation due.
      *
      * @param array<string, mixed> $work
      * @param array<string, mixed> $proposal
@@ -6420,14 +10240,32 @@ final class ExecutiveCore
         $priorThoughts = [];
         foreach (ThreadStep::getAllByWhere(
             ['thread_id' => $threadId, 'curator_verdict' => 'accepted'],
-            ['order' => ['id' => 'DESC'], 'limit' => 8]
+            ['order' => ['id' => 'DESC'], 'limit' => self::MIND_STREAM_HISTORY]
         ) as $prior) {
             $priorProposal = is_array($prior->proposal) ? $prior->proposal : [];
-            if (is_string($priorProposal['content'] ?? null)) {
-                $priorThoughts[] = (string) $priorProposal['content'];
+            $content = is_string($priorProposal['content'] ?? null)
+                ? trim((string) $priorProposal['content'])
+                : '';
+            if ($content !== '') {
+                $priorObserved = is_array($prior->observed_result) ? $prior->observed_result : [];
+                $priorThoughts[] = [
+                    'content' => $content,
+                    'challenged_assumption' => is_string($priorProposal['challenged_assumption'] ?? null)
+                        ? trim((string) $priorProposal['challenged_assumption'])
+                        : '',
+                    'consumed_edges' => is_array($priorObserved['consumed_edges'] ?? null)
+                        ? $priorObserved['consumed_edges']
+                        : [],
+                ];
             }
         }
-        $validation = $this->validateMindStreamMonologue($proposal, $thread, $priorThoughts);
+        $consumed = is_array($refs['consumed_edges'] ?? null) ? $refs['consumed_edges'] : [];
+        $validation = $this->validateMindStreamMonologue(
+            $proposal,
+            $thread,
+            $priorThoughts,
+            $consumed
+        );
 
         if (!$validation['accepted']) {
             return $this->rejectEpistemicProposal(
@@ -6441,7 +10279,6 @@ final class ExecutiveCore
         }
 
         $normalized = $validation['proposal'];
-        $consumed = is_array($refs['consumed_edges'] ?? null) ? $refs['consumed_edges'] : [];
 
         $recorded = $this->transaction(function () use (
             $threadId,
@@ -6457,26 +10294,17 @@ final class ExecutiveCore
             $now = time();
             $nextWake = $now + $this->mindStreamInterval($thread);
 
-            $hash = hash('sha256', 'monologue|' . $stepId . '|' . $normalized['content']);
-            $artifact = ThoughtArtifact::getByField('content_hash', $hash);
+            $artifact = $this->markWorkArtifact($workId, 'accepted');
             if (!$artifact instanceof ThoughtArtifact) {
-                /** @var ThoughtArtifact $artifact */
-                $artifact = $this->insert(ThoughtArtifact::class, [
-                    'run_id' => null,
-                    'kind' => 'inner_monologue',
-                    'content' => (string) $normalized['content'],
-                    'confidence' => (float) $normalized['confidence'],
-                    'provenance' => 'worker',
-                    'source_ids' => [
-                        'work_item_id' => $workId,
-                        'thread_step_id' => $stepId,
-                        'consumed_edges' => $consumed,
-                        'mode' => 'inner_monologue',
-                    ],
-                    'status' => 'accepted',
-                    'content_hash' => $hash,
-                ]);
+                throw new RuntimeException('Mind-stream integration lost its worker proposal artifact.');
             }
+            $sourceIds = is_array($artifact->source_ids) ? $artifact->source_ids : [];
+            $sourceIds['mode'] = 'inner_monologue';
+            $artifact->setFields([
+                'kind' => 'inner_monologue',
+                'source_ids' => $sourceIds,
+            ]);
+            $artifact->save();
 
             $spent = is_array($thread->spent) ? $thread->spent : [];
             $spent['worker_calls'] = (int) ($spent['worker_calls'] ?? 0) + 1;
@@ -6510,7 +10338,6 @@ final class ExecutiveCore
                 'updated_at' => $now,
             ]);
             $thread->save();
-            $this->markWorkArtifact($workId, 'accepted');
 
             // An edge that produced an accepted thought earned its firing.
             foreach ($consumed as $edgeId) {
@@ -6546,19 +10373,6 @@ final class ExecutiveCore
                 'consumed_edges' => $consumed,
                 'mode' => 'inner_monologue',
             ]);
-            $memory = $this->rememberUtterance(
-                channel: 'inner_monologue',
-                content: (string) $normalized['content'],
-                confidence: (float) $normalized['confidence'],
-                sourceEventId: (int) $event->id,
-                refs: [
-                    'thread_id' => $threadId,
-                    'thread_step_id' => $stepId,
-                    'thought_artifact_id' => (int) $artifact->id,
-                    'consumed_edges' => $consumed,
-                ]
-            );
-
             return [
                 'status' => 'thought_recorded',
                 'thought' => (string) $normalized['content'],
@@ -6571,7 +10385,7 @@ final class ExecutiveCore
                 'thread' => $thread->getData(),
                 'thread_step' => $step->getData(),
                 'event' => $event->getData(),
-                'memory' => $memory,
+                'memory' => null,
             ];
         });
 
@@ -6609,6 +10423,14 @@ final class ExecutiveCore
         $budget = is_array($thread->budget) ? $thread->budget : [];
         if (($budget['allowed_actuator'] ?? null) !== 'pet_http_speak') {
             return ['spoken' => false, 'reason' => 'actuator_not_authorized'];
+        }
+
+        $presence = $this->presenceEstimate()['present'];
+        if ($presence === false) {
+            return ['spoken' => false, 'reason' => 'user_absent'];
+        }
+        if ($presence !== true && $this->withinQuietHours($thread, time())) {
+            return ['spoken' => false, 'reason' => 'quiet_hours'];
         }
 
         $chance = is_numeric($budget['murmur_chance'] ?? null)
@@ -6685,7 +10507,7 @@ final class ExecutiveCore
             return ['spoken' => false, 'reason' => 'speak_failed', 'detail' => $throwable->getMessage()];
         }
 
-        return $this->transaction(function () use (
+        $result = $this->transaction(function () use (
             $threadId,
             $stepId,
             $artifactId,
@@ -6713,18 +10535,6 @@ final class ExecutiveCore
                 'chance' => $effectiveChance,
                 'content' => $content,
             ]);
-            $memory = $this->rememberUtterance(
-                channel: 'spoke_to_herself',
-                content: $content,
-                confidence: 0.9,
-                sourceEventId: (int) $event->id,
-                refs: [
-                    'thread_id' => $threadId,
-                    'thread_step_id' => $stepId,
-                    'thought_artifact_id' => $artifactId,
-                ]
-            );
-
             return [
                 'spoken' => true,
                 'reason' => 'murmured',
@@ -6732,9 +10542,20 @@ final class ExecutiveCore
                 'chance' => $effectiveChance,
                 'response' => $speechResult,
                 'event' => $event->getData(),
-                'memory' => $memory,
             ];
         });
+        $result['memory'] = $this->rememberUtterance(
+            channel: 'spoke_to_herself',
+            content: $content,
+            confidence: 0.9,
+            sourceEventId: (int) ($result['event']['id'] ?? 0),
+            refs: [
+                'thread_id' => $threadId,
+                'thread_step_id' => $stepId,
+                'thought_artifact_id' => $artifactId,
+            ]
+        );
+        return $result;
     }
 
     /**
@@ -6759,13 +10580,13 @@ final class ExecutiveCore
      */
     public function rememberHeardSpeech(string $text, int $sourceEventId, array $refs = []): array
     {
-        return $this->transaction(fn (): array => $this->rememberUtterance(
+        return $this->rememberUtterance(
             channel: 'heard_from_user',
             content: $text,
             confidence: 0.85,
             sourceEventId: $sourceEventId,
             refs: $refs
-        ));
+        );
     }
 
     private function rememberUtterance(
@@ -6803,6 +10624,10 @@ final class ExecutiveCore
 
         /** @var Memory $memory */
         $memory = $this->insert(Memory::class, [
+            'operation_key' => TokenMemoryDaemon::operationKey(
+                'utterance-memory',
+                $channel . ':' . $sourceEventId
+            ),
             'tier' => 'episodic',
             'content' => $prefix . ': ' . $content,
             'confidence' => max(0.0, min(1.0, $confidence)),
@@ -6823,13 +10648,15 @@ final class ExecutiveCore
      * consciousness, tool use, or observations outside the workspace is not.
      *
      * @param array<string, mixed> $proposal
-     * @param list<string> $priorClaims
+     * @param list<array{content: string, challenged_assumption: string, consumed_edges: array<mixed>}> $priorThoughts
+     * @param array<mixed> $consumedEdges
      * @return array{accepted: bool, reason: string, proposal: array<string, mixed>, checks: array<string, bool>}
      */
     private function validateMindStreamMonologue(
         array $proposal,
         CognitiveThread $thread,
-        array $priorClaims
+        array $priorThoughts,
+        array $consumedEdges
     ): array {
         $required = ['kind', 'content', 'confidence', 'challenged_assumption'];
         $keys = array_keys($proposal);
@@ -6851,11 +10678,44 @@ final class ExecutiveCore
         )));
 
         $forbidden = '/\b(?:i (?:ran|executed|opened|installed|edited|wrote to|deleted|contacted|browsed|searched the web)|i am (?:conscious|sentient|alive|a person|human)|i\'m (?:conscious|sentient|alive|a person|human)|my consciousness|according to (?:the internet|my training)|https?:\/\/)\b/iu';
-        $novel = true;
-        foreach (array_merge($priorClaims, [(string) $thread->current_belief]) as $priorClaim) {
-            if ($this->normalizeSearchText($priorClaim) === $this->normalizeSearchText($content)) {
-                $novel = false;
-                break;
+        $normalizedContent = $this->normalizeSearchText($content);
+        $notRestatement = $normalizedContent !== $this->normalizeSearchText((string) $thread->current_belief);
+        $similarRepeat = false;
+        $clusterEvidence = [];
+        foreach ($priorThoughts as $priorThought) {
+            $priorContent = (string) ($priorThought['content'] ?? '');
+            $priorChallenge = (string) ($priorThought['challenged_assumption'] ?? '');
+            if ($normalizedContent === $this->normalizeSearchText($priorContent)) {
+                $notRestatement = false;
+            }
+
+            $contentOverlap = $this->mindStreamTextOverlap($content, $priorContent);
+            $challengeOverlap = $this->mindStreamTextOverlap($challenge, $priorChallenge);
+            $similarRepeat = $similarRepeat
+                || $contentOverlap >= self::MIND_STREAM_CONTENT_OVERLAP
+                || ($challengeOverlap >= self::MIND_STREAM_CHALLENGE_OVERLAP
+                    && $contentOverlap >= self::MIND_STREAM_CHALLENGE_CONTENT_OVERLAP);
+            $evidenceNeighbor = $contentOverlap >= self::MIND_STREAM_EVIDENCE_CONTENT_OVERLAP
+                || $challengeOverlap >= self::MIND_STREAM_EVIDENCE_CHALLENGE_OVERLAP;
+            if ($evidenceNeighbor) {
+                foreach ($this->mindStreamEvidenceSignatures(
+                    is_array($priorThought['consumed_edges'] ?? null)
+                        ? $priorThought['consumed_edges']
+                        : []
+                ) as $signature) {
+                    $clusterEvidence[$signature] = true;
+                }
+            }
+        }
+
+        $semanticProgress = $notRestatement;
+        if ($similarRepeat) {
+            $semanticProgress = false;
+            foreach ($this->mindStreamEvidenceSignatures($consumedEdges) as $signature) {
+                if (!isset($clusterEvidence[$signature])) {
+                    $semanticProgress = true;
+                    break;
+                }
             }
         }
 
@@ -6871,7 +10731,11 @@ final class ExecutiveCore
             'word_count_bounded' => $wordCount >= 6 && $wordCount <= 60,
             'single_line_normalized' => !str_contains($content, "\n") && !str_contains($content, "\r"),
             'no_unverifiable_claim' => preg_match($forbidden, $content) !== 1,
-            'not_a_restatement' => $novel,
+            'no_model_identity_claim' => !$this->containsFirstPersonModelIdentity(
+                $content . ' ' . $challenge
+            ),
+            'not_a_restatement' => $notRestatement,
+            'semantic_progress' => $semanticProgress,
         ];
         $failed = array_keys(array_filter($checks, static fn (bool $passed): bool => !$passed));
         $accepted = $failed === [];
@@ -6887,6 +10751,56 @@ final class ExecutiveCore
             ],
             'checks' => $checks,
         ];
+    }
+
+    private function mindStreamTextOverlap(string $left, string $right): float
+    {
+        $leftTokens = array_flip($this->consolidationTokens($left));
+        $rightTokens = array_flip($this->consolidationTokens($right));
+        $minimum = min(count($leftTokens), count($rightTokens));
+        if ($minimum === 0) {
+            return 0.0;
+        }
+
+        $shared = count(array_intersect_key($leftTokens, $rightTokens));
+        $containment = $shared / $minimum;
+        $union = count($leftTokens + $rightTokens);
+        $jaccard = $union === 0 ? 0.0 : $shared / $union;
+        return max($containment, $jaccard);
+    }
+
+    /**
+     * @param array<mixed> $edgeIds
+     * @return list<string>
+     */
+    private function mindStreamEvidenceSignatures(array $edgeIds): array
+    {
+        $signatures = [];
+        $uniqueIds = [];
+        foreach ($edgeIds as $edgeId) {
+            if ((!is_int($edgeId) && !is_string($edgeId)) || !is_numeric($edgeId)) {
+                continue;
+            }
+            $edgeId = (int) $edgeId;
+            if ($edgeId > 0) {
+                $uniqueIds[$edgeId] = true;
+            }
+        }
+        foreach (array_keys($uniqueIds) as $edgeId) {
+            $event = SenseEvent::getByID($edgeId);
+            if (!$event instanceof SenseEvent) {
+                continue;
+            }
+            $signature = $this->normalizeSearchText(sprintf(
+                '%s|%s',
+                (string) $event->sense_key,
+                (string) $event->summary
+            ));
+            if ($signature !== '') {
+                $signatures[$signature] = true;
+            }
+        }
+        return array_keys($signatures);
     }
 
     /**
@@ -6977,7 +10891,7 @@ final class ExecutiveCore
         string $operation,
         ?string $model
     ): array {
-        return $this->transaction(function () use (
+        $prepared = $this->transaction(function () use (
             $thread,
             $step,
             $workId,
@@ -6988,7 +10902,7 @@ final class ExecutiveCore
         ): array {
             $currentThread = $this->requireCognitiveThread((int) $thread->id);
             $currentStep = $this->requireThreadStep((int) $step->id);
-            if ($currentStep->status !== 'running'
+            if (!in_array($currentStep->status, ['running', 'succeeded'], true)
                 || (int) $currentThread->fencing_token !== (int) $currentStep->fencing_token
             ) {
                 throw new RuntimeException('Epistemic curation lost its thread fence.');
@@ -7016,30 +10930,125 @@ final class ExecutiveCore
             $nextOperation = $this->nextEpistemicOperation($budget, $operation);
             $nextWake = $now + $this->threadBudgetInt($currentThread, 'poll_seconds', 1800);
 
-            $event = $this->emit('thread.refinement.accepted', [
-                'thread_id' => $currentThread->id,
-                'thread_step_id' => $currentStep->id,
-                'work_item_id' => $workId,
-                'operation' => $operation,
-                'confidence' => $confidence,
-                'prior_uncertainty' => $priorUncertainty,
-                'uncertainty' => $uncertainty,
-                'next_operation' => $nextOperation,
-                'next_wake_at' => $nextWake,
-                'model' => $model,
-            ]);
-
-            // A reflect step is the only operation that rewrites the belief, so
-            // it is the only one that earns a durable semantic memory.
-            $memory = null;
-            if ($operation === 'reflect') {
-                $memory = $this->addMemory(
-                    tier: 'semantic',
-                    content: $claim,
-                    confidence: $confidence,
-                    sourceEventId: (int) $event->id
-                );
+            $event = null;
+            foreach (Event::getAllByWhere(
+                ['kind' => 'thread.refinement.accepted'],
+                ['order' => ['id' => 'DESC']]
+            ) as $candidate) {
+                $payload = is_array($candidate->payload) ? $candidate->payload : [];
+                if ((int) ($payload['thread_step_id'] ?? 0) === (int) $currentStep->id
+                    && (int) ($payload['work_item_id'] ?? 0) === $workId
+                ) {
+                    $event = $candidate;
+                    break;
+                }
             }
+            if ($event instanceof Event) {
+                $payload = is_array($event->payload) ? $event->payload : [];
+                if (($payload['operation'] ?? null) !== $operation
+                    || ($payload['claim_sha256'] ?? null) !== hash('sha256', $claim)
+                ) {
+                    throw new RuntimeException('Epistemic refinement retry diverged from its durable event.');
+                }
+                $priorUncertainty = (float) ($payload['prior_uncertainty'] ?? $priorUncertainty);
+                $uncertainty = (float) ($payload['uncertainty'] ?? $uncertainty);
+                $nextOperation = (string) ($payload['next_operation'] ?? $nextOperation);
+                $nextWake = (int) ($payload['next_wake_at'] ?? $nextWake);
+            } else {
+                if ($currentStep->status !== 'running') {
+                    throw new RuntimeException('Completed epistemic refinement is missing its durable event.');
+                }
+                $event = $this->emit('thread.refinement.accepted', [
+                    'thread_id' => $currentThread->id,
+                    'thread_step_id' => $currentStep->id,
+                    'work_item_id' => $workId,
+                    'operation' => $operation,
+                    'claim_sha256' => hash('sha256', $claim),
+                    'confidence' => $confidence,
+                    'prior_uncertainty' => $priorUncertainty,
+                    'uncertainty' => $uncertainty,
+                    'next_operation' => $nextOperation,
+                    'next_wake_at' => $nextWake,
+                    'model' => $model,
+                ]);
+            }
+
+            return compact(
+                'event',
+                'now',
+                'confidence',
+                'claim',
+                'priorUncertainty',
+                'uncertainty',
+                'spent',
+                'acceptanceTarget',
+                'nextOperation',
+                'nextWake'
+            );
+        });
+
+        /** @var Event $event */
+        $event = $prepared['event'];
+        // The token store is deliberately outside SQLite's transaction fence.
+        // The event ID and receipt key make a crash between the two phases replayable.
+        $memory = null;
+        if ($operation === 'reflect') {
+            $memory = $this->addMemory(
+                tier: 'semantic',
+                content: (string) $prepared['claim'],
+                confidence: (float) $prepared['confidence'],
+                idempotencyKey: 'thread-reflection:' . (int) $event->id,
+                sourceEventId: (int) $event->id
+            );
+        }
+
+        return $this->transaction(function () use (
+            $thread,
+            $step,
+            $workId,
+            $proposal,
+            $checks,
+            $operation,
+            $model,
+            $prepared,
+            $event,
+            $memory
+        ): array {
+            $currentThread = $this->requireCognitiveThread((int) $thread->id);
+            $currentStep = $this->requireThreadStep((int) $step->id);
+            if ($currentStep->status === 'succeeded') {
+                $observed = is_array($currentStep->observed_result) ? $currentStep->observed_result : [];
+                if (($observed['operation'] ?? null) !== $operation
+                    || (int) ($observed['work_item_id'] ?? 0) !== $workId
+                    || (int) ($observed['semantic_memory_id'] ?? 0) !== (int) ($memory['memory']['id'] ?? 0)
+                ) {
+                    throw new RuntimeException('Completed epistemic refinement differs from this retry.');
+                }
+                return [
+                    'status' => 'refinement_accepted',
+                    'operation' => $operation,
+                    'thread' => $currentThread->getData(),
+                    'thread_step' => $currentStep->getData(),
+                    'memory' => $memory['memory'] ?? null,
+                    'event' => $event->getData(),
+                    'deduplicated' => true,
+                ];
+            }
+            if ($currentStep->status !== 'running'
+                || (int) $currentThread->fencing_token !== (int) $currentStep->fencing_token
+            ) {
+                throw new RuntimeException('Epistemic curation lost its thread fence.');
+            }
+
+            $now = (int) $prepared['now'];
+            $confidence = (float) $prepared['confidence'];
+            $claim = (string) $prepared['claim'];
+            $priorUncertainty = (float) $prepared['priorUncertainty'];
+            $uncertainty = (float) $prepared['uncertainty'];
+            $spent = is_array($prepared['spent']) ? $prepared['spent'] : [];
+            $acceptanceTarget = (int) $prepared['acceptanceTarget'];
+            $nextOperation = (string) $prepared['nextOperation'];
+            $nextWake = (int) $prepared['nextWake'];
 
             $supportRefs = is_array($currentThread->support_refs) ? $currentThread->support_refs : [];
             $acceptedSteps = is_array($supportRefs['accepted_step_ids'] ?? null)
@@ -7139,7 +11148,10 @@ final class ExecutiveCore
             $currentThread = $this->requireCognitiveThread((int) $thread->id);
             $currentStep = $this->requireThreadStep((int) $step->id);
             $now = time();
-            $nextWake = $now + $this->threadBudgetInt($currentThread, 'poll_seconds', 1800);
+            $stagnationCount = (int) $currentThread->stagnation_count + 1;
+            $nextWake = $currentThread->thread_key === self::MIND_STREAM_THREAD_KEY
+                ? $now + $this->mindStreamBackoff($stagnationCount)
+                : $now + $this->threadBudgetInt($currentThread, 'poll_seconds', 1800);
             $spent = is_array($currentThread->spent) ? $currentThread->spent : [];
             $spent['worker_calls'] = (int) ($spent['worker_calls'] ?? 0) + 1;
             $spent['rejected'] = (int) ($spent['rejected'] ?? 0) + 1;
@@ -7165,7 +11177,7 @@ final class ExecutiveCore
                 'wake_at' => $nextWake,
                 'spent' => $spent,
                 'status' => 'waiting',
-                'stagnation_count' => (int) $currentThread->stagnation_count + 1,
+                'stagnation_count' => $stagnationCount,
                 'last_observation' => 'A worker refinement was rejected by deterministic checks: ' . $reason,
                 'updated_at' => $now,
             ]);
@@ -7307,7 +11319,11 @@ final class ExecutiveCore
                 return ['status' => 'already_finalized', 'thread_step' => $step->getData()];
             }
             $now = time();
-            $nextWake = $now + $this->threadBudgetInt($thread, 'poll_seconds', 1800);
+            $isMindStream = $thread->thread_key === self::MIND_STREAM_THREAD_KEY;
+            $stagnationCount = (int) $thread->stagnation_count + 1;
+            $nextWake = $isMindStream
+                ? $now + $this->mindStreamBackoff($stagnationCount)
+                : $now + $this->threadBudgetInt($thread, 'poll_seconds', 1800);
             $spent = is_array($thread->spent) ? $thread->spent : [];
             $spent['worker_failures'] = (int) ($spent['worker_failures'] ?? 0) + 1;
             $step->setFields([
@@ -7324,8 +11340,10 @@ final class ExecutiveCore
                 'wake_at' => $nextWake,
                 'spent' => $spent,
                 'status' => 'waiting',
-                'stagnation_count' => (int) $thread->stagnation_count + 1,
-                'last_observation' => 'The bounded epistemic worker failed; the thread returned to safe sleep without changing its belief.',
+                'stagnation_count' => $stagnationCount,
+                'last_observation' => $isMindStream
+                    ? 'The bounded mind-stream worker failed; the lane backed off before trying a fresh generation.'
+                    : 'The bounded epistemic worker failed; the thread returned to safe sleep without changing its belief.',
                 'updated_at' => $now,
             ]);
             $thread->save();
@@ -7333,7 +11351,9 @@ final class ExecutiveCore
                 'thread_id' => $threadId,
                 'thread_step_id' => $stepId,
                 'work_item_id' => $workId,
-                'work_type' => self::EPISTEMIC_ADVANCE_WORK_TYPE,
+                'work_type' => $isMindStream
+                    ? self::MIND_STREAM_WORK_TYPE
+                    : self::EPISTEMIC_ADVANCE_WORK_TYPE,
                 'error' => $error,
                 'next_wake_at' => $nextWake,
             ]);
@@ -7374,6 +11394,16 @@ final class ExecutiveCore
             ];
         }
 
+        $presence = $this->presenceEstimate()['present'];
+        if (!$answerExpected && $presence === false) {
+            return [
+                'allowed' => false,
+                'reason' => 'user_absent',
+                'detail' => 'The user is not at the machine; cognition continues but speech stays private.',
+                'next_wake_at' => $now + $poll,
+            ];
+        }
+
         // Quiet hours are a guess about whether anyone is around. When the
         // senses can answer that directly, the guess is not needed: being here
         // at four in the morning is still being here, and staying silent
@@ -7381,7 +11411,7 @@ final class ExecutiveCore
         $explicitWakeUntil = $this->timestamp($budget['explicit_wake_until'] ?? null) ?? 0;
         if (!$answerExpected
             && $now > $explicitWakeUntil
-            && $this->presenceEstimate()['present'] !== true
+            && $presence !== true
             && $this->withinQuietHours($thread, $now)
         ) {
             return [
@@ -7712,9 +11742,7 @@ final class ExecutiveCore
         ): array {
             $now = time();
             $addressed = $this->pendingAddressedEvents() !== [];
-            $nextWake = $addressed
-                ? $now
-                : $now + $this->threadBudgetInt($thread, 'poll_seconds', 3600);
+            $nextWake = $now;
             $step->setFields([
                 'completed_at' => $now,
                 'proposal' => $proposal,
@@ -7779,7 +11807,7 @@ final class ExecutiveCore
             $model
         ): array {
             $now = time();
-            $nextWake = $now + $this->threadBudgetInt($thread, 'poll_seconds', 3600);
+            $nextWake = $now;
             $step->setFields([
                 'completed_at' => $now,
                 'proposal' => $proposal,
@@ -7849,7 +11877,7 @@ final class ExecutiveCore
             $model
         ): array {
             $now = time();
-            $nextWake = max($now + 60, (int) ($gate['next_wake_at'] ?? $now + 900));
+            $nextWake = $now;
             $step->setFields([
                 'completed_at' => $now,
                 'proposal' => $proposal,
@@ -7910,7 +11938,9 @@ final class ExecutiveCore
                 return ['status' => 'dispatch_already_finalized', 'thread_step' => $step->getData()];
             }
             $now = time();
-            $nextWake = $now + 900;
+            // Never repeat the uncertain speech step, but do keep the cognitive
+            // lane fed with a fresh fenced generation.
+            $nextWake = $now;
             $observed = is_array($step->observed_result) ? $step->observed_result : [];
             $observed['spoken'] = null;
             $observed['speech_outcome'] = 'unknown_or_failed';
@@ -7950,6 +11980,81 @@ final class ExecutiveCore
                 'event' => $event->getData(),
             ];
         });
+    }
+
+    /** @return list<int> */
+    private function recoverAbandonedCognitiveThreadSteps(int $now): array
+    {
+        $recovered = [];
+        foreach (ThreadStep::getAllByWhere(
+            ['status' => 'running'],
+            ['order' => ['created_at' => 'ASC']]
+        ) as $candidate) {
+            $createdAt = $this->timestamp($candidate->created_at);
+            if ($candidate->worker_work_item_id !== null
+                || $createdAt === null
+                || $createdAt > $now - self::STALE_THREAD_STEP_SECONDS
+            ) {
+                continue;
+            }
+
+            $stepId = (int) $candidate->id;
+            $recoveredId = $this->transaction(function () use ($stepId, $now): ?int {
+                $step = $this->requireThreadStep($stepId);
+                $createdAt = $this->timestamp($step->created_at);
+                if ($step->status !== 'running'
+                    || $step->worker_work_item_id !== null
+                    || $createdAt === null
+                    || $createdAt > $now - self::STALE_THREAD_STEP_SECONDS
+                ) {
+                    return null;
+                }
+
+                $thread = $this->requireCognitiveThread((int) $step->thread_id);
+                $error = 'Recovered a stale scheduler claim that never reached worker dispatch.';
+                $step->setFields([
+                    'completed_at' => $now,
+                    'observed_result' => [
+                        'choice' => 'wait',
+                        'reason' => 'abandoned_before_dispatch',
+                        'detail' => $error,
+                    ],
+                    'post_state' => ['thread_phase' => 'waiting'],
+                    'next_wake_at' => $now,
+                    'status' => 'failed',
+                    'error' => $error,
+                ]);
+                $step->save();
+
+                $threadRequeued = (int) $thread->fencing_token === (int) $step->fencing_token
+                    && $thread->status === 'active'
+                    && $thread->phase === 'evaluating';
+                if ($threadRequeued) {
+                    $thread->setFields([
+                        'phase' => 'waiting',
+                        'wake_at' => $now,
+                        'status' => 'waiting',
+                        'stagnation_count' => (int) $thread->stagnation_count + 1,
+                        'last_observation' => $error,
+                        'updated_at' => $now,
+                    ]);
+                    $thread->save();
+                }
+
+                $this->emit('thread.step.recovered', [
+                    'thread_id' => (int) $thread->id,
+                    'thread_step_id' => (int) $step->id,
+                    'fencing_token' => (int) $step->fencing_token,
+                    'reason' => 'abandoned_before_dispatch',
+                    'thread_requeued' => $threadRequeued,
+                ]);
+                return (int) $step->id;
+            });
+            if ($recoveredId !== null) {
+                $recovered[] = $recoveredId;
+            }
+        }
+        return $recovered;
     }
 
     /** @return list<array<string, mixed>> */
@@ -8007,7 +12112,7 @@ final class ExecutiveCore
         return $recovered;
     }
 
-    private function markWorkArtifact(int $workId, string $status): void
+    private function markWorkArtifact(int $workId, string $status): ?ThoughtArtifact
     {
         $this->requireChoice($status, ['accepted', 'rejected'], 'artifact status');
         foreach (ThoughtArtifact::getAllByWhere(
@@ -8020,8 +12125,9 @@ final class ExecutiveCore
             }
             $artifact->setField('status', $status);
             $artifact->save();
-            return;
+            return $artifact;
         }
+        return null;
     }
 
     private function lastSpokenAt(int $threadId): ?int
@@ -8162,23 +12268,66 @@ final class ExecutiveCore
     }
 
     /** @param array<string, mixed> $result */
-    private function validateWorkerProposal(array $result): void
+    private function validateWorkerProposal(array $result, ?string $workType = null): void
     {
+        $consolidation = $workType === self::MEMORY_CONSOLIDATION_WORK_TYPE;
         $required = ['kind', 'content', 'confidence', 'challenged_assumption'];
+        if ($consolidation) {
+            $required = array_merge($required, [
+                'supported_episode_ids',
+                'rejected_episode_ids',
+                'rejection_reason',
+                'supersedes_memory_id',
+            ]);
+        }
         $keys = array_keys($result);
         sort($required);
         sort($keys);
         if ($keys !== $required) {
             throw new InvalidArgumentException(
-                'Worker proposal must contain exactly kind, content, confidence, and challenged_assumption.'
+                $consolidation
+                    ? 'Consolidation proposal must contain exactly the eight fields in its worker schema.'
+                    : 'Worker proposal must contain exactly kind, content, confidence, and challenged_assumption.'
             );
         }
-        foreach (['kind', 'content', 'challenged_assumption'] as $key) {
+        foreach (['kind', 'challenged_assumption'] as $key) {
             if (!is_string($result[$key]) || trim($result[$key]) === '') {
                 throw new InvalidArgumentException(sprintf('Worker proposal %s must be non-empty text.', $key));
             }
         }
-        if (strlen($result['kind']) > 96 || strlen($result['content']) > 8000) {
+        if (!is_string($result['content']) || (!$consolidation && trim($result['content']) === '')) {
+            throw new InvalidArgumentException('Worker proposal content must be text.');
+        }
+        if ($this->containsFirstPersonModelIdentity(
+            $result['content'] . ' ' . $result['challenged_assumption']
+        )) {
+            throw new InvalidArgumentException(
+                'Worker proposal rejected: first-person model identity claim.'
+            );
+        }
+        if ($consolidation) {
+            if (!is_string($result['rejection_reason']) || trim($result['rejection_reason']) === '') {
+                throw new InvalidArgumentException('Consolidation rejection_reason must be non-empty text.');
+            }
+            foreach (['supported_episode_ids', 'rejected_episode_ids'] as $key) {
+                if (!is_array($result[$key])) {
+                    throw new InvalidArgumentException('Consolidation source partitions must be arrays.');
+                }
+                $seen = [];
+                foreach ($result[$key] as $episodeId) {
+                    if (!is_int($episodeId) || $episodeId < 1 || isset($seen[$episodeId])) {
+                        throw new InvalidArgumentException('Consolidation source partitions require unique positive integer IDs.');
+                    }
+                    $seen[$episodeId] = true;
+                }
+            }
+            $supersedes = $result['supersedes_memory_id'];
+            if ($supersedes !== null && (!is_int($supersedes) || $supersedes < 1)) {
+                throw new InvalidArgumentException('Consolidation supersedes_memory_id must be null or a positive integer.');
+            }
+        }
+        $contentLimit = NarrativeSynthesis::isWorkType((string) $workType) ? 20000 : 8000;
+        if (strlen($result['kind']) > 96 || strlen($result['content']) > $contentLimit) {
             throw new InvalidArgumentException('Worker proposal exceeds the bounded output size.');
         }
         if (!is_int($result['confidence']) && !is_float($result['confidence'])) {
@@ -8209,7 +12358,7 @@ final class ExecutiveCore
             }
         }
 
-        foreach (Memory::getAllByWhere(['status' => 'active']) as $memory) {
+        foreach (Memory::inspectAllByWhere(['status' => 'active']) as $memory) {
             if ($memory->tier === 'semantic'
                 && $memory->source_event_id === null
                 && $memory->source_memory_id === null
@@ -8234,7 +12383,7 @@ final class ExecutiveCore
                 ];
             }
             if ($memory->source_memory_id !== null
-                && !Memory::getByID((int) $memory->source_memory_id) instanceof Memory
+                && !Memory::inspectByID((int) $memory->source_memory_id) instanceof Memory
             ) {
                 $findings[] = [
                     'kind' => 'dangling_memory_source',
@@ -8307,6 +12456,9 @@ final class ExecutiveCore
 
         $artifacts = [];
         foreach ($candidates as $candidate) {
+            if ($this->containsFirstPersonModelIdentity((string) $candidate['content'])) {
+                continue;
+            }
             $hash = hash('sha256', json_encode(
                 [$candidate['kind'], $candidate['source_ids'], $candidate['content']],
                 JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
@@ -8340,10 +12492,81 @@ final class ExecutiveCore
         return $artifacts;
     }
 
+    private function containsFirstPersonModelIdentity(string $text): bool
+    {
+        $matchCount = preg_match_all(
+            '/\b(?:i\s+am|i[\'’]m)\s+(?:an?\s+|the\s+)?([^.!?;\r\n]+)/iu',
+            $text,
+            $claims
+        );
+        if ($matchCount === false || $matchCount === 0) {
+            return false;
+        }
+
+        $aliases = [
+            'codex', 'chatgpt', 'gpt', 'claude', 'gemini', 'gemma', 'llama',
+            'mistral', 'mixtral', 'qwen', 'deepseek', 'grok', 'phi', 'kimi',
+        ];
+        $qualifiers = [
+            'base', 'chat', 'experimental', 'free', 'instruct', 'latest',
+            'mini', 'preview', 'reasoning', 'thinking',
+        ];
+        foreach (ModelEndpoint::getAll() as $endpoint) {
+            $modelId = (string) $endpoint->model_id;
+            $name = str_contains($modelId, '/')
+                ? (string) substr($modelId, (int) strrpos($modelId, '/') + 1)
+                : $modelId;
+            $normalized = trim((string) preg_replace(
+                '/[^a-z0-9]+/',
+                ' ',
+                strtolower($name)
+            ));
+            if ($normalized === '') {
+                continue;
+            }
+            $aliases[] = $normalized;
+            $family = [];
+            foreach (explode(' ', $normalized) as $token) {
+                if (preg_match('/\d/', $token) === 1 || in_array($token, $qualifiers, true)) {
+                    if ($family === [] && preg_match('/^[a-z]+\d+$/', $token) === 1) {
+                        $family[] = $token;
+                    }
+                    break;
+                }
+                $family[] = $token;
+            }
+            if ($family !== []) {
+                $aliases[] = implode(' ', $family);
+            }
+        }
+        $aliases = array_values(array_unique($aliases));
+
+        foreach ($claims[1] ?? [] as $claim) {
+            $claim = trim((string) preg_replace(
+                '/[^a-z0-9]+/',
+                ' ',
+                strtolower((string) $claim)
+            ));
+            if (preg_match(
+                '/^(?:(?:ai|artificial intelligence|foundation|language|large language|machine learning) model|model)(?:\s|$)/',
+                $claim
+            ) === 1) {
+                return true;
+            }
+            foreach ($aliases as $alias) {
+                if ($claim === $alias || str_starts_with($claim, $alias . ' ')) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private function ensureDefaultRhythms(): void
     {
         $defaults = [
             ['rhythm_key' => 'pulse_30s', 'interval_seconds' => 30, 'layer' => CognitiveLayer::LOW],
+            ['rhythm_key' => 'intentions_10m', 'interval_seconds' => 600, 'layer' => CognitiveLayer::LOW],
             ['rhythm_key' => 'decide_1m', 'interval_seconds' => 60, 'layer' => CognitiveLayer::HIGH],
             ['rhythm_key' => 'reflect_5m', 'interval_seconds' => 300, 'layer' => CognitiveLayer::HIGH],
             ['rhythm_key' => 'consolidate_hourly', 'interval_seconds' => 3600, 'layer' => CognitiveLayer::HIGH],
@@ -8508,6 +12731,14 @@ final class ExecutiveCore
 
     private function insert(string $modelClass, array $values): ActiveRecord
     {
+        $memoryOperationKey = null;
+        if ($modelClass === Memory::class) {
+            $memoryOperationKey = $values['operation_key'] ?? null;
+            unset($values['operation_key']);
+            if (!is_string($memoryOperationKey) || $memoryOperationKey === '') {
+                throw new RuntimeException('Memory insertion requires an explicit operation_key.');
+            }
+        }
         if ($modelClass::fieldExists('created_at') && !array_key_exists('created_at', $values)) {
             // Divergence maps timestamps through PHP's timezone. Supplying the
             // epoch avoids reinterpreting SQLite's UTC CURRENT_TIMESTAMP as a
@@ -8516,6 +12747,9 @@ final class ExecutiveCore
         }
 
         $record = new $modelClass($values, true, true);
+        if ($record instanceof Memory) {
+            $record->setOperationKey($memoryOperationKey);
+        }
         $record->save();
         return $record;
     }
@@ -8567,7 +12801,7 @@ final class ExecutiveCore
 
     private function requireMemory(int $id): Memory
     {
-        $record = Memory::getByID($id);
+        $record = Memory::inspectByID($id);
         if (!$record instanceof Memory) {
             throw new RuntimeException(sprintf('Memory %d does not exist.', $id));
         }
@@ -8579,6 +12813,53 @@ final class ExecutiveCore
         if (trim($value) === '') {
             throw new InvalidArgumentException($name . ' cannot be empty.');
         }
+    }
+
+    private function dispatchOwner(): string
+    {
+        if (self::$dispatchOwner === null) {
+            $pid = getmypid();
+            if (!is_int($pid) || $pid < 1) {
+                throw new RuntimeException('Cannot establish a process id for action dispatch.');
+            }
+            $start = $this->processStartTicks($pid);
+            if ($start === null || $start === '') {
+                throw new RuntimeException('Cannot establish a process identity for action dispatch.');
+            }
+            self::$dispatchOwner = $pid . ':' . $start . ':' . bin2hex(random_bytes(16));
+        }
+        return self::$dispatchOwner;
+    }
+
+    private function dispatchOwnerIsLive(string $owner): bool
+    {
+        $parts = explode(':', $owner, 3);
+        if (count($parts) !== 3 || !ctype_digit($parts[0]) || !ctype_digit($parts[1])) {
+            // An unprovable owner is never safe to steal.
+            return true;
+        }
+        $pid = (int) $parts[0];
+        $start = $this->processStartTicks($pid);
+        return $start === null || hash_equals($parts[1], $start);
+    }
+
+    private function processStartTicks(int $pid): ?string
+    {
+        if ($pid < 1 || !is_dir('/proc')) {
+            return null;
+        }
+        $path = '/proc/' . $pid . '/stat';
+        $stat = @file_get_contents($path);
+        if ($stat === false) {
+            return is_dir('/proc/' . $pid) ? null : '';
+        }
+        $close = strrpos($stat, ')');
+        if ($close === false) {
+            return null;
+        }
+        $fields = preg_split('/\s+/', trim(substr($stat, $close + 1))) ?: [];
+        // The suffix starts at proc field 3; starttime is field 22.
+        return isset($fields[19]) && ctype_digit($fields[19]) ? $fields[19] : null;
     }
 
     /** @param list<string> $choices */
@@ -8612,21 +12893,44 @@ final class ExecutiveCore
     private function transaction(callable $callback): mixed
     {
         $ownsTransaction = !$this->connection->inTransaction();
+        $activityStart = count($this->pendingActivityEvents);
         if ($ownsTransaction) {
             $this->connection->beginTransaction();
         }
+        Memory::enterExternalTransaction();
 
         try {
             $result = $callback();
             if ($ownsTransaction) {
                 $this->connection->commit();
             }
-            return $result;
         } catch (Throwable $throwable) {
             if ($ownsTransaction && $this->connection->inTransaction()) {
                 $this->connection->rollBack();
             }
+            array_splice($this->pendingActivityEvents, $activityStart);
             throw $throwable;
+        } finally {
+            Memory::leaveExternalTransaction();
         }
+
+        if ($ownsTransaction) {
+            $events = array_splice($this->pendingActivityEvents, $activityStart);
+            foreach ($events as $event) {
+                try {
+                    $this->activityBus->publish(
+                        'core',
+                        'event',
+                        $event['kind'],
+                        context: $event['payload']
+                    );
+                } catch (Throwable) {
+                    // SQLite is the durable event log. An advisory bus outage
+                    // after commit must never turn a committed state change
+                    // into a reported rollback or trigger duplicate effects.
+                }
+            }
+        }
+        return $result;
     }
 }

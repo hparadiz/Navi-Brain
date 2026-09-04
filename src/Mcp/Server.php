@@ -8,18 +8,25 @@ use InvalidArgumentException;
 use JsonException;
 use NaviBrain\Core\ExecutiveCore;
 use NaviBrain\Perception\DesktopAwareness;
+use NaviBrain\Storage\TokenMemoryDaemon;
+use NaviBrain\Support\ActivityBus;
+use NaviBrain\Support\PlainText;
+use NaviBrain\Support\SessionPresence;
 use Throwable;
 
 final class Server
 {
-    private const VERSION = '0.4.0';
+    private const VERSION = '0.5.0';
 
     private ExecutiveCore $core;
     private DesktopAwareness $desktop;
+    private ActivityBus $activityBus;
+    private ?SessionPresence $sessionPresence = null;
 
     public function run(): int
     {
         try {
+            $this->activityBus = new ActivityBus();
             $this->core = new ExecutiveCore();
             $this->core->initialize();
             $this->desktop = new DesktopAwareness();
@@ -47,6 +54,7 @@ final class Server
             }
         }
 
+        $this->sessionPresence?->close();
         return 0;
     }
 
@@ -68,12 +76,13 @@ final class Server
             $protocolVersion = is_string($params['protocolVersion'] ?? null)
                 ? $params['protocolVersion']
                 : '2025-11-25';
+            $this->sessionPresence ??= SessionPresence::open($this->activityBus, $params);
 
             $this->sendResult($id, [
                 'protocolVersion' => $protocolVersion,
                 'capabilities' => ['tools' => (object) []],
                 'serverInfo' => ['name' => 'Navi-Brain', 'version' => self::VERSION],
-                'instructions' => 'Use Navi-Brain for durable, evidence-backed memory. Read before writing. Treat self-model facts as revisable observations, never privileged introspection.',
+                'instructions' => 'Use Navi-Brain for durable, evidence-backed memory. Read before writing. Normal tool content is compact plain text without storage wrappers; request debug only when raw JSON is necessary. Treat self-model facts as revisable observations, never privileged introspection.',
             ]);
             return;
         }
@@ -116,6 +125,19 @@ final class Server
             $this->sendError($id, -32602, 'Tool arguments must be an object.');
             return;
         }
+        $debug = $this->optionalBoolean($arguments, 'debug', false);
+        $startedAt = hrtime(true);
+        $outcome = 'ok';
+        $domain = ActivityBus::domainFor($name);
+        $flow = 'mcp-' . dechex($startedAt);
+        $this->activityBus->publish(
+            'mcp',
+            'started',
+            $name,
+            $domain,
+            outcome: 'pending',
+            flow: $flow
+        );
 
         try {
             if ($name === 'desktop_look') {
@@ -130,19 +152,33 @@ final class Server
                     )
                 );
                 if ($capture['image_base64'] !== null) {
-                    $this->sendImageToolResult($id, $capture['metadata'], $capture['image_base64']);
+                    $this->sendImageToolResult($id, $capture['metadata'], $capture['image_base64'], $debug);
                 } else {
-                    $this->sendToolResult($id, ['result' => $capture['metadata']]);
+                    $this->sendToolResult($id, ['result' => $capture['metadata']], false, $debug, $name);
                 }
                 return;
             }
 
             $result = match ($name) {
                 'desktop_presence' => $this->desktop->presence(),
-                'brain_status' => $this->core->status(),
-                'brain_recall' => $this->core->searchMemory(
-                    $this->requiredString($arguments, 'query'),
-                    $this->optionalInteger($arguments, 'limit', 20, 1, 100)
+                'brain_status' => $debug
+                    ? array_merge(
+                        ['primary_intention' => $this->requiredString($arguments, 'active_intention')],
+                        $this->core->status()
+                    )
+                    : $this->core->contextStatus(
+                        $this->requiredString($arguments, 'active_intention'),
+                        $this->optionalInteger(
+                            $arguments,
+                            'token_budget',
+                            TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS,
+                            1,
+                            TokenMemoryDaemon::MAX_CONTEXT_TOKENS
+                        )
+                    ),
+                'remember_navi' => $this->core->searchMemory(
+                    $this->requiredString($arguments, 'thoughts'),
+                    $this->optionalInteger($arguments, 'limit', 8, 1, 100)
                 ),
                 'brain_self_model' => $this->core->listSelfModelFacts(),
                 'brain_needs' => $this->core->listNeeds(),
@@ -173,11 +209,24 @@ final class Server
                 default => throw new InvalidArgumentException('Unknown tool: ' . $name),
             };
 
-            $this->sendToolResult($id, ['result' => $result]);
+            $this->sendToolResult($id, ['result' => $result], false, $debug, $name);
         } catch (InvalidArgumentException $exception) {
+            $outcome = 'failed';
             $this->sendError($id, -32602, $exception->getMessage());
         } catch (Throwable $throwable) {
-            $this->sendToolResult($id, ['error' => $throwable->getMessage()], true);
+            $outcome = 'failed';
+            $this->sendToolResult($id, ['error' => $throwable->getMessage()], true, $debug, $name);
+        } finally {
+            $durationMs = (int) max(0, round((hrtime(true) - $startedAt) / 1_000_000));
+            $this->activityBus->publish(
+                'mcp',
+                $outcome === 'ok' ? 'finished' : 'failed',
+                $name,
+                $domain,
+                $durationMs,
+                $outcome,
+                flow: $flow
+            );
         }
     }
 
@@ -197,7 +246,7 @@ final class Server
             'openWorldHint' => false,
         ];
 
-        return [
+        $tools = [
             [
                 'name' => 'desktop_presence',
                 'title' => 'Read Desktop Presence',
@@ -230,28 +279,49 @@ final class Server
             [
                 'name' => 'brain_status',
                 'title' => 'Read Navi-Brain Status',
-                'description' => 'Read active intentions, pending actions, discrepancies, working and semantic memory, self-model facts, and top appraisals.',
-                'inputSchema' => ['type' => 'object', 'properties' => (object) []],
-                'annotations' => $readOnly,
-            ],
-            [
-                'name' => 'brain_recall',
-                'title' => 'Recall Durable Memory',
-                'description' => 'Search active working, semantic, episodic, and procedural memory for task-relevant context.',
+                'description' => 'Inject the current intention into the resident C token network and read the strongest sequence-matched memory cohort it activates. Normal output contains only decoded cognitive content selected under the exact native token budget; it has no field names, row wrappers, scores, IDs, or metadata. Use debug only to inspect the separate executive database.',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
-                        'query' => ['type' => 'string', 'minLength' => 1],
-                        'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100, 'default' => 20],
+                        'active_intention' => [
+                            'type' => 'string',
+                            'minLength' => 1,
+                            'description' => 'Concise current user-directed objective, not a remembered background intention.',
+                        ],
+                        'token_budget' => [
+                            'type' => 'integer',
+                            'minimum' => 1,
+                            'maximum' => TokenMemoryDaemon::MAX_CONTEXT_TOKENS,
+                            'default' => TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS,
+                            'description' => 'Maximum resident BPE tokens in the returned thought stream, including separators.',
+                        ],
                     ],
-                    'required' => ['query'],
+                    'required' => ['active_intention'],
+                ],
+                'annotations' => $readOnly,
+            ],
+            [
+                'name' => 'remember_navi',
+                'title' => 'Remember, Navi',
+                'description' => 'Remember, Navi: supply a plain stream of current thought fragments or tokens and recall related working, semantic, episodic, and procedural memory. This is self-directed thought, not a search query. Defaults to eight results.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'thoughts' => [
+                            'type' => 'string',
+                            'description' => 'A plain series of current thought fragments or tokens, without array brackets and without composing a search query.',
+                            'minLength' => 1,
+                        ],
+                        'limit' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100, 'default' => 8],
+                    ],
+                    'required' => ['thoughts'],
                 ],
                 'annotations' => $readOnly,
             ],
             [
                 'name' => 'brain_self_model',
                 'title' => 'Read Navi Self Model',
-                'description' => 'Read current evidence-backed and revisable facts about Navi capabilities, tools, permissions, limits, and recurring failure modes.',
+                'description' => 'Read current evidence-backed and revisable facts about Navi capabilities, tools, permissions, limits, and recurring failure modes. Private appearance records remain local and are excluded from model context.',
                 'inputSchema' => ['type' => 'object', 'properties' => (object) []],
                 'annotations' => $readOnly,
             ],
@@ -344,7 +414,7 @@ final class Server
             [
                 'name' => 'brain_checkpoint',
                 'title' => 'Checkpoint Navi-Brain',
-                'description' => 'Capture the current executive state before context pressure, interruption, or task handoff.',
+                'description' => 'Synchronously persist the C daemon’s learned token counters, associations, and memory-access state, then record a lightweight checkpoint marker. Normal output is only a terse acknowledgement; use debug to inspect the marker.',
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
@@ -355,6 +425,20 @@ final class Server
                 'annotations' => $additiveWrite,
             ],
         ];
+
+        foreach ($tools as &$tool) {
+            $properties = is_array($tool['inputSchema']['properties'] ?? null)
+                ? $tool['inputSchema']['properties']
+                : [];
+            $properties['debug'] = [
+                'type' => 'boolean',
+                'default' => false,
+                'description' => 'Return raw JSON for serialization debugging. Never use this as prompt context.',
+            ];
+            $tool['inputSchema']['properties'] = $properties;
+        }
+        unset($tool);
+        return $tools;
     }
 
     /** @param array<string, mixed> $arguments */
@@ -392,6 +476,18 @@ final class Server
             throw new InvalidArgumentException($name . ' must be between 0 and 1.');
         }
         return $number;
+    }
+
+    /** @param array<string, mixed> $arguments */
+    private function optionalBoolean(array $arguments, string $name, bool $default): bool
+    {
+        if (!array_key_exists($name, $arguments)) {
+            return $default;
+        }
+        if (!is_bool($arguments[$name])) {
+            throw new InvalidArgumentException($name . ' must be true or false.');
+        }
+        return $arguments[$name];
     }
 
     /** @param array<string, mixed> $arguments */
@@ -445,35 +541,64 @@ final class Server
     }
 
     /** @param array<string, mixed> $metadata */
-    private function sendImageToolResult(mixed $id, array $metadata, string $imageBase64): void
+    private function sendImageToolResult(
+        mixed $id,
+        array $metadata,
+        string $imageBase64,
+        bool $debug
+    ): void
     {
         $payload = ['result' => $metadata];
-        $text = json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-        );
-        $this->sendResult($id, [
+        $text = $debug
+            ? json_encode(
+                $payload,
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+            )
+            : PlainText::render($payload, 6000, 8);
+        $result = [
             'content' => [
                 ['type' => 'text', 'text' => $text],
                 ['type' => 'image', 'data' => $imageBase64, 'mimeType' => 'image/png'],
             ],
-            'structuredContent' => $payload,
             'isError' => false,
-        ]);
+        ];
+        if ($debug) {
+            $result['structuredContent'] = $payload;
+        }
+        $this->sendResult($id, $result);
     }
 
     /** @param array<string, mixed> $payload */
-    private function sendToolResult(mixed $id, array $payload, bool $isError = false): void
-    {
-        $text = json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-        );
-        $this->sendResult($id, [
+    private function sendToolResult(
+        mixed $id,
+        array $payload,
+        bool $isError = false,
+        bool $debug = false,
+        string $toolName = ''
+    ): void {
+        $text = match (true) {
+            $debug => json_encode(
+                $payload,
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+            ),
+            !$isError && $toolName === 'brain_status' => is_string($payload['result'] ?? null)
+                ? $payload['result']
+                : '',
+            !$isError && $toolName === 'brain_checkpoint' => 'saved',
+            default => PlainText::render(
+                $payload,
+                10000,
+                12
+            ),
+        };
+        $result = [
             'content' => [['type' => 'text', 'text' => $text]],
-            'structuredContent' => $payload,
             'isError' => $isError,
-        ]);
+        ];
+        if ($debug) {
+            $result['structuredContent'] = $payload;
+        }
+        $this->sendResult($id, $result);
     }
 
     /** @param array<string, mixed> $result */

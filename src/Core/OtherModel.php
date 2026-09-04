@@ -14,6 +14,7 @@ use NaviBrain\Model\SenseReading;
 use NaviBrain\Model\SensorySource;
 use NaviBrain\Model\UtteranceOutcome;
 use NaviBrain\Perception\AgentObservationProjector;
+use NaviBrain\Support\PlainText;
 use RuntimeException;
 use Throwable;
 
@@ -269,7 +270,7 @@ final class OtherModel
             'Use none when the line does not explicitly report one of those things.',
             'Do not infer an unstated motive. evidence_quote must be a verbatim fragment of the utterance.',
             'Do not emit actor, recursion, access, representation, confidence, or an action.',
-            'Utterance: ' . json_encode($statement, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+            'Utterance: ' . PlainText::sanitize($statement),
         ]);
         $queued = $this->core->enqueueWork(
             parentRunId: null,
@@ -428,7 +429,7 @@ final class OtherModel
         $cycle->save();
         $this->core->workingMemory()->publish(
             role: 'other_agent_state',
-            claim: json_encode($published, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+            claim: PlainText::render($published, 3000, 12),
             recordType: 'other_model_cycle',
             recordId: (int) $cycle->id,
             confidence: (float) ($published['confidence'] ?? 0.0),
@@ -1553,12 +1554,9 @@ final class OtherModel
             'updated_at' => time(),
         ]);
         $cycle->save();
-        $this->core->emitEvent('other_model.cycle.transition', [
-            'other_model_cycle_id' => (int) $cycle->id,
-            'completed_state' => $completed,
-            'next_state' => $next,
-            'elapsed_ms' => $elapsed,
-        ]);
+        // The cycle row already durably records both the current state and all
+        // stage timings. Emitting another event at every internal boundary
+        // multiplied ordinary sensory writes without preserving extra state.
     }
 
     /** @param array<string, mixed> $context */

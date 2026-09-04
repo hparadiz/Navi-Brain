@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 
 name="navi-brain local model"
-description="CPU-only llama.cpp server providing Navi-Brain's baseline cognition"
+description="Optional CPU-only llama.cpp ablation server for Navi-Brain"
 
 : ${NAVI_BRAIN_ROOT:=/home/akujin/Sources/Navi-Brain}
 : ${LLAMA_SERVER:=/usr/local/bin/llama-server}

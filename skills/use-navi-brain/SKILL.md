@@ -9,10 +9,11 @@ Use durable state only when it can change the current task. Keep the loop small.
 
 ## Retrieve
 
-1. Call `brain_status` at the start or resume of a substantial task.
+1. Call `brain_status` at the start or resume of a substantial task. Pass the concise current user-directed objective as `active_intention`; never substitute a remembered background intention. When the harness knows its available context headroom, pass that as `token_budget`; otherwise use the daemon default. Never post-truncate the result by characters.
 2. Call `brain_self_model` when capabilities, tools, permissions, limits, or recurring failures matter.
-3. Call `brain_recall` with a short task-specific query when prior knowledge could alter the plan.
-4. Use retrieved evidence in the next decision. Do not perform retrieval as ceremony.
+3. Call `remember_navi` with a short plain stream of current thought fragments or tokens, not a search query or an array, and a limit of eight or fewer when prior knowledge could alter the plan. Treat the call as Navi telling herself, “remember, Navi: …”.
+4. Use only the daemon-selected activation text in the next decision. Never forward a raw tool envelope, structured payload, or database row dump into another prompt.
+5. Request debug output only while diagnosing serialization. Do not reuse debug output as context.
 
 Skip retrieval for casual conversation, a trivial one-step answer, or a task with no plausible durable context.
 
@@ -31,11 +32,11 @@ Never store feelings, wishes, hidden reasoning, consciousness claims, flattering
 
 ## Checkpoint
 
-Call `brain_checkpoint` before context pressure, interruption, or a handoff when active executive state would otherwise be expensive to reconstruct.
+After writing any session evidence that must survive, call `brain_checkpoint` before context pressure, interruption, or handoff. It flushes learned token, association, and access state; it does not infer or serialize missing session content.
 
 ## Delegate cautiously
 
-For a substantial task with multiple meaningful outcomes, read [worker-protocol.md](references/worker-protocol.md). Subagents may propose memory or self-model updates, but the main agent remains the sole curator and performs every canonical write.
+For a substantial task with multiple meaningful outcomes, read `references/worker-protocol.md`. Subagents may propose memory or self-model updates, but the main agent remains the sole curator and performs every canonical write.
 
 ## Preserve authority
 

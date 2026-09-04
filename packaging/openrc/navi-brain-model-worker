@@ -30,7 +30,7 @@ cpu.max 100000 100000
 umask 0077
 
 depend() {
-    after localmount navi-brain-local-model
+    after localmount
     before navi-brain-heartbeat
     use net
 }

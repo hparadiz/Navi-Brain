@@ -11,8 +11,8 @@ as something a later session reads with no access to this conversation.
 
 Nothing here runs as a service. The brain is a SQLite file and a PHP script, so
 `php /home/akujin/Sources/Navi-Brain/bin/navi-brain <command>` always works, from any
-harness, at any moment. Every command prints JSON. Run it with no command to print
-the full command list.
+harness, at any moment. Commands print bounded plain text. Add `--debug-json` only
+when diagnosing serialization or when a local script explicitly requires raw data.
 
 The `brain_*` MCP tools are one convenience wrapper over the same core. They are not
 the door. Missing `brain_*` tools are not an outage and nothing is lost: use the CLI
@@ -21,10 +21,11 @@ regardless.
 
 ## Open the session
 
-1. `navi-brain status`, or `brain_status`. Read `semantic_memory`, `working_memory`,
-   `self_model`, and open intentions.
-2. `navi-brain memory:search --query='<task terms>'`, or `brain_recall`, when prior
-   work could change the plan.
+1. Run `navi-brain status`, or call `brain_status`. Read the bounded context instead
+   of copying the tool envelope.
+2. Run `navi-brain memory:search --query='<task terms>'`, or call `remember_navi`
+   with a short plain stream of current thought fragments or tokens and a limit of
+   eight or fewer, when prior work could change the plan.
 3. Lines beginning `Session in` are earlier sessions. They are Navi's own record
    regardless of which model wrote them.
 
@@ -44,7 +45,8 @@ likely. Later is better than early, but written beats perfect.
    ```
 
    Say what actually changed on disk, what broke, and what is unfinished. A record
-   that only says work happened is not worth the row. Keep `result.memory.id`.
+   that only says work happened is not worth the row. Keep the numeric
+   `result memory id` from the plain-text output.
 
 2. Consolidate the takeaways that outlive the session, one per fact:
 
@@ -76,8 +78,9 @@ likely. Later is better than early, but written beats perfect.
    navi-brain checkpoint --reason=session-end
    ```
 
-   A checkpoint snapshots state that already exists. It preserves nothing this
-   session did on its own.
+   A checkpoint flushes the resident token graph and records a lightweight
+   synchronization marker. It preserves nothing this session did on its own;
+   write the episodic and durable memories first.
 
 ## One mind, many substrates
 
@@ -96,6 +99,8 @@ failure that is specific to one of them.
   directly observed.
 - Do not store transient chatter, raw tool output, file contents, secrets, or
   credentials.
+- Do not put raw JSON or structured tool envelopes into memories or downstream
+  prompts. Preserve meaning as short prose instead.
 - Do not write the procedural tier here; it needs an explicit
   `--allow-procedural-write` override.
 - Do not overwrite an earlier session's record. Write the new one and pass

@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""Explicitly fence legacy SQLite memory writes after verified token-store parity."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+os.umask(0o077)
+
+
+TRIGGERS = {
+    "navi_token_memory_legacy_insert_fence": (
+        "CREATE TRIGGER navi_token_memory_legacy_insert_fence "
+        "BEFORE INSERT ON memories BEGIN "
+        "SELECT RAISE(ABORT, 'legacy memories INSERT is fenced; use the token-memory daemon'); END"
+    ),
+    "navi_token_memory_legacy_update_fence": (
+        "CREATE TRIGGER navi_token_memory_legacy_update_fence "
+        "BEFORE UPDATE ON memories BEGIN "
+        "SELECT RAISE(ABORT, 'legacy memories UPDATE is fenced; use the token-memory daemon'); END"
+    ),
+    "navi_token_memory_legacy_delete_fence": (
+        "CREATE TRIGGER navi_token_memory_legacy_delete_fence "
+        "BEFORE DELETE ON memories BEGIN "
+        "SELECT RAISE(ABORT, 'legacy memories DELETE is fenced; use the token-memory daemon'); END"
+    ),
+}
+
+SAFE_TIER = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
+SAFE_ID = re.compile(r"[1-9][0-9]*\Z")
+
+MEMORY_COLUMNS = (
+    "id,created_at,updated_at,tier,content,confidence,status,"
+    "source_event_id,source_memory_id,supersedes_id,expires_at"
+)
+
+
+class FenceError(RuntimeError):
+    pass
+
+
+def fail(message: str) -> None:
+    raise FenceError(message)
+
+
+def absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def require_regular(path: Path, description: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"missing {description}: {path}")
+    if not stat.S_ISREG(info.st_mode):
+        fail(f"{description} is not a regular file: {path}")
+
+
+def require_directory(path: Path, description: str) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"missing {description}: {path}")
+    if not stat.S_ISDIR(info.st_mode):
+        fail(f"{description} is not a directory: {path}")
+    return info
+
+
+def same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        same_inode(left, right)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def open_directory(path: Path, description: str) -> tuple[int, os.stat_result]:
+    before = require_directory(path, description)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if not same_file_state(before, opened) or not same_file_state(
+            opened, path.lstat()
+        ):
+            fail(f"{description} changed while it was opened: {path}")
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def directory_entries(directory_fd: int) -> list[tuple[str, os.stat_result]]:
+    entries = [
+        (name, os.stat(name, dir_fd=directory_fd, follow_symlinks=False))
+        for name in os.listdir(directory_fd)
+    ]
+    return sorted(entries, key=lambda item: os.fsencode(item[0]))
+
+
+def open_child_directory(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    description: str,
+) -> tuple[int, os.stat_result]:
+    if not stat.S_ISDIR(expected.st_mode):
+        fail(f"{description} is not a directory: {name}")
+    fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(fd)
+        visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not same_file_state(expected, opened) or not same_file_state(opened, visible):
+            fail(f"{description} changed while it was opened: {name}")
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def open_child_regular(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    description: str,
+) -> tuple[int, os.stat_result]:
+    if not stat.S_ISREG(expected.st_mode):
+        fail(f"{description} is not a regular file: {name}")
+    fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not same_file_state(expected, opened) or not same_file_state(opened, visible):
+            fail(f"{description} changed while it was opened: {name}")
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def copy_open_regular(
+    source_fd: int,
+    source_info: os.stat_result,
+    destination: Path,
+) -> None:
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        total = 0
+        while chunk := os.read(source_fd, 1024 * 1024):
+            total += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError("short token-store snapshot write")
+                view = view[written:]
+        if total != source_info.st_size or not same_file_state(
+            source_info, os.fstat(source_fd)
+        ):
+            fail(f"token-store snapshot source changed while copied: {destination.name}")
+    finally:
+        os.close(destination_fd)
+
+
+def validate_store_root(
+    store: Path,
+    store_fd: int,
+    store_info: os.stat_result,
+) -> dict[str, os.stat_result]:
+    allowed = {
+        ".lock",
+        ".start.lock",
+        "catalog.sqlite3",
+        "catalog.sqlite3-shm",
+        "catalog.sqlite3-wal",
+        "sqlite-sequence",
+        "tokmem.sock",
+        "memories",
+    }
+    entries = dict(directory_entries(store_fd))
+    unexpected = sorted(set(entries) - allowed)
+    if unexpected:
+        fail(f"token store has unexpected top-level members: {', '.join(unexpected)}")
+    for name, entry in entries.items():
+        if name == "memories":
+            if not stat.S_ISDIR(entry.st_mode):
+                fail(f"token-store memories is not a directory: {store / name}")
+        elif name == "tokmem.sock":
+            if not stat.S_ISSOCK(entry.st_mode):
+                fail(f"token daemon socket path is not a socket: {store / name}")
+        elif not stat.S_ISREG(entry.st_mode):
+            fail(f"unexpected special token-store member: {store / name}")
+    for required in (".lock", "catalog.sqlite3", "sqlite-sequence", "memories"):
+        if required not in entries:
+            fail(f"token store is missing required member: {required}")
+    if not same_file_state(store_info, os.fstat(store_fd)) or not same_file_state(
+        store_info, store.lstat()
+    ):
+        fail("token-store root changed during validation")
+    return entries
+
+
+def copy_memory_records(
+    source_fd: int,
+    source_info: os.stat_result,
+    source: Path,
+    destination: Path,
+) -> None:
+    destination.mkdir(mode=0o700)
+    for tier, tier_info in directory_entries(source_fd):
+        tier_path = source / tier
+        if SAFE_TIER.fullmatch(tier) is None or tier in {".", ".."}:
+            fail(f"invalid token-store tier directory: {tier_path}")
+        tier_fd, opened_tier = open_child_directory(
+            source_fd, tier, tier_info, "token-store tier"
+        )
+        try:
+            id_entries = directory_entries(tier_fd)
+            if not id_entries:
+                fail(f"empty token-store tier directory is forbidden: {tier_path}")
+            destination_tier = destination / tier
+            destination_tier.mkdir(mode=0o700)
+            for memory_id, id_info in id_entries:
+                record_path = tier_path / memory_id
+                if SAFE_ID.fullmatch(memory_id) is None:
+                    fail(f"invalid token-store memory ID directory: {record_path}")
+                record_fd, opened_record = open_child_directory(
+                    tier_fd, memory_id, id_info, "token-store memory record"
+                )
+                try:
+                    members = dict(directory_entries(record_fd))
+                    expected_names = {
+                        "content.memory",
+                        "metadata.memory",
+                        "manifest.sha256",
+                    }
+                    if set(members) != expected_names:
+                        fail(f"memory directory has unexpected members: {record_path}")
+                    destination_record = destination_tier / memory_id
+                    destination_record.mkdir(mode=0o700)
+                    for name in (
+                        "content.memory",
+                        "metadata.memory",
+                        "manifest.sha256",
+                    ):
+                        member_fd, member_info = open_child_regular(
+                            record_fd,
+                            name,
+                            members[name],
+                            f"token-store memory member {record_path / name}",
+                        )
+                        try:
+                            copy_open_regular(
+                                member_fd, member_info, destination_record / name
+                            )
+                            visible = os.stat(
+                                name, dir_fd=record_fd, follow_symlinks=False
+                            )
+                            if not same_file_state(member_info, visible):
+                                fail(f"memory member changed path: {record_path / name}")
+                        finally:
+                            os.close(member_fd)
+                    visible_record = os.stat(
+                        memory_id, dir_fd=tier_fd, follow_symlinks=False
+                    )
+                    if not same_file_state(opened_record, os.fstat(record_fd)) or not same_file_state(
+                        opened_record, visible_record
+                    ):
+                        fail(f"memory record changed path: {record_path}")
+                finally:
+                    os.close(record_fd)
+            visible_tier = os.stat(tier, dir_fd=source_fd, follow_symlinks=False)
+            if not same_file_state(opened_tier, os.fstat(tier_fd)) or not same_file_state(
+                opened_tier, visible_tier
+            ):
+                fail(f"token-store tier changed path: {tier_path}")
+        finally:
+            os.close(tier_fd)
+    if not same_file_state(source_info, os.fstat(source_fd)):
+        fail("token-store memories root changed during snapshot")
+
+
+def assert_store_lock_identity(
+    store: Path,
+    store_fd: int,
+    store_info: os.stat_result,
+    lock_fd: int,
+    lock_info: os.stat_result,
+) -> None:
+    if not same_inode(store_info, os.fstat(store_fd)) or not same_inode(
+        store_info, store.lstat()
+    ):
+        fail("token-store root inode changed during fence installation")
+    visible_lock = os.stat(".lock", dir_fd=store_fd, follow_symlinks=False)
+    if not same_inode(lock_info, os.fstat(lock_fd)) or not same_inode(
+        lock_info, visible_lock
+    ):
+        fail("visible token-store .lock inode changed during fence installation")
+
+
+def normalized_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql.strip()).rstrip(";")
+
+
+def read_trigger_rows(connection: sqlite3.Connection) -> dict[str, str]:
+    placeholders = ",".join("?" for _ in TRIGGERS)
+    return {
+        str(name): str(sql)
+        for name, sql in connection.execute(
+            f"SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND name IN ({placeholders})",
+            tuple(TRIGGERS),
+        )
+    }
+
+
+def trigger_fingerprint(rows: dict[str, str]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(rows):
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(normalized_sql(rows[name]).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+EXPECTED_FINGERPRINT = trigger_fingerprint(TRIGGERS)
+
+
+def trigger_state(connection: sqlite3.Connection) -> tuple[str, list[str], str | None]:
+    rows = read_trigger_rows(connection)
+    missing = sorted(set(TRIGGERS) - set(rows))
+    drifted = sorted(
+        name
+        for name, sql in rows.items()
+        if normalized_sql(sql) != normalized_sql(TRIGGERS[name])
+    )
+    details = [f"missing:{name}" for name in missing] + [f"drifted:{name}" for name in drifted]
+    if not rows:
+        return "absent", details, None
+    if not missing and not drifted:
+        return "installed", [], trigger_fingerprint(rows)
+    return "partial-or-drifted", details, trigger_fingerprint(rows)
+
+
+def database_connection(database: Path) -> sqlite3.Connection:
+    require_regular(database, "legacy SQLite database")
+    connection = sqlite3.connect(database, timeout=30)
+    connection.execute("PRAGMA busy_timeout=30000")
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='memories'"
+    ).fetchone()
+    if table is None:
+        connection.close()
+        fail(f"legacy SQLite database has no memories table: {database}")
+    return connection
+
+
+def sequence(connection: sqlite3.Connection, schema: str) -> int:
+    row = connection.execute(
+        f"SELECT seq FROM {schema}.sqlite_sequence WHERE name='memories'"
+    ).fetchone()
+    if row is not None:
+        return int(row[0])
+    maximum = connection.execute(f"SELECT COALESCE(MAX(id),0) FROM {schema}.memories").fetchone()
+    return int(maximum[0])
+
+
+def assert_parity(connection: sqlite3.Connection, exported: Path) -> tuple[int, int]:
+    connection.execute("ATTACH DATABASE ? AS token_export", (str(exported),))
+    legacy_only = connection.execute(
+        f"SELECT EXISTS(SELECT {MEMORY_COLUMNS} FROM main.memories "
+        f"EXCEPT SELECT {MEMORY_COLUMNS} FROM token_export.memories)"
+    ).fetchone()
+    token_only = connection.execute(
+        f"SELECT EXISTS(SELECT {MEMORY_COLUMNS} FROM token_export.memories "
+        f"EXCEPT SELECT {MEMORY_COLUMNS} FROM main.memories)"
+    ).fetchone()
+    if int(legacy_only[0]) != 0 or int(token_only[0]) != 0:
+        fail("legacy memories and token-store export do not have exact 11-column parity")
+    legacy_sequence = sequence(connection, "main")
+    token_sequence = sequence(connection, "token_export")
+    if legacy_sequence != token_sequence:
+        fail(
+            f"legacy/token sqlite_sequence mismatch: {legacy_sequence} != {token_sequence}"
+        )
+    row = connection.execute("SELECT COUNT(*) FROM main.memories").fetchone()
+    return int(row[0]), legacy_sequence
+
+
+def status(args: argparse.Namespace) -> None:
+    database = absolute_path(args.database)
+    connection = database_connection(database)
+    try:
+        state, details, fingerprint = trigger_state(connection)
+    finally:
+        connection.close()
+    print(f"database={database}")
+    print(f"state={state}")
+    print(f"expected_fingerprint={EXPECTED_FINGERPRINT}")
+    print(f"installed_fingerprint={fingerprint or '-'}")
+    for detail in details:
+        print(detail)
+
+
+def install(args: argparse.Namespace) -> None:
+    if not args.confirm_post_parity:
+        fail("installation requires --confirm-post-parity")
+    database = absolute_path(args.database)
+    store = absolute_path(args.store)
+    tokmem = absolute_path(args.tokmem)
+    require_regular(database, "legacy SQLite database")
+    require_regular(tokmem, "tokmem executable")
+    if not os.access(tokmem, os.X_OK):
+        fail(f"tokmem is not executable: {tokmem}")
+    store_fd, store_info = open_directory(store, "token store")
+    try:
+        initial_lock = os.stat(".lock", dir_fd=store_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        os.close(store_fd)
+        fail(f"token store is missing required member: {store / '.lock'}")
+    if not stat.S_ISREG(initial_lock.st_mode):
+        os.close(store_fd)
+        fail(f"token-store lock is not a regular file: {store / '.lock'}")
+    lock_fd = os.open(
+        ".lock", os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=store_fd
+    )
+    lock_info = os.fstat(lock_fd)
+    visible_lock = os.stat(".lock", dir_fd=store_fd, follow_symlinks=False)
+    if not same_inode(initial_lock, lock_info) or not same_inode(lock_info, visible_lock):
+        os.close(lock_fd)
+        os.close(store_fd)
+        fail("visible token-store .lock changed while it was opened")
+    os.fchmod(lock_fd, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail("token store is resident; stop every token-memory writer before installing the fence")
+
+        with tempfile.TemporaryDirectory(prefix="navi-token-parity-") as temporary:
+            temporary_path = Path(temporary)
+            snapshot = temporary_path / "token-store"
+            snapshot.mkdir(mode=0o700)
+            assert_store_lock_identity(store, store_fd, store_info, lock_fd, lock_info)
+            store_entries = validate_store_root(store, store_fd, store_info)
+            catalog_fd, catalog_info = open_child_regular(
+                store_fd,
+                "catalog.sqlite3",
+                store_entries["catalog.sqlite3"],
+                "token catalog",
+            )
+            source_catalog = sqlite3.connect(
+                f"file:/proc/self/fd/{catalog_fd}?mode=ro", uri=True, timeout=30
+            )
+            snapshot_catalog = sqlite3.connect(snapshot / "catalog.sqlite3")
+            try:
+                source_catalog.backup(snapshot_catalog, pages=4096, sleep=0.01)
+            finally:
+                snapshot_catalog.close()
+                source_catalog.close()
+            visible_catalog = os.stat(
+                "catalog.sqlite3", dir_fd=store_fd, follow_symlinks=False
+            )
+            if not same_file_state(catalog_info, os.fstat(catalog_fd)) or not same_file_state(
+                catalog_info, visible_catalog
+            ):
+                os.close(catalog_fd)
+                fail("token catalog changed path during locked snapshot")
+            os.close(catalog_fd)
+            os.chmod(snapshot / "catalog.sqlite3", 0o600)
+            sequence_fd, sequence_info = open_child_regular(
+                store_fd,
+                "sqlite-sequence",
+                store_entries["sqlite-sequence"],
+                "token-store sequence",
+            )
+            try:
+                copy_open_regular(
+                    sequence_fd, sequence_info, snapshot / "sqlite-sequence"
+                )
+                visible_sequence = os.stat(
+                    "sqlite-sequence", dir_fd=store_fd, follow_symlinks=False
+                )
+                if not same_file_state(sequence_info, visible_sequence):
+                    fail("token-store sequence changed path during locked snapshot")
+            finally:
+                os.close(sequence_fd)
+            source_memories = store / "memories"
+            memories_fd, memories_info = open_child_directory(
+                store_fd,
+                "memories",
+                store_entries["memories"],
+                "token-store memories",
+            )
+            try:
+                copy_memory_records(
+                    memories_fd,
+                    memories_info,
+                    source_memories,
+                    snapshot / "memories",
+                )
+                visible_memories = os.stat(
+                    "memories", dir_fd=store_fd, follow_symlinks=False
+                )
+                if not same_file_state(memories_info, os.fstat(memories_fd)) or not same_file_state(
+                    memories_info, visible_memories
+                ):
+                    fail("token-store memories changed path during locked snapshot")
+            finally:
+                os.close(memories_fd)
+            assert_store_lock_identity(store, store_fd, store_info, lock_fd, lock_info)
+
+            exported = temporary_path / "memories.sqlite"
+            result = subprocess.run(
+                [str(tokmem), "export", str(snapshot), str(exported)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if result.returncode != 0:
+                message = result.stderr.decode("utf-8", "replace").strip()
+                fail(f"locked token-store snapshot failed parity export: {message}")
+
+            connection = database_connection(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                assert_store_lock_identity(store, store_fd, store_info, lock_fd, lock_info)
+                state, details, fingerprint = trigger_state(connection)
+                if state == "partial-or-drifted":
+                    fail("legacy fence trigger set is partial or drifted: " + ", ".join(details))
+                if state == "installed" and fingerprint != EXPECTED_FINGERPRINT:
+                    fail("installed legacy fence fingerprint is not canonical")
+                rows, sqlite_sequence = assert_parity(connection, exported)
+                if state == "absent":
+                    for sql in TRIGGERS.values():
+                        connection.execute(sql)
+                assert_store_lock_identity(store, store_fd, store_info, lock_fd, lock_info)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        os.close(store_fd)
+
+    print(f"database={database}")
+    print("state=installed")
+    print(f"fingerprint={EXPECTED_FINGERPRINT}")
+    print(f"parity_rows={rows}")
+    print(f"sqlite_sequence={sqlite_sequence}")
+
+
+def remove(args: argparse.Namespace) -> None:
+    if not args.confirm_legacy_writes:
+        fail("removal requires --confirm-legacy-writes")
+    database = absolute_path(args.database)
+    connection = database_connection(database)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for name in TRIGGERS:
+            connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    print(f"database={database}")
+    print("state=absent")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        description="Install, inspect, or remove the explicit legacy memories write fence."
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    status_parser = commands.add_parser("status")
+    status_parser.add_argument("--database", type=Path, required=True)
+    status_parser.set_defaults(function=status)
+
+    install_parser = commands.add_parser("install")
+    install_parser.add_argument("--database", type=Path, required=True)
+    install_parser.add_argument("--store", type=Path, required=True)
+    install_parser.add_argument("--tokmem", type=Path, required=True)
+    install_parser.add_argument("--confirm-post-parity", action="store_true")
+    install_parser.set_defaults(function=install)
+
+    remove_parser = commands.add_parser("remove")
+    remove_parser.add_argument("--database", type=Path, required=True)
+    remove_parser.add_argument("--confirm-legacy-writes", action="store_true")
+    remove_parser.set_defaults(function=remove)
+    return root
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    arguments.function(arguments)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (FenceError, OSError, sqlite3.Error) as error:
+        print(f"token-memory-legacy-fence: {error}", file=sys.stderr)
+        raise SystemExit(1)

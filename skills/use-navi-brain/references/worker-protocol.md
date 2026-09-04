@@ -11,17 +11,18 @@ Use at most two workers at once. Give them the smallest relevant trace. Do not g
 
 ## Proposal shape
 
-Require workers to return either `none` or one JSON object:
+Require workers to return either `none` or these five plain-text lines:
 
-```json
-{
-  "key": "runtime.example_capability",
-  "value": "A concise, falsifiable claim.",
-  "confidence": 0.9,
-  "evidence": "The exact observed result that supports the claim.",
-  "future_effect": "What decision this should change later."
-}
+```text
+key: runtime.example_capability
+value: A concise, falsifiable claim.
+confidence: 0.9
+evidence: The exact observed result that supports the claim.
+future effect: What decision this should change later.
 ```
+
+Do not request JSON or forward raw tool output. The proposal is advisory text;
+the curator supplies canonical tool arguments after checking it.
 
 ## Curator checks
 

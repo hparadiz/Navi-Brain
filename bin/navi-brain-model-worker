@@ -4,15 +4,13 @@
 declare(strict_types=1);
 
 use NaviBrain\Core\ExecutiveCore;
-use NaviBrain\Core\FreeModelWorker;
-use NaviBrain\Core\LocalModelWorker;
+use NaviBrain\Core\CodexSparkWorker;
 
 require dirname(__DIR__) . '/bootstrap/app.php';
 
 $core = new ExecutiveCore();
 $core->initialize();
-$localWorker = new LocalModelWorker($core);
-$freeWorker = new FreeModelWorker($core);
+$sparkWorker = new CodexSparkWorker($core);
 $nodeId = getenv('NAVI_BRAIN_NODE_ID');
 if (!is_string($nodeId) || trim($nodeId) === '') {
     $nodeId = gethostname() ?: 'local';
@@ -29,14 +27,7 @@ if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
 while ($running) {
     $record = ['at' => time(), 'owner' => $owner];
     try {
-        $record['worker'] = $localWorker->runOnce($owner);
-        if (in_array(
-            $record['worker']['status'] ?? null,
-            ['local_model_unavailable', 'local_model_cooling_down'],
-            true
-        )) {
-            $record['worker_fallback'] = $freeWorker->runOnce($owner);
-        }
+        $record['spark_worker'] = $sparkWorker->runOnce($owner);
         $record['ok'] = true;
     } catch (Throwable $throwable) {
         $record['ok'] = false;
@@ -49,9 +40,9 @@ while ($running) {
     ) . PHP_EOL);
     fflush(STDOUT);
 
-    $status = $record['worker']['status'] ?? null;
+    $status = $record['spark_worker']['status'] ?? null;
     $pause = match ($status) {
-        'local_model_unavailable', 'local_model_cooling_down' => 10,
+        'spark_model_unavailable', 'spark_model_cooling_down' => 10,
         'idle' => 2,
         default => 1,
     };

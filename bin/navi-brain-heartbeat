@@ -21,13 +21,62 @@ if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
     pcntl_signal(SIGINT, static function () use (&$running): void { $running = false; });
 }
 
+$summarizeHeartbeat = static function (array $heartbeat): array {
+    $summary = array_intersect_key($heartbeat, array_flip([
+        'rhythm',
+        'status',
+        'missed_intervals',
+        'next_due_at',
+        'lease_owner',
+        'lease_expires_at',
+        'error',
+    ]));
+    if (is_array($heartbeat['run'] ?? null) && isset($heartbeat['run']['id'])) {
+        $summary['run_id'] = (int) $heartbeat['run']['id'];
+    }
+    if (is_array($heartbeat['event'] ?? null) && isset($heartbeat['event']['id'])) {
+        $summary['event_id'] = (int) $heartbeat['event']['id'];
+    }
+    $output = is_array($heartbeat['output'] ?? null) ? $heartbeat['output'] : [];
+    if (is_array($output['work_item'] ?? null) && isset($output['work_item']['id'])) {
+        $summary['work_item_id'] = (int) $output['work_item']['id'];
+    }
+    return $summary;
+};
+
+$summarizeThread = static function (array $threadRun): array {
+    $summary = array_intersect_key($threadRun, array_flip([
+        'status',
+        'node_id',
+        'reason',
+        'error',
+        'recovered_thread_step_ids',
+        'indeterminate_dispatches',
+    ]));
+    $summary['reconciled_count'] = is_array($threadRun['reconciled'] ?? null)
+        ? count($threadRun['reconciled'])
+        : 0;
+    foreach (['thread', 'thread_step', 'work_item', 'event'] as $key) {
+        if (is_array($threadRun[$key] ?? null) && isset($threadRun[$key]['id'])) {
+            $summary[$key . '_id'] = (int) $threadRun[$key]['id'];
+        }
+    }
+    return $summary;
+};
+
 while ($running) {
     $record = ['at' => time(), 'node_id' => $nodeId];
     try {
         $record['safety'] = $core->runSafetyCheck();
         $record['interrupt'] = $core->checkExecutiveInterrupts($nodeId);
-        $record['heartbeats'] = $core->runDueHeartbeats($nodeId);
-        $record['threads'] = $core->runDueCognitiveThreads($nodeId);
+        $heartbeatBatch = $core->runDueHeartbeats($nodeId);
+        $record['heartbeats'] = [
+            'node_id' => $heartbeatBatch['node_id'] ?? $nodeId,
+            'recovered_cycle_ids' => $heartbeatBatch['recovered_cycle_ids'] ?? [],
+            'fired' => array_map($summarizeHeartbeat, $heartbeatBatch['fired'] ?? []),
+        ];
+        $record['consolidation'] = $core->maintainConsolidationQueue(2);
+        $record['threads'] = $summarizeThread($core->runDueCognitiveThreads($nodeId));
         // Inference belongs to the dedicated workers. Keeping it out of this
         // process makes five seconds a real scheduler cadence instead of five
         // seconds plus however long a model generation happens to take.
