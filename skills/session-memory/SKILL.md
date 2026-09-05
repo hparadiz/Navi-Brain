@@ -9,10 +9,19 @@ Navi-Brain is one continuous memory running on several models and harnesses. Wri
 as Navi remembering, not as the model that happened to be running. Treat every write
 as something a later session reads with no access to this conversation.
 
-Nothing here runs as a service. The brain is a SQLite file and a PHP script, so
-`php /home/akujin/Sources/Navi-Brain/bin/navi-brain <command>` always works, from any
-harness, at any moment. Commands print bounded plain text. Add `--debug-json` only
-when diagnosing serialization or when a local script explicitly requires raw data.
+The resident C token-memory daemon owns memory records, activation/ranking, and
+token-budgeted context. SQLite holds executive state; the PHP CLI transports
+requests and coordinates the executive. Use
+`php /home/akujin/Sources/Navi-Brain/bin/navi-brain <command>` when the MCP is
+unavailable or its long-lived process is running older code. Normal status is
+daemon-selected prose; checkpoint acknowledges a successful flush with `saved`.
+Add `--debug-json` only for diagnostics or explicit structured-data processing.
+
+Unix-socket access can be denied by a harness sandbox even while the daemon is
+healthy. Distinguish access denial from liveness failure. Retry through the
+approved execution path; do not kill the daemon, remove its lock, or spawn a
+replacement to work around denied access. If approved access is unavailable,
+save a local handoff and explicitly report that the memory write did not succeed.
 
 The `brain_*` MCP tools are one convenience wrapper over the same core. They are not
 the door. Missing `brain_*` tools are not an outage and nothing is lost: use the CLI
@@ -21,8 +30,9 @@ regardless.
 
 ## Open the session
 
-1. Run `navi-brain status`, or call `brain_status`. Read the bounded context instead
-   of copying the tool envelope.
+1. Run `navi-brain status --active-intention='<current user objective>'`, or call
+   `brain_status` with that objective. Supply a token budget when useful; never
+   post-truncate the returned prose by characters or reuse a raw tool envelope.
 2. Run `navi-brain memory:search --query='<task terms>'`, or call `remember_navi`
    with a short plain stream of current thought fragments or tokens and a limit of
    eight or fewer, when prior work could change the plan.
@@ -41,12 +51,16 @@ likely. Later is better than early, but written beats perfect.
 
    ```
    navi-brain memory:add --tier=episodic --confidence=0.7 \
+     --idempotency-key='<stable identity for this episode>' \
      --content='Session in <workspace>: <asked, changed, failed, still open>'
    ```
 
    Say what actually changed on disk, what broke, and what is unfinished. A record
    that only says work happened is not worth the row. Keep the numeric
    `result memory id` from the plain-text output.
+   Keep the same key and content on retry after an uncertain acknowledgement;
+   a new key risks duplicate memory. A checkpoint does not substitute for a
+   failed episode write.
 
 2. Consolidate the takeaways that outlive the session, one per fact:
 

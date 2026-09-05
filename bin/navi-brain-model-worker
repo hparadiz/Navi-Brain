@@ -5,18 +5,31 @@ declare(strict_types=1);
 
 use NaviBrain\Core\ExecutiveCore;
 use NaviBrain\Core\CodexSparkWorker;
+use NaviBrain\Core\PublicReflection;
 
 require dirname(__DIR__) . '/bootstrap/app.php';
 
 $core = new ExecutiveCore();
 $core->initialize();
-$sparkWorker = new CodexSparkWorker($core);
+$config = require dirname(__DIR__) . '/config/cognition.php';
+$profile = $config['profile'] ?? 'disabled';
+$worker = match ($profile) {
+    'public-reflection' => new PublicReflection($core),
+    'codex-spark' => new CodexSparkWorker($core),
+    'disabled' => null,
+    default => throw new RuntimeException('Unknown cognition profile; worker will not guess a provider.'),
+};
+if ($worker === null) {
+    fwrite(STDOUT, "Background cognition is disabled by config/cognition.php.\n");
+    exit(0);
+}
 $nodeId = getenv('NAVI_BRAIN_NODE_ID');
 if (!is_string($nodeId) || trim($nodeId) === '') {
     $nodeId = gethostname() ?: 'local';
 }
 $owner = sprintf('%s:model-worker:%d', $nodeId, getmypid());
 $running = true;
+$lastIdleStatus = null;
 
 if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
     pcntl_async_signals(true);
@@ -27,22 +40,27 @@ if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
 while ($running) {
     $record = ['at' => time(), 'owner' => $owner];
     try {
-        $record['spark_worker'] = $sparkWorker->runOnce($owner);
+        $record['profile'] = $profile;
+        $record['worker'] = $worker->runOnce($owner);
         $record['ok'] = true;
     } catch (Throwable $throwable) {
         $record['ok'] = false;
         $record['error'] = $throwable->getMessage();
         $record['type'] = $throwable::class;
     }
-    fwrite(STDOUT, json_encode(
-        $record,
-        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-    ) . PHP_EOL);
-    fflush(STDOUT);
-
-    $status = $record['spark_worker']['status'] ?? null;
+    $status = $record['worker']['status'] ?? null;
+    $idle = in_array($status, ['idle', 'disabled', 'awaiting_review', 'unchanged_evidence', 'evidence_already_reviewed', 'publication_required', 'provider_busy', 'provider_cooling_down'], true);
+    if (!$idle || $status !== $lastIdleStatus) {
+        fwrite(STDOUT, json_encode(
+            $record,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+        ) . PHP_EOL);
+        fflush(STDOUT);
+    }
+    $lastIdleStatus = $idle ? $status : null;
     $pause = match ($status) {
-        'spark_model_unavailable', 'spark_model_cooling_down' => 10,
+        'spark_model_unavailable', 'spark_model_cooling_down', 'model_pool_unavailable', 'model_discovery_failed' => 30,
+        'disabled', 'awaiting_review', 'unchanged_evidence', 'evidence_already_reviewed', 'publication_required', 'provider_busy', 'provider_cooling_down' => 30,
         'idle' => 2,
         default => 1,
     };

@@ -555,13 +555,7 @@ final class TokenMemoryDaemon
 
     private static function probe(string $socketPath): bool
     {
-        $socket = @stream_socket_client(
-            'unix://' . $socketPath,
-            $errorNumber,
-            $errorMessage,
-            self::PROBE_TIMEOUT_SECONDS,
-            STREAM_CLIENT_CONNECT
-        );
+        $socket = self::connect($socketPath, $errorMessage, self::PROBE_TIMEOUT_SECONDS);
         if (!is_resource($socket)) {
             return false;
         }
@@ -655,15 +649,29 @@ final class TokenMemoryDaemon
     }
 
     /** @return resource|false */
-    private static function connect(string $socketPath, ?string &$errorMessage)
+    private static function connect(
+        string $socketPath,
+        ?string &$errorMessage,
+        float $timeout = self::IO_TIMEOUT_SECONDS
+    )
     {
-        return @stream_socket_client(
+        $socket = @stream_socket_client(
             'unix://' . $socketPath,
             $errorNumber,
             $errorMessage,
-            self::IO_TIMEOUT_SECONDS,
+            $timeout,
             STREAM_CLIENT_CONNECT
         );
+        // EPERM/EACCES describe this caller's access, not daemon liveness.
+        // Never wait on the store lock or try spawning a replacement for them.
+        if (!is_resource($socket) && in_array($errorNumber, [1, 13], true)) {
+            throw new RuntimeException(
+                'Token-memory socket access denied: ' . $errorMessage
+                . '. This process may be sandboxed; retry with approved local socket access.'
+                . ' The resident daemon has not been shown to be unhealthy.'
+            );
+        }
+        return $socket;
     }
 
     /** @param resource $stream */

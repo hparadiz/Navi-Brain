@@ -218,6 +218,7 @@ final class NarrativeSynthesis
                 'trigger_reason' => $reason,
                 'compile_protocol' => (string) ($compile['protocol'] ?? ''),
                 'evidence_checksum' => $checksum,
+                'synthesis_checksum' => hash('sha256', $prompt),
                 'evidence_bytes' => strlen($evidence),
                 'evidence_count' => $this->evidenceCount($workType, $compile),
             ], $additionalInputRefs),

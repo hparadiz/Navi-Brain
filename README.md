@@ -237,20 +237,44 @@ Only one high-brain cycle may run at once. Missed intervals are coalesced, not
 replayed. Cycle and work leases use monotonically increasing fencing tokens so
 late workers cannot commit after losing ownership.
 
-All model-backed background cognition runs through `gpt-5.3-codex-spark` using
-the existing ChatGPT-authenticated Codex CLI. Calls are ephemeral, read-only,
-tool- and web-disabled, schema-constrained, and have no local or OpenCode model
-fallback. Every queued job carries a bounded, checksummed projection of current
-sensory evidence, ranked motivation, active need pressure, and computed emotional
-appraisal. Memory consolidation deliberately excludes that live projection so
-unrelated state cannot leak into a factual claim.
+The default persistent profile in `config/cognition.php` is now
+`public-reflection`: one evidence-change-driven, proposal-only code-review lane
+pinned to `opencode/muse-spark-1.3-contributor-free`. It accepts only explicitly
+selected source files matching verified public-repository hashes, preserves their
+syntax, exposes no tools, and appends no personal memories or sensory state. A
+finished proposal requires explicit review before another job can run; unchanged
+evidence does not generate more work. The broad heartbeat/sensory/narrative loops
+are not enabled by this profile. See [the September cognition review](docs/cognition-review-2026-09.md).
+
+This Meta Contributor Free route may use prompts and completions for training;
+do not route private cognition through it without informed authorization.
+`codex-spark` remains an explicit legacy profile using the existing
+ChatGPT-authenticated CLI, not a fallback from the public pilot. `disabled` turns
+off the model-worker profile. Changing profiles requires restarting the worker.
+
+Narratives use their complete evidence compiles without unrelated live-state
+injection. Identical synthesis inputs reuse the latest queued, leased, or
+completed job across triggers; failed/cancelled work can be retried by a new
+trigger. Other legacy cognition jobs still carry their checksummed background
+state projection; this does not establish that old observations are fresh.
 
 The legacy manual `opencode:once` worker can still discover current
 `opencode/*-free` models and rank them
 by failures and observed latency, and applies exponential circuit-breaker
 cooldowns. A whole work item has one deadline and may try at most three models;
 failover does not multiply the budget. The isolated OpenCode configuration is in
-`config/opencode-worker/` and disables every tool.
+`config/opencode-worker/` and disables every tool. All `FreeModelWorker` instances
+in this checkout share one provider slot and a persisted cooldown. HTTP 429 honors
+`Retry-After` (seconds or date) plus exponential backoff, without trying another
+model/IP or rejecting the work's source evidence. This is local coordination, not
+a distributed account-quota service. The public pilot never falls back to another
+model. Manual `opencode:once` is broader and is not the public-only entry point.
+
+```sh
+./bin/navi-brain reflection:once --owner=manual
+./bin/navi-brain reflection:status --debug-json
+./bin/navi-brain reflection:review --work=<id> --verdict=useful --note='<checked evidence and limitations>'
+```
 
 ## Optional local model
 
@@ -287,9 +311,10 @@ The ceilings matter more than the speed:
   `pids.max 128`, and six CPUs. If the model ever exceeds them the kernel kills
   that service alone and the brain degrades rather than the workstation.
 
-Two OpenRC services run `bin/navi-brain-model-worker`. They use the same leases,
-fencing checks, Codex Spark endpoint, and deny-all structured-output contract.
-Reflective social labels are queued to these workers; the
+Two OpenRC service templates run `bin/navi-brain-model-worker`, which selects the
+explicit cognition profile. Only one service is needed for the public pilot;
+its provider slot also serializes manual OpenCode workers. In the legacy profile,
+reflective social labels are queued to the workers; the
 sensory daemon never calls an LLM and therefore keeps sampling while both model
 slots are busy.
 

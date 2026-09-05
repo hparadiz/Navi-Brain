@@ -288,6 +288,11 @@ final class Application
                 'opencode:once' => (new FreeModelWorker($this->core))->runOnce(
                     $this->string($options, 'owner')
                 ),
+                'reflection:once' => (new \NaviBrain\Core\PublicReflection($this->core))->runOnce($this->string($options, 'owner')),
+                'reflection:status' => (new \NaviBrain\Core\PublicReflection($this->core))->status(),
+                'reflection:review' => (new \NaviBrain\Core\PublicReflection($this->core))->review(
+                    $this->integer($options, 'work'), $this->string($options, 'verdict'), $this->string($options, 'note')
+                ),
                 'local:status' => $this->localModelStatus(),
                 'local:reset' => $this->core->resetLocalModelBackoff(
                     LocalModelWorker::MODEL_ID,
@@ -675,6 +680,9 @@ final class Application
                 'spark:once --owner',
                 'worker:once --owner',
                 'opencode:once --owner',
+                'reflection:once --owner',
+                'reflection:status',
+                'reflection:review --work --verdict=useful|rejected --note',
                 'local:status',
                 'local:reset --reason',
                 'local:once --owner',

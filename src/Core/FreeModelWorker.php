@@ -35,15 +35,49 @@ final class FreeModelWorker
     }
 
     /** @return array<string, mixed> */
-    public function runOnce(string $owner, array $includedWorkTypes = []): array
+    public function runOnce(
+        string $owner,
+        array $includedWorkTypes = [],
+        array $allowedModels = []
+    ): array
     {
+        foreach ($allowedModels as $model) {
+            if (!is_string($model) || preg_match('~\Aopencode/[a-z0-9][a-z0-9._-]*-free\z~', $model) !== 1) {
+                throw new RuntimeException('Pinned OpenCode workers require explicit opencode/*-free model IDs.');
+            }
+        }
         $this->ensureRuntimeDirectories();
+        $quota = new OpenCodeQuota($this->runtimeRoot);
+        try {
+            if (!$quota->acquire()) {
+                return ['status' => 'provider_busy'];
+            }
+            if ($quota->retryAt() > time()) {
+                return ['status' => 'provider_cooling_down', 'retry_at' => $quota->retryAt()];
+            }
+            return $this->runAvailable($owner, $includedWorkTypes, $allowedModels, $quota);
+        } finally {
+            $quota->release();
+        }
+    }
+
+    private function runAvailable(
+        string $owner,
+        array $includedWorkTypes,
+        array $allowedModels,
+        OpenCodeQuota $quota
+    ): array {
         try {
             $this->refreshModelsWhenDue();
         } catch (\Throwable $throwable) {
             return ['status' => 'model_discovery_failed', 'error' => $throwable->getMessage()];
         }
-        if ($this->core->selectableFreeModels() === []) {
+        $models = $this->core->selectableFreeModels();
+        if ($allowedModels !== []) {
+            $models = array_values(array_intersect($allowedModels, $models));
+        }
+        $models = array_slice($models, 0, self::MAX_MODELS_PER_WORK);
+        if ($models === []) {
             return ['status' => 'model_pool_unavailable'];
         }
         $claimed = $this->core->claimWork(
@@ -58,7 +92,6 @@ final class FreeModelWorker
 
         $work = $claimed['work_item'];
         $errors = [];
-        $models = array_slice($this->core->selectableFreeModels(), 0, self::MAX_MODELS_PER_WORK);
         $deadline = microtime(true) + max(1, (int) $work['wall_budget_seconds']);
         foreach ($models as $index => $modelId) {
             $remaining = (int) floor($deadline - microtime(true));
@@ -71,7 +104,6 @@ final class FreeModelWorker
             try {
                 $invocation = $this->invokeModel($work, $modelId, $attemptWall);
                 $latency = (int) round((hrtime(true) - $started) / 1_000_000);
-                $this->recordModelResultBestEffort($modelId, true, $latency);
                 $finished = $this->finishWorkWithRetry(
                     workId: (int) $work['id'],
                     owner: $owner,
@@ -80,6 +112,13 @@ final class FreeModelWorker
                     result: $invocation['proposal'],
                     model: $modelId
                 );
+                $this->recordModelResultBestEffort($modelId, true, $latency);
+                try {
+                    $quota->succeeded();
+                } catch (\Throwable) {
+                    // Failure to clear an expired brake is conservative; it
+                    // must not replay or fail already-committed work.
+                }
                 try {
                     $integration = $this->core->integrateWorkerResult(
                         $work,
@@ -102,6 +141,12 @@ final class FreeModelWorker
                     'result' => $finished,
                     'integration' => $integration,
                 ];
+            } catch (ModelRateLimit $limited) {
+                // All local OpenCode lanes share this brake. Do not try a
+                // second model or reject the source evidence because of 429.
+                $retryAt = $quota->rateLimited($limited->retryAt);
+                $this->core->deferWork((int) $work['id'], $owner, (int) $work['fencing_token'], $retryAt);
+                return ['status' => 'provider_cooling_down', 'retry_at' => $retryAt, 'work_id' => $work['id']];
             } catch (\Throwable $throwable) {
                 $latency = (int) round((hrtime(true) - $started) / 1_000_000);
                 $errors[$modelId] = $throwable->getMessage();
@@ -185,7 +230,7 @@ final class FreeModelWorker
     {
         $this->ensureRuntimeDirectories();
         $result = $this->runProcess(
-            ['/usr/bin/timeout', '--signal=TERM', '--kill-after=5s', '60s', $this->opencodeBinary, 'models'],
+            ['/usr/bin/timeout', '--signal=TERM', '--kill-after=5s', '60s', $this->opencodeBinary, 'models', 'opencode', '--refresh'],
             '',
             70
         );
@@ -195,7 +240,7 @@ final class FreeModelWorker
         $models = array_values(array_filter(array_map(
             'trim',
             preg_split('/\R/u', $result['output']) ?: []
-        ), static fn (string $model): bool => str_ends_with($model, '-free')));
+        ), static fn (string $model): bool => preg_match('~\Aopencode/[a-z0-9][a-z0-9._-]*-free\z~', $model) === 1));
         $this->core->syncFreeModels($models);
         return $models;
     }
@@ -205,6 +250,9 @@ final class FreeModelWorker
         $models = $this->core->listModelEndpoints();
         $latest = 0;
         foreach ($models as $model) {
+            if (!str_starts_with((string) ($model['model_id'] ?? ''), 'opencode/')) {
+                continue;
+            }
             $value = $model['last_discovered_at'] ?? null;
             $timestamp = is_int($value) ? $value : (is_string($value) ? strtotime($value) : false);
             if ($timestamp !== false && $timestamp !== null) {
@@ -225,7 +273,8 @@ final class FreeModelWorker
      */
     private function invokeModel(array $work, string $modelId, int $wall): array
     {
-        $prompt = PlainText::sanitize((string) $work['prompt'])
+        $prompt = ($work['work_type'] === PublicReflection::WORK_TYPE
+                ? (string) $work['prompt'] : PlainText::sanitize((string) $work['prompt']))
             . "\n\nRequired response fields:\n"
             . PlainText::render($this->workerSchema((string) $work['work_type']), 5000, 20);
         $wall = max(1, min(3600, $wall));
@@ -249,6 +298,9 @@ final class FreeModelWorker
             '--title',
             $title,
         ], $prompt, $wall + 15);
+        // Error events can be emitted with either exit status. Inspect them
+        // before a generic exit-code error discards status and Retry-After.
+        $this->checkStreamErrors($result['output']);
         if ($result['exit_code'] !== 0) {
             throw new RuntimeException(sprintf(
                 'OpenCode worker exited %d: %s',
@@ -262,6 +314,14 @@ final class FreeModelWorker
     /** @return array<string, string> */
     private function workerSchema(string $workType): array
     {
+        if ($workType === PublicReflection::WORK_TYPE) {
+            return [
+                'kind' => PublicReflection::WORK_TYPE,
+                'content' => 'one code finding with an exact source quote and a falsifiable check, or the specific missing evidence',
+                'confidence' => 'number from 0 through 1 for support in the supplied code, not runtime verification',
+                'challenged_assumption' => 'the specific assumption challenged by this finding',
+            ];
+        }
         if ($workType === DecisionStateMachine::WORK_TYPE) {
             return [
                 'kind' => 'decision_candidates',
@@ -338,9 +398,36 @@ final class FreeModelWorker
         ];
     }
 
+    private function checkStreamErrors(string $output): void
+    {
+        foreach (preg_split('/\R/u', trim($output)) ?: [] as $line) {
+            $event = json_decode($line, true);
+            if (!is_array($event)) {
+                continue;
+            }
+            if (($event['type'] ?? '') === 'tool_use') {
+                throw new RuntimeException('Deny-all worker emitted a forbidden tool event.');
+            }
+            if (($event['type'] ?? '') !== 'error') {
+                continue;
+            }
+            $data = $event['error']['data'] ?? [];
+            if (($data['statusCode'] ?? null) === 429) {
+                throw new ModelRateLimit(is_array($data['responseHeaders'] ?? null) ? $data['responseHeaders'] : []);
+            }
+            // Do not copy response bodies/headers, which can contain credentials.
+            throw new RuntimeException(sprintf('OpenCode %s (HTTP %s): %s',
+                (string) ($event['error']['name'] ?? 'error'),
+                (string) ($data['statusCode'] ?? 'unknown'),
+                (string) ($data['message'] ?? 'No provider error message.')
+            ));
+        }
+    }
+
     /** @return array{proposal: array<string, mixed>, session_id?: string} */
     private function parseWorkerStream(string $output, string $workType): array
     {
+        $this->checkStreamErrors($output);
         $sessionId = null;
         $finalText = null;
         $stopped = false;
@@ -364,9 +451,6 @@ final class FreeModelWorker
                 $sessionId = $currentSession;
             }
             $type = $event['type'] ?? null;
-            if ($type === 'tool_use' || $type === 'error') {
-                throw new RuntimeException('Deny-all worker emitted a forbidden tool or error event.');
-            }
             if ($type === 'text' && is_string($event['part']['text'] ?? null)) {
                 $finalText = $event['part']['text'];
             }

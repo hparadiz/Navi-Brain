@@ -6361,7 +6361,10 @@ final class ExecutiveCore
         // model's claim even though its episode ID is absent from the batch.
         $evidenceFenced = in_array($workType, [
             self::MEMORY_CONSOLIDATION_WORK_TYPE,
+            NarrativeSynthesis::PERSONALITY_WORK_TYPE,
+            NarrativeSynthesis::MOTIVATION_WORK_TYPE,
             NarrativeSynthesis::INTENTION_WORK_TYPE,
+            PublicReflection::WORK_TYPE,
         ], true);
         $workingContext = $evidenceFenced
             ? []
@@ -6406,7 +6409,10 @@ final class ExecutiveCore
                 'emotional_state',
             ];
         }
-        $prompt = PlainText::sanitize($prompt);
+        // Source-code evidence must survive byte-for-byte, including syntax.
+        if ($workType !== PublicReflection::WORK_TYPE) {
+            $prompt = PlainText::sanitize($prompt);
+        }
 
         return $this->transaction(function () use (
             $parentRunId,
@@ -6424,6 +6430,21 @@ final class ExecutiveCore
             $existing = WorkItem::getByField('idempotency_key', $idempotencyKey);
             if ($existing instanceof WorkItem) {
                 return ['work_item' => $existing->getData(), 'deduplicated' => true];
+            }
+
+            // A clock tick or manual nonce is not new evidence. Keep the trigger
+            // key for exact retries, but reuse the latest identical synthesis.
+            // Failed/cancelled work may be retried by a new trigger; a changed
+            // synthesis prompt also creates new work. This check and insertion
+            // share the queue transaction, not a racy producer-side preflight.
+            if (NarrativeSynthesis::isWorkType($workType)
+                && is_string($inputRefs['synthesis_checksum'] ?? null)) {
+                $latest = WorkItem::getByWhere(['work_type' => $workType], ['order' => ['id' => 'DESC']]);
+                if ($latest instanceof WorkItem
+                    && in_array($latest->status, ['queued', 'leased', 'completed'], true)
+                    && ($latest->input_refs['synthesis_checksum'] ?? null) === $inputRefs['synthesis_checksum']) {
+                    return ['work_item' => $latest->getData(), 'deduplicated' => true];
+                }
             }
 
             /** @var WorkItem $work */
@@ -6556,6 +6577,26 @@ final class ExecutiveCore
         });
     }
 
+    /** Transport backoff is not a rejected proposal or rejected source evidence. */
+    public function deferWork(int $workId, string $owner, int $fencingToken, int $retryAt): void
+    {
+        $this->transaction(function () use ($workId, $owner, $fencingToken, $retryAt): void {
+            $work = WorkItem::getByID($workId);
+            if (!$work instanceof WorkItem || $work->status !== 'leased'
+                || $work->lease_owner !== $owner || (int) $work->fencing_token !== $fencingToken
+                || ($this->timestamp($work->lease_expires_at) ?? 0) < time()) {
+                throw new RuntimeException('Worker lease is stale; deferral was rejected by the fencing check.');
+            }
+            // Existing lease recovery requeues this work at retryAt, with a new
+            // fence on the next claim. No failed-work curator runs here.
+            $retryAt = max(time() + 1, $retryAt);
+            $work->setFields(['lease_expires_at' => $retryAt, 'updated_at' => time()]);
+            $work->save();
+            $this->extendParentRhythmLease($work, $retryAt + 30);
+            $this->emit('work.rate_limited', ['work_item_id' => $workId, 'retry_at' => $retryAt]);
+        });
+    }
+
     /** @return list<array<string, mixed>> */
     public function listWorkItems(?string $status = null): array
     {
@@ -6669,6 +6710,7 @@ final class ExecutiveCore
                     NarrativeSynthesis::PERSONALITY_WORK_TYPE,
                     NarrativeSynthesis::MOTIVATION_WORK_TYPE,
                     NarrativeSynthesis::INTENTION_WORK_TYPE,
+                    PublicReflection::WORK_TYPE,
                 ], true)) {
                     $workingProjection = [
                         'role' => 'reasoning_result',
@@ -7229,7 +7271,7 @@ final class ExecutiveCore
         $normalized = array_values(array_unique(array_filter(array_map(
             static fn (mixed $model): string => is_string($model) ? trim($model) : '',
             $modelIds
-        ), static fn (string $model): bool => $model !== '' && str_ends_with($model, '-free'))));
+        ), static fn (string $model): bool => preg_match('~\Aopencode/[a-z0-9][a-z0-9._-]*-free\z~', $model) === 1)));
 
         return $this->transaction(function () use ($normalized): array {
             $now = time();
@@ -7247,7 +7289,12 @@ final class ExecutiveCore
                         'updated_at' => $now,
                     ]);
                 } else {
-                    $endpoint->setFields(['last_discovered_at' => $now, 'updated_at' => $now]);
+                    $fields = ['last_discovered_at' => $now, 'updated_at' => $now];
+                    if ($endpoint->last_error === 'Model disappeared from the latest free-model catalogue.') {
+                        $fields['status'] = 'discovered';
+                        $fields['last_error'] = null;
+                    }
+                    $endpoint->setFields($fields);
                     $endpoint->save();
                 }
             }
@@ -7264,6 +7311,9 @@ final class ExecutiveCore
                 if (!in_array($endpoint->model_id, $normalized, true)) {
                     $endpoint->setFields([
                         'status' => 'unavailable',
+                        // An old failure cooldown must not make a removed
+                        // model selectable again when that cooldown expires.
+                        'cooldown_until' => null,
                         'updated_at' => $now,
                         'last_error' => 'Model disappeared from the latest free-model catalogue.',
                     ]);
@@ -7295,7 +7345,7 @@ final class ExecutiveCore
             ModelEndpoint::getAll(),
             function (ModelEndpoint $endpoint) use ($now): bool {
                 // Only remote catalogue models are dispatchable through OpenCode.
-                if (!str_ends_with((string) $endpoint->model_id, '-free')) {
+                if (preg_match('~\Aopencode/[a-z0-9][a-z0-9._-]*-free\z~', (string) $endpoint->model_id) !== 1) {
                     return false;
                 }
                 $cooldown = $this->timestamp($endpoint->cooldown_until);
@@ -12270,6 +12320,9 @@ final class ExecutiveCore
     /** @param array<string, mixed> $result */
     private function validateWorkerProposal(array $result, ?string $workType = null): void
     {
+        if ($workType === PublicReflection::WORK_TYPE && ($result['kind'] ?? '') !== $workType) {
+            throw new InvalidArgumentException('Public reflection returned an unrelated proposal kind.');
+        }
         $consolidation = $workType === self::MEMORY_CONSOLIDATION_WORK_TYPE;
         $required = ['kind', 'content', 'confidence', 'challenged_assumption'];
         if ($consolidation) {
