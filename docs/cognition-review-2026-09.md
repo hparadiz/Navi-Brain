@@ -36,7 +36,7 @@ accidental request and is out of scope.
   limit meaning, serializes local requests, persists provider-wide backoff, and
   defers fenced work without calling failed-proposal/consolidation rejection.
 
-## Enabled profile and privacy boundary
+## Configured profile and privacy boundary
 
 `config/cognition.php` selects `public-reflection`, pinned to
 `opencode/muse-spark-1.3-contributor-free`. No paid/local/other-model fallback.
@@ -83,12 +83,29 @@ model service.
 - A separate local quota check verified mutual exclusion, persistence of a
   two-hour cooldown, numeric/date/invalid Retry-After handling, 429 classification,
   and preservation of valid structured proposal content.
+- One hundred local guarded idle passes took 29.8 ms total (0.30 ms/pass).
+  This measures the new pilot gate, not a full legacy heartbeat or inference.
+- The exact persistent-worker entry point was exercised in a 50-second
+  foreground run: its Meta job completed in 30.7 seconds and it then waited for
+  review. That finding repeated the already-fixed issue without the queue
+  implementation in view; it was rejected as non-actionable. The next manual
+  pass returned `unchanged_evidence` with no model call. The foreground run exited
+  at its deliberate timeout and left no unmanaged worker behind.
+- Earlier TTS episodes were recovered through their original idempotency keys,
+  and stale operational self-model claims were corrected. Memory receipts must
+  match every original input, including confidence, not just key and content.
 
 The work ledger's token budget is not a proven provider-side output-token ceiling
 in the OpenCode CLI path. Source input is not character-truncated. Existing wall
 deadlines and transport resource guards still apply.
 
 ## Operations and remaining boundaries
+
+Persistent OpenRC startup is still pending operator authentication: attempting
+`sudo -n rc-service navi-brain-model-worker start` returned `a password is
+required`. The service remains stopped; the successful foreground verification
+does not mean it is running continuously. Run
+`sudo rc-service navi-brain-model-worker start` locally to enable it.
 
 Use `reflection:status --debug-json` for deliberate diagnostics and
 `reflection:review --work=<id> --verdict=useful|rejected --note='<evidence>'` to

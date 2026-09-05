@@ -12,10 +12,12 @@ final class PublicReflection
 {
     public const WORK_TYPE = 'public_cognitive_reflection';
     private ExecutiveCore $core;
+    private FreeModelWorker $worker;
 
     public function __construct(ExecutiveCore $core)
     {
         $this->core = $core;
+        $this->worker = new FreeModelWorker($core);
     }
 
     public function runOnce(string $owner): array
@@ -32,7 +34,7 @@ final class PublicReflection
                 return ['status' => 'awaiting_review', 'work_id' => (int) $latest->id];
             }
             if (in_array($latest->status, ['queued', 'leased'], true)) {
-                return (new FreeModelWorker($this->core))->runOnce(
+                return $this->worker->runOnce(
                     $owner, [self::WORK_TYPE], [$config['model']]
                 );
             }
@@ -89,7 +91,7 @@ final class PublicReflection
             && !in_array($queued['work_item']['status'] ?? '', ['queued', 'leased'], true)) {
             return ['status' => 'evidence_already_reviewed', 'work_id' => $queued['work_item']['id']];
         }
-        return (new FreeModelWorker($this->core))->runOnce(
+        return $this->worker->runOnce(
             $owner, [self::WORK_TYPE], [$config['model']]
         );
     }

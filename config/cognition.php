@@ -8,10 +8,10 @@ return [
     'model' => 'opencode/muse-spark-1.3-contributor-free',
     'sources' => [
         'src/Core/BackgroundStateCompiler.php' => '44d73ab06c0bc8a2ea25ea8b86f37c938bc6918c9aaba55f1d8f3860ef2afb31',
-        'src/Core/NarrativeSynthesis.php' => '4704c1985178179f3f2b47c41abd84e3c713379139eabacf07dee384a0bc7d74',
+        'src/Core/NarrativeSynthesis.php' => '3fd7e0d4d330660aa1be710bed593ce140ebf2d48eede2e08e1f91ab458a4dc6',
     ],
     // Hashes independently matched unauthenticated public GitHub downloads.
-    'public_revision' => 'https://github.com/hparadiz/Navi-Brain/tree/5de17b11ab550ed7a5a519a081d7fadc00874171',
+    'public_revision' => 'https://github.com/hparadiz/Navi-Brain/tree/bea0064f80d32e9845395d285efdd2de4a3e762e',
     'question' => 'Can unchanged or stale evidence repeatedly produce new-looking cognition? '
         . 'Identify one concrete failure in the supplied implementation, quote the relevant code, '
         . 'explain the causal path, and propose a falsifiable verification. '
