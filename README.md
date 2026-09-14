@@ -11,6 +11,10 @@ changes lazily, and flushes dirty state on close. The protocol and migration
 boundary are documented in [`memories/README.md`](memories/README.md) and
 [`memories/ARCHITECTURE.md`](memories/ARCHITECTURE.md).
 
+PHP executive behavior lives in the [`ExecutiveCore` namespace](src/Core/ExecutiveCore/),
+with `Executive.php` coordinating its components. Application records use
+Divergence models; the resident C core owns memory storage and recall.
+
 The project is informed by the literature in the
 [paper manifest](assets/papers/MANIFEST.md)
 and the synthesis in
@@ -99,33 +103,90 @@ This is functional cognitive infrastructure, not a consciousness claim.
 
 Composer resolves `divergence/divergence` from the sibling local checkout at
 `../../Divergence/framework`. The dependency is intentionally symlinked so this
-project exercises Akujin's current Divergence v3 worktree instead of silently
-substituting an unrelated package release.
+project uses that Divergence v3 worktree directly. Set up the framework checkout
+before running `composer install`.
 
-## Usage
+## Local configuration
 
-The default database is `var/navi-brain.sqlite`. Override it with
-`NAVI_BRAIN_DB=/absolute/path.sqlite`.
+Copy [`.env.example`](.env.example) to `.env` on a fresh checkout. Identity and
+replication settings read this file; exported process environment values take
+precedence. `.env` is ignored by Git.
 
-Copy `.env.example` to `.env` to set `Name` (default `Navi`), `NAVI_USER_NAME`, and
-`NAVI_USER_NAME_PRONUNCIATION`. The user name defaults to `User`; an empty
-pronunciation uses the name. Process environment values override `.env`.
-The local `.env` file is ignored by Git.
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `Name` | `Navi` | Name used in generated prompts, session context, and display text. |
+| `PronounSubject` | `she` | Subject pronoun. |
+| `PronounObject` | `her` | Object pronoun. |
+| `PronounReflexive` | `herself` | Reflexive pronoun. |
+| `NAVI_USER_NAME` | `User` | Name of the user. |
+| `NAVI_USER_NAME_PRONUNCIATION` | Empty | Alternate pronunciation; an empty value uses the user name. |
 
-Set `PronounSubject`, `PronounObject`, and `PronounReflexive` in `.env` to
-configure pronouns. They default to `she`, `her`, and `herself`. For example,
-`they`, `them`, and `themselves` also produce the matching `they are` wording.
+For example, the default identity settings are:
 
-Replication uses `NAVI_REPLICATION_REMOTE_HOST` and
-`NAVI_REPLICATION_REMOTE_DIR` from `.env` or the process environment, with no
-default destination. `NAVI_REPLICATION_LOCAL_DIR` defaults to this checkout.
-Set `NAVI_REPLICATION_QUIESCE_HELPER` to the executable described in the
-[replication instructions](docs/token-memory-cutover.md#mesh-replication).
+```dotenv
+Name="Navi"
+PronounSubject="she"
+PronounObject="her"
+PronounReflexive="herself"
+NAVI_USER_NAME="User"
+NAVI_USER_NAME_PRONUNCIATION=""
+```
+
+Set all three pronoun forms together. `they`, `them`, and `themselves` also
+produce the matching `they are` wording. Restart running processes after
+changing identity settings. New output uses the configured values; stored
+memories retain their existing wording. Command names, MCP tool identifiers
+such as `remember_navi`, and storage filenames stay stable.
+
+Replication has no default remote destination:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `NAVI_REPLICATION_LOCAL_DIR` | This checkout | Local repository and default state location. |
+| `NAVI_REPLICATION_REMOTE_HOST` | Empty | Required SSH destination for `bin/replicate`. |
+| `NAVI_REPLICATION_REMOTE_DIR` | Empty | Required absolute repository path on the remote host. |
+| `NAVI_REPLICATION_QUIESCE_HELPER` | Empty | Required absolute path to the executable that stops and resumes application memory writers. |
+
+See the [replication instructions](docs/token-memory-cutover.md#mesh-replication)
+for the helper contract and backup transfer procedure.
+
+The application database defaults to `var/navi-brain.sqlite`, and the native
+memory store defaults to `memories/store`. Export `NAVI_BRAIN_DB` and
+`NAVI_TOKEN_MEMORY_STORE` to override these paths for CLI/MCP processes. Other
+runtime settings also use the process environment; `.env` is not a general
+shell environment loader. `bin/replicate` additionally reads its database and
+store path overrides from `.env`.
+
+## Fresh checkout and usage
+
+A fresh clone contains no stored memories, learned personality narratives,
+intentions, or captured session history. The application database, native
+memory store, session captures, and local `.env` are excluded from Git.
+Initialization creates the schema and operational defaults, including needs,
+rhythms, model registration, and a baseline metrics record. Default prompt
+wording and behavior still come from the source code.
+
+For a new checkout with no existing memory store, build the C core and
+initialize both stores. The C build requires a C17 compiler, SQLite development
+headers, and pthreads. PHP dependencies are declared in `composer.json`.
 
 ```bash
+cp .env.example .env
 composer install
+make -C memories
+./memories/build/tokmem init ./memories/store
 ./bin/navi-brain init
+./bin/navi-brain recall:init
+./bin/navi-brain status
+```
 
+`recall:init` starts the resident memory daemon. Heartbeat, model-worker, and
+sensory services are installed and started separately; they are optional for
+using the memory CLI and MCP. For an existing brain, use the
+[backup and restore instructions](docs/token-memory-cutover.md#restore-and-rollback)
+to preserve its state.
+
+```bash
 ./bin/navi-brain intention:add \
   --title="Build the executive spine" \
   --reason="Preserve task continuity" \
