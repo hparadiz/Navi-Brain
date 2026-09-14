@@ -4,42 +4,55 @@ declare(strict_types=1);
 
 namespace NaviBrain\Perception;
 
-use RuntimeException;
-
 /**
- * Looking at the machine, as a sense.
- *
- * Navi can inspect the machine on Navi's own initiative rather than waiting for
- * a sampler someone wrote in advance. The result is a reading like any other:
- * it goes through the cortex, senses fire on it, and an unchanged result stops
- * being interesting exactly the way a repeated sensor value does.
- *
- * Nothing is executed here. This class opens a unix socket and asks the
- * navi-senses service, which runs as its own account holding no write
- * permission, to look at something and say what it saw. The privilege boundary
- * is the process boundary: the brain cannot run a command even if it wanted to,
- * because the code that runs commands lives on the other side of the socket in
- * a process that cannot write anything.
- *
- * That arrangement is why there is no list of forbidden commands in this file.
- * A list has to anticipate every spelling of a destructive command and is wrong
- * the first time it misses one. An account without the permission simply fails,
- * and the failure is itself a reading worth having.
- *
- * The authority split the codebase already runs on lines up exactly: a source
- * is the user's to grant and carries an effect ceiling, while senses over it
- * are Navi's to invent, and inventing one "changes what Navi notices; it can
- * never change what Navi can reach".
+ * Requests named, bounded kernel observations from the unprivileged service.
+ * The service enforces a fixed-file contract: no caller-selected path, argv,
+ * shell or network operation. Account separation alone is not a read-only
+ * sandbox. The legacy command argument now selects an installed observation.
  */
 final class CommandSense
 {
+    public const PROTOCOL = 'navi-observation-v1';
     private const SOCKET_PATH = '/run/navi-senses/navi-senses.sock';
-    /** Generous: the service enforces its own shorter ceiling per command. */
+    /** Bound waiting for the service; observations themselves use bounded reads. */
     private const TIMEOUT_SECONDS = 15;
     private const MAX_RESPONSE_BYTES = 65536;
 
-    public function __construct(private readonly string $socketPath = self::SOCKET_PATH)
+    private readonly string $socketPath;
+
+    public function __construct(string $socketPath = self::SOCKET_PATH)
     {
+        $this->socketPath = $socketPath;
+    }
+
+    /** @return array<string, string> */
+    public static function operations(): array
+    {
+        return [
+            'system.summary' => 'Bounded uptime, load, memory and kernel facts.',
+            'system.uptime' => 'Kernel uptime and idle time from /proc/uptime.',
+            'system.load' => 'Load averages and runnable task counts from /proc/loadavg.',
+            'system.memory' => 'Memory counters from /proc/meminfo.',
+            'system.cpu' => 'Bounded processor information from /proc/cpuinfo.',
+            'system.kernel' => 'Kernel version from /proc/version.',
+        ];
+    }
+
+    public static function resolveOperation(string $command): ?string
+    {
+        $command = trim($command);
+        if (isset(self::operations()[$command])) {
+            return $command;
+        }
+        // Exact compatibility aliases, not a parser for arbitrary commands.
+        return match ($command) {
+            'cat /proc/uptime' => 'system.uptime',
+            'cat /proc/loadavg' => 'system.load',
+            'cat /proc/meminfo' => 'system.memory',
+            'cat /proc/cpuinfo' => 'system.cpu',
+            'cat /proc/version' => 'system.kernel',
+            default => null,
+        };
     }
 
     /** Is the looking service reachable right now? */
@@ -68,8 +81,10 @@ final class CommandSense
     public function observe(string $command): array
     {
         $command = trim($command);
-        if ($command === '') {
-            return $this->unavailable('', 'an empty command');
+        $operation = self::resolveOperation($command);
+        if ($operation === null) {
+            return $this->unavailable($command, 'Unsupported observation. Choose one of: '
+                . implode(', ', array_keys(self::operations())) . '. Arbitrary commands and paths are not supported.');
         }
 
         $socket = @stream_socket_client(
@@ -87,8 +102,11 @@ final class CommandSense
 
         try {
             stream_set_timeout($socket, self::TIMEOUT_SECONDS);
-            $payload = json_encode(['command' => $command], JSON_UNESCAPED_SLASHES) . "\n";
-            if (@fwrite($socket, $payload) === false) {
+            $payload = json_encode([
+                'protocol' => self::PROTOCOL,
+                'operation' => $operation,
+            ], JSON_UNESCAPED_SLASHES) . "\n";
+            if (@fwrite($socket, $payload) !== strlen($payload)) {
                 return $this->unavailable($command, 'the looking service closed the connection');
             }
             $response = (string) @stream_get_line($socket, self::MAX_RESPONSE_BYTES, "\n");
@@ -99,6 +117,12 @@ final class CommandSense
         $decoded = json_decode($response, true);
         if (!is_array($decoded)) {
             return $this->unavailable($command, 'the looking service returned something unreadable');
+        }
+        if (($decoded['protocol'] ?? null) !== self::PROTOCOL
+            || ($decoded['operation'] ?? null) !== $operation
+            || ($decoded['effect_contract'] ?? null) !== 'fixed_kernel_files_v1'
+        ) {
+            return $this->unavailable($command, 'The looking service does not confirm the fixed-file observation contract.');
         }
         $decoded['command'] = $command;
         return $decoded;

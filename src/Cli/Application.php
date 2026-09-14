@@ -10,6 +10,7 @@ use NaviBrain\Core\CodexSparkWorker;
 use NaviBrain\Core\ExecutiveCore;
 use NaviBrain\Core\FreeModelWorker;
 use NaviBrain\Core\IntentionCompiler;
+use NaviBrain\Core\IntentionTtyAgent;
 use NaviBrain\Core\LocalModelClient;
 use NaviBrain\Core\LocalModelWorker;
 use NaviBrain\Core\MotivationCompiler;
@@ -33,15 +34,37 @@ final class Application
         try {
             $options = $this->parseOptions($argv);
             unset($options['debug-json']);
-            $this->core = new ExecutiveCore();
-            $schema = $this->core->initialize();
+            $nativeCommand = in_array($command, ['help', '--help', '-h', 'recall:init', 'recall', 'memory:search'], true)
+                || ($command === 'status' && !$debugJson);
+            if ($command === 'memory:search' && ($this->integer($options, 'limit', 20) < 1
+                || $this->integer($options, 'limit', 20) > 100)) {
+                throw new InvalidArgumentException('limit must be between 1 and 100.');
+            }
+            if ($command === 'recall:init') {
+                TokenMemoryDaemon::ensureRunning();
+            }
+            if (!$nativeCommand) {
+                require dirname(__DIR__, 2) . '/bootstrap/app.php';
+                $this->core = new ExecutiveCore();
+                $schema = $this->core->initialize();
+            }
 
             $result = match ($command) {
                 'help', '--help', '-h' => $this->help(),
                 'init' => $schema,
+                'recall:init' => ['daemon' => 'ready'],
                 'event:list' => $this->core->listEvents($this->integer($options, 'limit', 50)),
                 'intention:add' => $this->addIntention($options),
                 'intention:list' => $this->core->listIntentions($this->optionalString($options, 'status')),
+                'intention:agent:context' => ['context' => (new IntentionTtyAgent())->context($this->integer($options, 'id'))],
+                'intention:agent:start' => (new IntentionTtyAgent())->start(
+                    $this->integer($options, 'id'), $this->string($options, 'workspace')
+                ),
+                'intention:agent:status' => isset($options['id'])
+                    ? (new IntentionTtyAgent())->status($this->integer($options, 'id'))
+                    : (new IntentionTtyAgent())->list(),
+                'intention:agent:stop' => (new IntentionTtyAgent())->stop($this->integer($options, 'id')),
+                'intention:agent:attach' => ['exit_code' => (new IntentionTtyAgent())->attach($this->integer($options, 'id'))],
                 'intention:advance' => $this->core->advanceIntention(
                     $this->integer($options, 'id'),
                     $this->string($options, 'next-action'),
@@ -99,6 +122,7 @@ final class Application
                     $this->integer($options, 'limit', 20)
                 ),
                 'decision:show' => $this->core->showDecisionCycle($this->integer($options, 'id')),
+                'decision:recover' => $this->core->recoverDecisionIntegrations($this->integer($options, 'limit', 16)),
                 'decision:compare' => $this->core->compareDecisionModels(
                     $this->integer($options, 'limit', 200)
                 ),
@@ -127,7 +151,11 @@ final class Application
                     $this->integer($options, 'limit', 500)
                 ),
                 'memory:add' => $this->addMemory($options),
-                'memory:search' => $this->core->searchMemory(
+                'recall' => TokenMemoryDaemon::activate(
+                    $this->string($options, 'query'),
+                    $this->integer($options, 'token-budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS)
+                ),
+                'memory:search' => TokenMemoryDaemon::recall(
                     $this->string($options, 'query'),
                     $this->integer($options, 'limit', 20)
                 ),
@@ -147,6 +175,9 @@ final class Application
                     $this->number($options, 'confidence')
                 ),
                 'memory:consolidation:status' => $this->core->consolidationStatus(),
+                'memory:consolidation:reuse' => $this->core->reuseConsolidationEvidence(
+                    $this->flag($options, 'apply')
+                ),
                 'memory:consolidation:pump' => $this->core->maintainConsolidationQueue(
                     $this->integer($options, 'depth', 2)
                 ),
@@ -253,6 +284,9 @@ final class Application
                     $this->integer($options, 'limit', 10),
                     $this->optionalString($options, 'scope')
                 ),
+                'control:status' => $this->core->cognitionControl(),
+                'control:pause' => $this->core->pauseCognition($this->string($options, 'reason')),
+                'control:resume' => $this->core->resumeCognition($this->integer($options, 'pause-event')),
                 'interrupt:raise' => $this->core->raiseInterrupt(
                     $this->string($options, 'reason'),
                     $this->optionalString($options, 'severity') ?? 'high',
@@ -309,6 +343,34 @@ final class Application
                     $this->string($options, 'evidence')
                 ),
                 'self:list' => $this->core->listSelfModelFacts(),
+                'value:list' => $this->core->listValues(),
+                'value:set' => $this->core->setValue(
+                    $this->string($options, 'key'),
+                    $this->string($options, 'statement'),
+                    $this->string($options, 'rationale'),
+                    $this->number($options, 'weight'),
+                    $this->optionalString($options, 'status') ?? 'active',
+                    $this->integer($options, 'review-interval-hours', 168),
+                    $this->optionalString($options, 'authority') ?? 'agent'
+                ),
+                'value:appraise' => $this->core->appraiseValue(
+                    $this->string($options, 'key'),
+                    $this->number($options, 'alignment'),
+                    $this->string($options, 'evidence'),
+                    $this->string($options, 'source'),
+                    $this->optionalInteger($options, 'event'),
+                    $this->optionalInteger($options, 'intention')
+                ),
+                'value:review' => $this->core->reviewValuesDue(),
+                'value:reviewed' => $this->core->markValueReviewed($this->string($options, 'key')),
+                'value:revise' => $this->core->reviseValue(
+                    $this->string($options, 'key'),
+                    $this->string($options, 'statement'),
+                    $this->number($options, 'weight'),
+                    $this->string($options, 'basis'),
+                    $this->string($options, 'reason'),
+                    $this->optionalString($options, 'authority') ?? 'agent'
+                ),
                 'appraise' => $this->appraise($options),
                 'checkpoint' => $this->core->checkpoint($this->string($options, 'reason')),
                 'status' => $debugJson
@@ -316,7 +378,7 @@ final class Application
                         ['primary_intention' => $this->optionalString($options, 'active-intention')],
                         $this->core->status()
                     )
-                    : $this->core->contextStatus(
+                    : TokenMemoryDaemon::activate(
                         $this->string($options, 'active-intention'),
                         $this->integer(
                             $options,
@@ -383,7 +445,8 @@ final class Application
             sourceMemoryId: $this->optionalInteger($options, 'source-memory'),
             supersedesId: $this->optionalInteger($options, 'supersedes'),
             expiresAt: $this->optionalString($options, 'expires'),
-            allowProceduralWrite: $this->flag($options, 'allow-procedural-write')
+            allowProceduralWrite: $this->flag($options, 'allow-procedural-write'),
+            sourceEventKind: $this->optionalString($options, 'source-event-kind') ?? 'event'
         );
     }
 
@@ -603,6 +666,11 @@ final class Application
                 'event:list [--limit=50]',
                 'intention:add --title --reason --authority --next-action --success --release [--dependencies=1,2] [--parent=1]',
                 'intention:list [--status=active]',
+                'intention:agent:context --id (preview; no inference)',
+                'intention:agent:start --id --workspace (start/resume OpenCode in a detached Screen terminal)',
+                'intention:agent:status [--id]',
+                'intention:agent:attach --id (interactive terminal; Ctrl-a d detaches)',
+                'intention:agent:stop --id (preserves conversation for resume)',
                 'intention:advance --id --next-action [--note]',
                 'intention:close --id --status=blocked|completed|released --note',
                 'action:start --intention --description --expected [--kind] [--arguments=JSON]',
@@ -616,6 +684,7 @@ final class Application
                 'decision:start --intention --trigger [--thread] [--model-hint]',
                 'decision:list [--status=running|waiting|completed|impasse|failed|cancelled] [--limit=20]',
                 'decision:show --id',
+                'decision:recover [--limit=16] (settle proven-dead integration owners without replaying adapters)',
                 'decision:compare [--limit=200]',
                 'other:status',
                 'other:frame [--status=active|superseded|corrected|rejected|expired] [--limit=100]',
@@ -624,7 +693,9 @@ final class Application
                 'other:cycles [--status=running|waiting|completed|abstained|failed] [--limit=20]',
                 'other:correct --hypothesis --correction',
                 'other:replay [--limit=500]',
-                'memory:add --tier --content --confidence --idempotency-key [--source-event] [--source-memory] [--supersedes] [--expires] [--allow-procedural-write]',
+                'memory:add --tier --content --confidence --idempotency-key [--source-event] [--source-event-kind=event|sense_event] [--source-memory] [--supersedes] [--expires] [--allow-procedural-write]',
+                'recall:init (idempotent daemon startup; no executive migration)',
+                'recall --query [--token-budget=1024] (native recall; no executive bootstrap)',
                 'memory:search --query [--limit=20]',
                 'personality:compile --context',
                 'motivation:compile --context',
@@ -632,6 +703,7 @@ final class Application
                 'narrative:queue --reason',
                 'memory:consolidate --episode --content --confidence',
                 'memory:consolidation:status',
+                'memory:consolidation:reuse [--apply]',
                 'memory:consolidation:pump [--depth=2]',
                 'memory:consolidation:repair --reason',
                 'need:list',
@@ -666,6 +738,9 @@ final class Application
                 'capsule:show [--id]',
                 'metrics:snapshot --node [--scope]',
                 'metrics:report [--limit] [--scope]',
+                'control:status',
+                'control:pause --reason (pause new scheduled/model work and action/effect admissions)',
+                'control:resume --pause-event=<id>',
                 'interrupt:raise --reason [--severity=critical|high|normal] [--source=external]',
                 'interrupt:list [--status=pending|acknowledged|resolved]',
                 'interrupt:check --node',
@@ -689,6 +764,12 @@ final class Application
                 'backup:create --reason',
                 'self:set --key --value --confidence --evidence',
                 'self:list',
+                'value:set --key --statement --rationale --weight [--status=active] [--review-interval-hours=168] [--authority=agent]',
+                'value:list',
+                'value:appraise --key --alignment --evidence --source=user|self|outcome [--event] [--intention]',
+                'value:review (slow loop; reports values due, revises nothing)',
+                'value:reviewed --key (mark reviewed and kept)',
+                'value:revise --key --statement --weight --basis=world_evidence|cost_discovered|incoherence|user_directive --reason [--authority=agent]',
                 'appraise --event|--intention --relevance --urgency --controllability --uncertainty --commitment-impact',
                 'checkpoint --reason',
                 'status --active-intention="current user-directed objective" [--token-budget=1024]',
@@ -703,6 +784,10 @@ final class Application
     {
         if (!$debugJson) {
             $command = (string) ($payload['command'] ?? '');
+            if (($payload['ok'] ?? false) && $command === 'intention:agent:context') {
+                fwrite($stream, $payload['result']['context'] . PHP_EOL);
+                return;
+            }
             if (($payload['ok'] ?? false) === true
                 && in_array(
                     $command,
@@ -717,7 +802,7 @@ final class Application
                 );
                 return;
             }
-            if (($payload['ok'] ?? false) === true && $command === 'status') {
+            if (($payload['ok'] ?? false) === true && in_array($command, ['status', 'recall'], true)) {
                 $result = $payload['result'] ?? [];
                 fwrite($stream, is_string($result) ? $result : '');
                 return;

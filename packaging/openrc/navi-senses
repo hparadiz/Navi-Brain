@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 
 name="navi-senses"
-description="Unprivileged looking service: runs commands Navi chooses and returns what they saw"
+description="Bounded machine observations from fixed kernel information files"
 
 supervisor="supervise-daemon"
 
@@ -12,16 +12,14 @@ supervisor="supervise-daemon"
 # decorative. Root owns it, everyone else reads.
 command="/usr/local/libexec/navi-senses"
 
-# The whole design is this line. The service runs as an account that holds no
-# write permission outside its own runtime directory, so "Navi can only look"
-# is enforced by the kernel rather than by a list of forbidden strings that
-# would have to anticipate every way of spelling a destructive command.
-# Granting a capability later is a change to this account, not to any code.
+# The installed service enforces a named, fixed-file observation catalog and
+# does not execute client-supplied commands. Account separation is additional
+# containment; an unprivileged account alone is not a read-only sandbox.
 #
 # The primary group is `users`, not navi-senses. supervise-daemon sets uid and
 # gid and does not apply supplementary groups, so making `users` primary is what
-# actually lets akujin reach the socket. It grants nothing else: akujin's home is
-# mode 0755, so group `users` carries read and traverse and no write bit.
+# actually lets akujin reach the socket. Every member of users can request the
+# same catalog; no request can select a path or spawn a command.
 command_user="navi-senses:users"
 
 pidfile="/run/navi-senses.pid"
@@ -36,8 +34,7 @@ respawn_delay=5
 respawn_max=5
 respawn_period=120
 
-# Ceilings for the service itself. Individual commands carry their own ulimits,
-# but a service that spawns them needs its own floor under the machine.
+# Ceilings for the service itself; each observation also caps its output bytes.
 rc_cgroup_mode="unified"
 rc_cgroup_settings="
 memory.max 512M

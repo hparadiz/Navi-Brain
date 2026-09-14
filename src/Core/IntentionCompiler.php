@@ -12,8 +12,8 @@ use NaviBrain\Model\Intention;
 /**
  * Compile every open canonical intention and only intention-related evidence.
  *
- * This compiler is read-only and uncapped. It deliberately excludes needs,
- * affect, sensory state, working memory, and conversational context so the
+ * This compiler is read-only and uncapped, or scoped to one requested ID.
+ * It deliberately excludes needs, affect, sensory state, working memory, and conversational context so the
  * resulting narrative cannot mistake background pressure for an intention.
  */
 final class IntentionCompiler
@@ -21,7 +21,7 @@ final class IntentionCompiler
     private const PROTOCOL = 'intention-evidence-v1';
 
     /** @return array<string, mixed> */
-    public function compile(): array
+    public function compile(?int $intentionId = null): array
     {
         $allIntentions = Intention::getAll(['order' => ['id' => 'ASC']]);
         $intentionsById = [];
@@ -39,6 +39,9 @@ final class IntentionCompiler
         ];
 
         foreach ($allIntentions as $intention) {
+            if ($intentionId !== null && (int) $intention->id !== $intentionId) {
+                continue;
+            }
             $status = (string) $intention->status;
             if (!in_array($status, ['active', 'blocked'], true)) {
                 continue;
@@ -89,6 +92,7 @@ final class IntentionCompiler
                 'compiler_writes' => false,
                 'result_count_limited' => false,
                 'intention_evidence_only' => true,
+                'intention_id' => $intentionId,
             ],
             'open_intentions' => $open,
             'evidence_health' => $health,

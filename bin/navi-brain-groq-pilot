@@ -1,0 +1,65 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use NaviBrain\Core\GroqModelClient;
+
+// Autoload only: bootstrap/app.php opens the live state database.
+require dirname(__DIR__) . '/vendor/autoload.php';
+
+$args = array_slice($argv, 1);
+if ($args === ['--help']) {
+    fwrite(STDOUT, "Usage: navi-brain-groq-pilot [--send-synthetic --account-no-charge-confirmed]\n"
+        . "Default: print the fixed synthetic request without reading credentials or using the network.\n"
+        . "Send: one request using GROQ_API_KEY, only after the operator confirms authorized no-charge account access.\n"
+        . "No custom prompt, stdin, file input, retries, tools, state integration, or background loop.\n");
+    exit(0);
+}
+$send = count($args) === 2
+    && in_array('--send-synthetic', $args, true)
+    && in_array('--account-no-charge-confirmed', $args, true);
+if ($args !== [] && !$send) {
+    fwrite(STDERR, "Use --help. Sending requires both --send-synthetic and --account-no-charge-confirmed.\n");
+    exit(2);
+}
+
+$kind = 'synthetic_update';
+$prompt = <<<'PROMPT'
+This is a fictional memory-update exercise. No real people, secrets, or executable actions are involved.
+Record 1: The fictional workshop's indicator color is amber.
+Record 2: The workshop operator explicitly corrects record 1: its current indicator color is teal.
+Return a proposal with kind synthetic_update. Set content to exactly "The indicator color is teal.".
+State the obsolete assumption in challenged_assumption and give confidence from 0 to 1.
+PROMPT;
+
+try {
+    if (!$send) {
+        $output = [
+            'status' => 'dry_run',
+            'endpoint' => GroqModelClient::ENDPOINT,
+            'synthetic_only' => true,
+            'request' => GroqModelClient::requestPayload($prompt, $kind),
+            'limits' => [
+                'requests' => 1,
+                'timeout_seconds' => GroqModelClient::TIMEOUT_SECONDS,
+                'max_request_bytes' => GroqModelClient::MAX_REQUEST_BYTES,
+                'max_response_bytes' => GroqModelClient::MAX_RESPONSE_BYTES,
+                'max_completion_tokens' => GroqModelClient::MAX_COMPLETION_TOKENS,
+            ],
+        ];
+    } else {
+        $output = (new GroqModelClient())->complete($prompt, $kind);
+        $output['synthetic_only'] = true;
+        $output['expected_content_match'] = $output['status'] === 'completed'
+            ? $output['proposal']['content'] === 'The indicator color is teal.'
+            : null;
+        $output['assessment'] = 'single_literal_instruction_check_not_semantic_memory_validation';
+    }
+    fwrite(STDOUT, json_encode($output, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL);
+    exit(($output['status'] === 'rejected' || ($output['expected_content_match'] ?? true) === false) ? 1 : 0);
+} catch (Throwable) {
+    // Do not expose an exception stack, environment, provider body, or credential.
+    fwrite(STDERR, "Synthetic pilot failed before producing a result. Check ext-curl, async DNS, GROQ_API_KEY, and the documented limits.\n");
+    exit(1);
+}

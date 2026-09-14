@@ -133,10 +133,12 @@ final class OtherModelEvaluator
                 (int) $hypothesis->predictions_resolved > 0 ? (float) $hypothesis->forward_score : null,
             $hypotheses
         ), static fn (?float $value): bool => $value !== null));
-        $backward = array_values(array_map(
-            static fn (OtherModelHypothesis $hypothesis): float => (float) $hypothesis->backward_score,
+        $provenanceWeights = array_values(array_filter(array_map(
+            static fn (OtherModelHypothesis $hypothesis): ?float => (float) $hypothesis->backward_score > 0.0
+                ? (float) $hypothesis->backward_score
+                : null,
             $hypotheses
-        ));
+        ), static fn (?float $value): bool => $value !== null));
         $correctionLatencies = array_values(array_filter(array_map(
             fn (OtherModelHypothesis $hypothesis): ?int => $hypothesis->status === 'corrected'
                 ? max(0, ($this->timestamp($hypothesis->corrected_at) ?? 0)
@@ -148,6 +150,7 @@ final class OtherModelEvaluator
         return [
             'protocol' => 'other-model-replay-v1',
             'sealed_predictions' => [
+                'score_scope' => 'observed_category_forecasts_not_proposition_truth',
                 'pending' => count(array_filter(
                     $predictions,
                     static fn (OtherModelPrediction $prediction): bool => $prediction->status === 'pending'
@@ -179,9 +182,21 @@ final class OtherModelEvaluator
                 'mean_hypothesis_forward_score' => $forward === []
                     ? null
                     : round(array_sum($forward) / count($forward), 4),
-                'mean_hypothesis_backward_score' => $backward === []
+                // Retained alias for clients; these are fixed provenance weights.
+                'mean_hypothesis_backward_score' => $provenanceWeights === []
                     ? null
-                    : round(array_sum($backward) / count($backward), 4),
+                    : round(array_sum($provenanceWeights) / count($provenanceWeights), 4),
+                'mean_provenance_weight' => $provenanceWeights === []
+                    ? null
+                    : round(array_sum($provenanceWeights) / count($provenanceWeights), 4),
+                'provenance_weight_count' => count($provenanceWeights),
+                'inverse_consistency_score' => null,
+                'score_semantics' => [
+                    'posterior' => 'forecast_support_not_proposition_probability',
+                    'forward_score' => 'coarse_observable_forecast_quality',
+                    'backward_score' => 'fixed_provenance_weight_not_inverse_consistency',
+                    'usable' => 'forecast_eligible_not_semantically_validated',
+                ],
                 'mean_correction_latency_seconds' => $correctionLatencies === []
                     ? null
                     : round(array_sum($correctionLatencies) / count($correctionLatencies), 2),
@@ -195,12 +210,14 @@ final class OtherModelEvaluator
                     $hypotheses,
                     static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->provenance_kind === 'direct_statement'
                 )),
-                'prediction_validated_labels' => count(array_filter(
+                'prediction_validated_labels' => null,
+                'forecast_usable_hypotheses' => count(array_filter(
                     $hypotheses,
                     static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->validation === 'usable'
                 )),
                 'extraction_recall' => null,
                 'label_accuracy' => null,
+                'semantic_support' => null,
                 'why_unscored' => 'Explicit correction fixtures are required; an LLM is never used to label its own ground truth.',
             ],
             'integrity' => [
@@ -320,45 +337,82 @@ final class OtherModelEvaluator
             static fn (array $decision): bool => $decision['baseline_chosen']
                 !== $decision['counterfactual_other_model_chosen']
         ));
-        $actualCounterfactualMismatch = count(array_filter(
+        $actualChoices = array_values(array_filter(
             $decisions,
+            static fn (array $decision): bool => isset($decision['chosen'])
+        ));
+        $actualCounterfactualMismatch = count(array_filter(
+            $actualChoices,
             static fn (array $decision): bool => $decision['chosen']
                 !== $decision['counterfactual_other_model_chosen']
+        ));
+        $ablationEvidence = array_values(array_filter(
+            $actualChoices,
+            static fn (array $decision): bool => is_bool($decision['other_agent_model_ablated'] ?? null)
+        ));
+        $unablatedMismatches = count(array_filter(
+            $ablationEvidence,
+            static fn (array $decision): bool => !$decision['other_agent_model_ablated']
+                && $decision['chosen'] !== $decision['counterfactual_other_model_chosen']
         ));
         $modelDeltas = [];
         $actualDeltas = [];
         foreach ($decisions as $decision) {
-            $baseline = is_array($decision['baseline_action_distribution'] ?? null)
-                ? $decision['baseline_action_distribution']
-                : [];
-            $counterfactual = is_array($decision['counterfactual_other_model_action_distribution'] ?? null)
-                ? $decision['counterfactual_other_model_action_distribution']
-                : [];
-            $actual = is_array($decision['action_distribution'] ?? null)
-                ? $decision['action_distribution']
-                : [];
-            if ($baseline !== [] && $counterfactual !== []) {
+            $baseline = $this->scoreDistribution($decision['baseline_action_distribution'] ?? null);
+            $counterfactual = $this->scoreDistribution($decision['counterfactual_other_model_action_distribution'] ?? null);
+            $actual = $this->scoreDistribution($decision['action_distribution'] ?? null);
+            if ($baseline !== null && $counterfactual !== null) {
                 $modelDeltas[] = $this->totalVariation($baseline, $counterfactual);
             }
-            if ($actual !== [] && $counterfactual !== []) {
+            if ($actual !== null && $counterfactual !== null) {
                 $actualDeltas[] = $this->totalVariation($actual, $counterfactual);
             }
         }
         return [
+            'measurement' => 'paired_normalized_heuristic_score_sensitivity',
+            'realized_task_return' => null,
             'decisions_with_counterfactual' => count($decisions),
+            'model_distribution_pairs' => count($modelDeltas),
+            'model_distribution_pairs_missing_or_invalid' => count($decisions) - count($modelDeltas),
+            'actual_distribution_pairs' => count($actualDeltas),
+            'decisions_with_actual_choice' => count($actualChoices),
+            'decisions_with_ablation_evidence' => count($ablationEvidence),
             'model_would_change_action' => $changed,
-            'functional_action_distribution_delta' => $decisions === []
+            'functional_action_distribution_delta' => $modelDeltas === []
                 ? null
-                : round(array_sum($modelDeltas) / max(1, count($modelDeltas)), 4),
+                : round(array_sum($modelDeltas) / count($modelDeltas), 4),
             'action_choice_change_rate' => $decisions === []
                 ? null
                 : round($changed / count($decisions), 4),
-            'counterfactual_arbiter_mismatches' => $actualCounterfactualMismatch,
+            'counterfactual_arbiter_mismatches' => $actualChoices === [] ? null : $actualCounterfactualMismatch,
             'actual_counterfactual_distribution_delta' => $actualDeltas === []
                 ? null
                 : round(array_sum($actualDeltas) / count($actualDeltas), 4),
-            'actual_differs_only_when_ablation_enabled' => true,
+            'actual_differs_only_when_ablation_enabled' => $unablatedMismatches > 0
+                ? false
+                : ($decisions !== [] && count($ablationEvidence) === count($decisions) ? true : null),
         ];
+    }
+
+    /** @return array<string, float>|null */
+    private function scoreDistribution(mixed $value): ?array
+    {
+        if (!is_array($value) || $value === []) {
+            return null;
+        }
+        $distribution = [];
+        foreach ($value as $action => $weight) {
+            if (!is_string($action) || $action === '' || !is_numeric($weight)) {
+                return null;
+            }
+            $weight = (float) $weight;
+            if (!is_finite($weight) || $weight < 0.0 || $weight > 1.0) {
+                return null;
+            }
+            $distribution[$action] = $weight;
+        }
+        // ActionSelector rounds each normalized score to four decimal places.
+        return abs(array_sum($distribution) - 1.0) <= 0.001 ? $distribution : null;
     }
 
     /** @param array<string, int|float> $left @param array<string, int|float> $right */

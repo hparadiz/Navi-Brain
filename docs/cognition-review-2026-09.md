@@ -101,11 +101,17 @@ deadlines and transport resource guards still apply.
 
 ## Operations and remaining boundaries
 
-Persistent OpenRC startup is still pending operator authentication: attempting
-`sudo -n rc-service navi-brain-model-worker start` returned `a password is
-required`. The service remains stopped; the successful foreground verification
-does not mean it is running continuously. Run
-`sudo rc-service navi-brain-model-worker start` locally to enable it.
+Persistent OpenRC startup was completed on September 5 using KDE authentication:
+`kdesu -n -c '/sbin/rc-service navi-brain-model-worker start'`. Host-namespace
+status reported `started`; the worker logged `unchanged_evidence`. An initial
+idle sample showed about 52 MiB RSS and 0.1% CPU, not an inference-load benchmark.
+Worker 2 remained stopped. The earlier sudo-password blocker is resolved.
+
+The waiting gate runs every 30 seconds; model inference does not. New published
+evidence and review of the previous proposal are required before another model
+job. Unchanged evidence causes zero further model calls. Check OpenRC status
+from the host process namespace: the harness's isolated PID view can incorrectly
+report an active host service as `unsupervised`.
 
 Use `reflection:status --debug-json` for deliberate diagnostics and
 `reflection:review --work=<id> --verdict=useful|rejected --note='<evidence>'` to

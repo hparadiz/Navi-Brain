@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use Divergence\IO\Database\Connections;
 use InvalidArgumentException;
 use NaviBrain\Model\ActionTrace;
 use NaviBrain\Model\CognitiveThread;
@@ -11,6 +12,8 @@ use NaviBrain\Model\DecisionCandidate;
 use NaviBrain\Model\DecisionCycle;
 use NaviBrain\Model\Intention;
 use NaviBrain\Model\Memory;
+use NaviBrain\Model\SenseEvent;
+use NaviBrain\Model\SensorySource;
 use NaviBrain\Model\WorkItem;
 use NaviBrain\Support\PlainText;
 use RuntimeException;
@@ -41,6 +44,10 @@ final class DecisionStateMachine
         ?string $modelHint = null,
         ?int $parentRunId = null
     ): array {
+        $this->core->recoverLocallyRelinquishedDecisions();
+        if (ExecutiveControl::status()['paused']) {
+            throw new CognitionPaused('Cognition is paused; new decision cycles are not admitted.');
+        }
         $intention = Intention::getByID($intentionId);
         if (!$intention instanceof Intention || $intention->status !== 'active') {
             throw new RuntimeException('A decision cycle requires an active intention.');
@@ -69,6 +76,14 @@ final class DecisionStateMachine
             }
         }
 
+        $inputSnapshot = ['version' => 1, 'dependencies' => []];
+        $intentionIds = array_merge([$intentionId], (array) $intention->dependencies,
+            $intention->parent_id === null ? [] : [(int) $intention->parent_id]);
+        foreach (array_unique($intentionIds) as $id) {
+            $this->captureDependency($inputSnapshot, 'intention', (int) $id,
+                (int) $id === $intentionId ? $intention->getData() : null);
+        }
+
         $working = $this->core->workingMemory()->snapshot($threadId);
         if ($this->core->otherModel()->isAblated()) {
             $working = array_values(array_filter(
@@ -77,35 +92,39 @@ final class DecisionStateMachine
             ));
         }
         $workingJson = $this->encode($working);
-        /** @var DecisionCycle $cycle */
-        $cycle = $this->core->insertRecord(DecisionCycle::class, [
-            'intention_id' => $intentionId,
-            'thread_id' => $threadId,
-            'trigger' => mb_substr($trigger, 0, 160),
-            'model_id' => $modelHint,
-            'state' => 'observe',
-            'status' => 'running',
-            'working_memory_checksum' => hash('sha256', $workingJson),
-            'observations' => [],
-            'retrieval' => [],
-            'reasoning' => [],
-            'evaluation' => [],
-            'selection' => [],
-            'execution' => [],
-            'verification' => [],
-            'adaptation' => [],
-            'stage_timings' => [],
-            'updated_at' => time(),
-        ]);
-        $this->core->emitEvent('decision_cycle.started', [
-            'decision_cycle_id' => (int) $cycle->id,
-            'intention_id' => $intentionId,
-            'thread_id' => $threadId,
-            'trigger' => $trigger,
-            'working_memory_checksum' => (string) $cycle->working_memory_checksum,
-            'model_hint' => $modelHint,
-        ]);
+        $cycle = $this->core->beginDecisionPlanning(
+            $intentionId, $threadId, $trigger, $modelHint, hash('sha256', $workingJson)
+        );
+        try {
+            $result = $this->planStartedCycle($cycle, $intention, $inputSnapshot, $working,
+                $trigger, $modelHint, $parentRunId);
+        } catch (Throwable $throwable) {
+            $failed = $this->core->finishDecisionPlanning((int) $cycle->id,
+                'Decision planning failed: ' . $throwable->getMessage());
+            if ($failed !== null) {
+                return $failed;
+            }
+            // A committed work item has its own owner and must not be undone.
+            throw $throwable;
+        }
+        return $this->core->finishDecisionPlanning((int) $cycle->id) ?? $result;
+    }
 
+    /** @param array<string, mixed> $inputSnapshot
+     *  @param list<array<string, mixed>> $working
+     *  @return array<string, mixed>
+     */
+    private function planStartedCycle(
+        DecisionCycle $cycle,
+        Intention $intention,
+        array $inputSnapshot,
+        array $working,
+        string $trigger,
+        ?string $modelHint,
+        ?int $parentRunId
+    ): array {
+        $intentionId = (int) $cycle->intention_id;
+        $threadId = $cycle->thread_id === null ? null : (int) $cycle->thread_id;
         $started = hrtime(true);
         $pending = $this->core->sensoryCortex()->pendingEvents(6);
         $observations = [
@@ -127,7 +146,10 @@ final class DecisionStateMachine
             ))[0] ?? null,
             'other_agent_model_ablated' => $this->core->otherModel()->isAblated(),
         ];
-        $cycle->setField('observations', $observations);
+        foreach ($pending as $event) {
+            $this->captureDependency($inputSnapshot, 'sense_event', (int) ($event['id'] ?? 0), $event);
+        }
+        $cycle->setField('observations', $observations + ['input_snapshot' => $inputSnapshot]);
         $this->advance($cycle, 'retrieve', 'observe', $this->elapsedMs($started));
 
         $started = hrtime(true);
@@ -139,13 +161,26 @@ final class DecisionStateMachine
         // Retrieval is an internal planning action, not the outcome of the
         // decision cycle. Run it through the same typed procedural boundary so
         // repeated success can become a reusable procedure without a model.
-        $retrievalAction = $this->core->proceduralMemory()->executeAction(
-            $intentionId,
-            'memory.search',
-            ['query' => $query, 'limit' => 8],
-            'Retrieve long-term memory relevant to the active decision.',
-            'A bounded, machine-verified result set is returned.'
-        );
+        try {
+            $retrievalAction = $this->core->proceduralMemory()->executeAction(
+                $intentionId,
+                'memory.search',
+                ['query' => $query, 'limit' => 8],
+                'Retrieve long-term memory relevant to the active decision.',
+                'A bounded, machine-verified result set is returned.'
+            );
+        } catch (CognitionPaused) {
+            return $this->fail($cycle, 'Cognition paused before planning retrieval; start a fresh cycle after resume.');
+        }
+        if (($retrievalAction['status'] ?? null) === 'held') {
+            $actionId = (int) ($retrievalAction['started']['action']['id'] ?? 0);
+            $this->core->rejectPendingActionExecution($actionId, [
+                'error' => 'Planning retrieval was held by cognition pause; start a fresh cycle.',
+                'dispatch_not_attempted' => true,
+            ]);
+            $this->core->proceduralMemory()->finishDurableAction($actionId);
+            return $this->fail($cycle, 'Cognition paused before planning retrieval; start a fresh cycle after resume.');
+        }
         if (($retrievalAction['status'] ?? null) !== 'succeeded') {
             return $this->fail($cycle, 'The installed retrieval procedure failed during planning.');
         }
@@ -160,6 +195,7 @@ final class DecisionStateMachine
             ) {
                 continue;
             }
+            $this->captureDependency($inputSnapshot, 'memory', (int) ($memory['id'] ?? 0), $memory);
             $retrieved[] = [
                 'id' => (int) ($memory['id'] ?? 0),
                 'tier' => (string) ($memory['tier'] ?? ''),
@@ -211,6 +247,8 @@ final class DecisionStateMachine
             "Retrieved memory:\n" . PlainText::render($retrieval['memories'], 5000, 8),
             "Installed adapters:\n" . PlainText::render($adapters, 6000, 20),
         ]);
+        $cycle->setField('observations', $observations + ['input_snapshot' => $inputSnapshot]);
+        $cycle->save();
         $queued = $this->core->enqueueWork(
             parentRunId: $parentRunId,
             parentIntentionId: $intentionId,
@@ -231,21 +269,30 @@ final class DecisionStateMachine
                 $adapters
             ))
         );
-        $timings = is_array($cycle->stage_timings) ? $cycle->stage_timings : [];
-        $timings['reason_dispatch_ms'] = $this->elapsedMs($started);
-        $cycle->setFields([
-            'proposal_work_item_id' => (int) ($queued['work_item']['id'] ?? 0),
-            'status' => 'waiting',
-            'stage_timings' => $timings,
-            'updated_at' => time(),
-        ]);
-        $cycle->save();
-        $this->core->emitEvent('decision_cycle.waiting', [
-            'decision_cycle_id' => (int) $cycle->id,
-            'state' => 'reason',
-            'work_item_id' => (int) $cycle->proposal_work_item_id,
-        ]);
-        return ['status' => 'waiting', 'cycle' => $cycle->getData(), 'work_item' => $queued['work_item'] ?? null];
+        // Queue publication binds the exact workspace and work item before a
+        // worker can claim it. A fast worker may already have advanced it.
+        $cycle = DecisionCycle::getByID((int) $cycle->id);
+        if (!$cycle instanceof DecisionCycle) {
+            throw new RuntimeException('Decision cycle disappeared during work enqueue.');
+        }
+        if ($cycle->status === 'waiting' && $cycle->state === 'reason') {
+            $timings = is_array($cycle->stage_timings) ? $cycle->stage_timings : [];
+            $timings['reason_dispatch_ms'] = $this->elapsedMs($started);
+            $timing = Connections::getConnection()->prepare(
+                "UPDATE decision_cycles SET stage_timings = :timings
+                 WHERE id = :id AND proposal_work_item_id = :work_id
+                   AND status = 'waiting' AND state = 'reason'"
+            );
+            $timing->execute([
+                'timings' => serialize($timings), 'id' => (int) $cycle->id,
+                'work_id' => (int) ($queued['work_item']['id'] ?? 0),
+            ]);
+            $cycle = DecisionCycle::getByID((int) $cycle->id);
+        }
+        if (!$cycle instanceof DecisionCycle) {
+            throw new RuntimeException('Decision cycle disappeared after work publication.');
+        }
+        return ['status' => (string) $cycle->status, 'cycle' => $cycle->getData(), 'work_item' => $queued['work_item'] ?? null];
     }
 
     /** @param array<string, mixed> $work
@@ -266,7 +313,44 @@ final class DecisionStateMachine
         if ((int) $cycle->proposal_work_item_id !== (int) ($work['id'] ?? 0)) {
             throw new RuntimeException('Decision proposal work item does not match its cycle.');
         }
-        $cycle->setFields(['model_id' => $model, 'status' => 'running', 'updated_at' => time()]);
+        $claimed = $this->core->claimDecisionIntegration($cycleId, (int) $work['id'], $model);
+        if (!$claimed) {
+            $durable = DecisionCycle::getByID($cycleId);
+            return ['status' => 'already_integrated', 'cycle' => $durable?->getData() ?? $cycle->getData()];
+        }
+        try {
+            $cycle = DecisionCycle::getByID($cycleId);
+            if (!$cycle instanceof DecisionCycle) {
+                throw new RuntimeException('Decision cycle disappeared during result admission.');
+            }
+            $result = $cycle->status === 'running' && $cycle->state === 'reason'
+                ? $this->integrateClaimed($cycle, $work, $proposal)
+                : ['status' => 'already_integrated', 'cycle' => $cycle->getData()];
+        } catch (Throwable $throwable) {
+            $failed = $this->core->finishDecisionIntegration(
+                $cycleId, (int) $work['id'], 'Decision integration failed: ' . $throwable->getMessage()
+            );
+            if ($failed !== null) {
+                return $failed;
+            }
+            // A bound action owns its durable outcome and existing recovery.
+            // A worker failure must not overwrite that action's decision cycle.
+            throw $throwable;
+        }
+        return $this->core->finishDecisionIntegration($cycleId, (int) $work['id']) ?? $result;
+    }
+
+    /** @param array<string, mixed> $work
+     *  @param array<string, mixed> $proposal
+     *  @return array<string, mixed>
+     */
+    private function integrateClaimed(DecisionCycle $cycle, array $work, array $proposal): array
+    {
+        $cycleId = (int) $cycle->id;
+        $changes = $this->decisionInputChanges($cycleId);
+        if ($changes !== []) {
+            return $this->fail($cycle, 'Stale decision input; start a fresh cycle: ' . implode('; ', $changes));
+        }
         $workRecord = WorkItem::getByID((int) $work['id']);
         $createdAt = $workRecord instanceof WorkItem ? $this->timestamp($workRecord->created_at) : null;
         $timings = is_array($cycle->stage_timings) ? $cycle->stage_timings : [];
@@ -295,30 +379,20 @@ final class DecisionStateMachine
         if (!$legacyList && ($currentPlan === '' || $decisionBasis === '')) {
             return $this->fail($cycle, 'Reasoning output must contain current_plan and decision_basis.');
         }
-        $scope = $cycle->thread_id === null ? 'shared' : 'thread:' . (int) $cycle->thread_id;
-        if ($currentPlan !== '') {
-            $this->core->workingMemory()->publish(
-                role: 'current_plan',
-                claim: mb_substr($currentPlan, 0, 800),
-                recordType: 'decision_cycle',
-                recordId: (int) $cycle->id,
-                confidence: (float) ($proposal['confidence'] ?? 0.0),
-                ttlSeconds: 900,
-                scope: $scope,
-                threadId: $cycle->thread_id === null ? null : (int) $cycle->thread_id
+        try {
+            $this->core->publishDecisionReasoning(
+                $cycleId,
+                ['claim' => $currentPlan, 'confidence' => (float) ($proposal['confidence'] ?? 0.0)],
+                ['claim' => $decisionBasis, 'confidence' => (float) ($proposal['confidence'] ?? 0.0)]
             );
-        }
-        if ($decisionBasis !== '') {
-            $this->core->workingMemory()->publish(
-                role: 'decision_basis',
-                claim: mb_substr($decisionBasis, 0, 800),
-                recordType: 'decision_cycle',
-                recordId: (int) $cycle->id,
-                confidence: (float) ($proposal['confidence'] ?? 0.0),
-                ttlSeconds: 900,
-                scope: $scope,
-                threadId: $cycle->thread_id === null ? null : (int) $cycle->thread_id
-            );
+        } catch (Throwable $throwable) {
+            $durable = DecisionCycle::getByID($cycleId);
+            if ($durable instanceof DecisionCycle
+                && ($durable->status !== 'running' || $durable->state !== 'reason')) {
+                return ['status' => 'already_integrated', 'cycle' => $durable->getData()];
+            }
+            return $this->fail($durable instanceof DecisionCycle ? $durable : $cycle,
+                'Reasoning publication rejected: ' . $throwable->getMessage());
         }
         $cycle->setField('reasoning', [
             'current_plan' => $currentPlan,
@@ -455,20 +529,34 @@ final class DecisionStateMachine
         $this->advance($cycle, 'execute', 'select', $this->elapsedMs($started));
 
         $started = hrtime(true);
-        $outcome = $this->core->proceduralMemory()->executeAction(
-            (int) $cycle->intention_id,
-            (string) $selected->action_kind,
-            is_array($selected->arguments) ? $selected->arguments : [],
-            (string) $selected->description,
-            (string) $selected->expected,
-            isset($inspection['procedure']['procedure_id'])
-                ? (int) $inspection['procedure']['procedure_id']
-                : null,
-            procedureMemoryId: isset($inspection['procedure']['memory_id'])
-                ? (int) $inspection['procedure']['memory_id']
-                : null,
-            decisionCycleId: (int) $cycle->id
-        );
+        $changes = $this->decisionInputChanges((int) $cycle->id);
+        if ($changes !== []) {
+            return $this->fail($cycle, 'Stale decision input before execution; start a fresh cycle: ' . implode('; ', $changes));
+        }
+        try {
+            $outcome = $this->core->proceduralMemory()->executeAction(
+                (int) $cycle->intention_id,
+                (string) $selected->action_kind,
+                is_array($selected->arguments) ? $selected->arguments : [],
+                (string) $selected->description,
+                (string) $selected->expected,
+                isset($inspection['procedure']['procedure_id'])
+                    ? (int) $inspection['procedure']['procedure_id']
+                    : null,
+                procedureMemoryId: isset($inspection['procedure']['memory_id'])
+                    ? (int) $inspection['procedure']['memory_id']
+                    : null,
+                decisionCycleId: (int) $cycle->id
+            );
+        } catch (Throwable $throwable) {
+            $durable = DecisionCycle::getByID((int) $cycle->id);
+            if ($durable instanceof DecisionCycle
+                && (int) (((array) $durable->execution)['action_id'] ?? 0) === 0
+                && $this->decisionInputChanges((int) $cycle->id) !== []) {
+                return $this->fail($durable, 'Decision admission changed; start a fresh cycle: ' . $throwable->getMessage());
+            }
+            throw $throwable;
+        }
         $actionId = (int) ($outcome['started']['action']['id'] ?? 0);
         $durableCycle = DecisionCycle::getByID((int) $cycle->id);
         if (!$durableCycle instanceof DecisionCycle) {
@@ -504,7 +592,7 @@ final class DecisionStateMachine
             return ['status' => (string) $durableCycle->status, 'cycle' => $durableCycle->getData()];
         }
         return [
-            'status' => 'in_progress',
+            'status' => ($outcome['status'] ?? null) === 'held' ? 'held' : 'in_progress',
             'cycle' => $durableCycle->getData(),
             'selected' => $selected->getData(),
             'execution' => $outcome,
@@ -557,8 +645,54 @@ final class DecisionStateMachine
     }
 
     /**
+     * Native upkeep: finish only proven non-attempts after integration ended.
+     * No dispatching recovery, legacy scan, adapter invocation or model queue.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function reconcileUnattemptedActions(int $limit = 16): array
+    {
+        $reconciled = [];
+        foreach ($this->core->pendingDecisionActionClaims($limit, true) as $claim) {
+            $actionId = (int) $claim['action_id'];
+            try {
+                if (!($claim['integration_settled'] ?? false)) {
+                    continue;
+                }
+                $execution = \NaviBrain\Model\ActionExecution::getByField('action_trace_id', $actionId);
+                if (!$execution instanceof \NaviBrain\Model\ActionExecution) {
+                    throw new RuntimeException('Decision action claim points to a missing execution.');
+                }
+                if ($execution->status === 'pending') {
+                    if (!in_array($claim['status'], ['started', 'held'], true)
+                        || $this->core->rejectSettledDecisionPendingAction(
+                            (int) $claim['decision_cycle_id'], $actionId
+                        ) === null) {
+                        continue;
+                    }
+                    $execution = \NaviBrain\Model\ActionExecution::getByField('action_trace_id', $actionId);
+                }
+                if (!$execution instanceof \NaviBrain\Model\ActionExecution
+                    || !in_array($execution->status, ['failed', 'cancelled'], true)
+                    || (((array) $execution->observed)['dispatch_not_attempted'] ?? false) !== true) {
+                    continue;
+                }
+                $finished = $this->core->proceduralMemory()->finishDurableAction($actionId);
+                $reconciled[] = ['action_id' => $actionId,
+                    'result' => $this->completeAsyncAction($actionId, false, $finished)];
+            } catch (Throwable $error) {
+                $reconciled[] = ['action_id' => $actionId, 'status' => 'recovery_blocked',
+                    'error' => $error->getMessage()];
+            }
+        }
+        return $reconciled;
+    }
+
+    /**
      * Close crash-stranded decision actions without ever re-running an adapter.
-     * Pending actions become an explicit refusal; dead/same-owner dispatches
+     * Pending actions become an explicit refusal after their owner exits, or
+     * after resume when the owner explicitly returned a durable held action.
+     * Dead/same-owner dispatches
      * use the action ledger's atomic indeterminate outcome; terminal actions
      * replay their durable finish into the exact decision claim.
      *
@@ -574,12 +708,32 @@ final class DecisionStateMachine
                 throw new RuntimeException('Decision action claim points to a missing execution.');
             }
             if ((string) $execution->status === 'pending') {
-                if ($claim['owner_live']) {
+                if (ExecutiveControl::status()['paused']
+                    || ($claim['owner_live'] && $claim['status'] !== 'held'
+                        && !($claim['status'] === 'started' && ($claim['integration_settled'] ?? false)))) {
                     continue;
                 }
-                $this->core->rejectPendingActionExecution($actionId, [
-                    'error' => 'Decision worker exited before its bound adapter dispatch began.',
-                ]);
+                if (in_array($claim['status'], ['started', 'held'], true)
+                    && ($claim['integration_settled'] ?? false)) {
+                    if ($this->core->rejectSettledDecisionPendingAction(
+                        (int) $claim['decision_cycle_id'], $actionId
+                    ) === null) {
+                        continue;
+                    }
+                } else {
+                    $observed = $claim['status'] === 'held'
+                        ? [
+                            'error' => 'Decision dispatch was held by cognition pause; start a fresh cycle.',
+                            'dispatch_not_attempted' => true,
+                        ]
+                        : [
+                            'error' => 'Decision worker exited before its bound adapter dispatch began.',
+                            'dispatch_not_attempted' => true,
+                        ];
+                    // Pause may arrive after the observation above. Its final
+                    // check belongs to the same transaction as the pending CAS.
+                    $this->core->rejectPendingActionExecution($actionId, $observed, holdDuringPause: true);
+                }
                 $execution = \NaviBrain\Model\ActionExecution::getByField('action_trace_id', $actionId);
             } elseif ((string) $execution->status === 'dispatching') {
                 $dispatch = $this->core->claimActionDispatch($actionId);
@@ -639,10 +793,46 @@ final class DecisionStateMachine
     public function failWork(array $work, string $error): array
     {
         $refs = is_array($work['input_refs'] ?? null) ? $work['input_refs'] : [];
-        $cycle = DecisionCycle::getByID((int) ($refs['decision_cycle_id'] ?? 0));
-        return $cycle instanceof DecisionCycle
-            ? $this->fail($cycle, $error)
-            : ['status' => 'not_applicable'];
+        $cycleId = (int) ($refs['decision_cycle_id'] ?? 0);
+        $cycle = DecisionCycle::getByID($cycleId);
+        if (!$cycle instanceof DecisionCycle) {
+            return ['status' => 'not_applicable'];
+        }
+        if ((int) $cycle->proposal_work_item_id !== (int) ($work['id'] ?? 0)) {
+            throw new RuntimeException('Decision failure work item does not match its cycle.');
+        }
+        // Failed inference competes with result integration for the same state.
+        // Late failures cannot replace an admitted result or a bound action.
+        $statement = Connections::getConnection()->prepare(
+            "UPDATE decision_cycles
+             SET state = 'failed', status = 'failed', error = :error,
+                 completed_at = :completed_at, updated_at = :updated_at
+             WHERE id = :id AND proposal_work_item_id = :work_id
+               AND status = 'waiting' AND state = 'reason'"
+        );
+        $now = date('Y-m-d H:i:s');
+        $statement->execute([
+            'error' => $error,
+            'completed_at' => $now,
+            'updated_at' => $now,
+            'id' => $cycleId,
+            'work_id' => (int) ($work['id'] ?? 0),
+        ]);
+        $failed = $statement->rowCount() === 1;
+        $cycle = DecisionCycle::getByID($cycleId);
+        if (!$cycle instanceof DecisionCycle) {
+            throw new RuntimeException('Decision cycle disappeared during failure admission.');
+        }
+        if (!$failed) {
+            return ['status' => 'already_integrated', 'cycle' => $cycle->getData()];
+        }
+        $event = $this->core->emitEvent('decision_cycle.failed', [
+            'decision_cycle_id' => $cycleId,
+            'failed_state' => 'reason',
+            'model_id' => $cycle->model_id,
+            'error' => $error,
+        ]);
+        return ['status' => 'failed', 'cycle' => $cycle->getData(), 'event' => $event];
     }
 
     /** @return list<array<string, mixed>> */
@@ -787,6 +977,203 @@ final class DecisionStateMachine
             'total_ms' => $timings['total_ms'],
         ]);
         return ['status' => 'completed', 'cycle' => $cycle->getData(), 'event' => $event];
+    }
+
+    /**
+     * Add references from the exact workspace appended by enqueueWork. Occupant
+     * changes alone are not invalidation: validate the referenced source record.
+     * Access counters, update timestamps, and whole-workspace checksums are
+     * excluded; memory expiry remains an explicit eligibility constraint.
+     *
+     * @param list<array<string, mixed>> $workspace
+     * @param array<int, array<string, mixed>|null> $memoryObservations Exact queue-local reads, never worker input refs.
+     */
+    public function prepareWorkspaceDependencies(
+        int $cycleId,
+        array &$workspace,
+        array $memoryObservations = []
+    ): array
+    {
+        $cycle = DecisionCycle::getByID($cycleId);
+        if (!$cycle instanceof DecisionCycle) {
+            throw new RuntimeException('Cannot capture inputs for a missing decision cycle.');
+        }
+        if ($cycle->status !== 'running' || $cycle->state !== 'reason'
+            || $cycle->proposal_work_item_id !== null) {
+            throw new DecisionPreparationChanged('Decision cycle is not preparing its first reasoning work item.');
+        }
+        $observations = (array) $cycle->observations;
+        $originalHash = hash('sha256', serialize($observations));
+        $snapshot = $observations['input_snapshot'] ?? null;
+        if (!is_array($snapshot) || ($snapshot['version'] ?? null) !== 1) {
+            throw new RuntimeException('Decision input snapshot is missing; start a fresh cycle.');
+        }
+        foreach ($workspace as &$slot) {
+            $type = (string) ($slot['record_type'] ?? '');
+            $type = match ($type) {
+                'procedure' => 'memory',
+                'sense_edge' => 'sense_event',
+                default => $type,
+            };
+            if (in_array($type, ['memory', 'intention', 'sense_event'], true)) {
+                $id = (int) ($slot['record_id'] ?? 0);
+                if ($type === 'memory' && array_key_exists($id, $memoryObservations)) {
+                    $observed = $memoryObservations[$id];
+                    if ($observed !== null && (!is_array($observed)
+                        || (int) ($observed['id'] ?? 0) !== $id)) {
+                        throw new RuntimeException('Workspace source observation has a mismatched identity.');
+                    }
+                    $data = $observed === null ? null : $this->dependencyData($type, $id, $observed);
+                } else {
+                    $data = $this->dependencyData($type, $id);
+                }
+                if (!isset($snapshot['dependencies'][$type . ':' . $id])) {
+                    $snapshot['dependencies'][$type . ':' . $id] = [
+                        'type' => $type, 'id' => $id, 'hash' => hash('sha256', $this->encode($data)),
+                    ];
+                }
+                // A cached slot can predate an in-place source correction.
+                // Render the very record fingerprinted above, never bless old
+                // slot text with a newer source hash. Existing retrieval hashes
+                // are retained so inconsistent inputs still reject.
+                if ($data !== null) {
+                    $slot['claim'] = match ($type) {
+                        'memory' => mb_substr((string) $data['content'], 0, 800),
+                        'sense_event' => mb_substr((string) $data['summary'], 0, 800),
+                        'intention' => PlainText::render($data, 3000, 12),
+                    };
+                    if ($type === 'memory') {
+                        $slot['confidence'] = (float) $data['confidence'];
+                    }
+                }
+            }
+        }
+        unset($slot);
+        $observations['input_snapshot'] = $snapshot;
+        return [
+            'cycle_id' => $cycleId,
+            'intention_id' => (int) $cycle->intention_id,
+            'thread_id' => $cycle->thread_id === null ? null : (int) $cycle->thread_id,
+            'original_observations_hash' => $originalHash,
+            'observations' => $observations,
+        ];
+    }
+
+    /**
+     * Read-only freshness gate, also called at the executive dispatch boundary.
+     * SQLite callers can fence their own state, but native memory is a separate
+     * store: this is a last-moment check, not a cross-store atomic transaction.
+     * Unknown/legacy snapshots fail closed without trusting worker-supplied refs.
+     *
+     * @return list<string>
+     */
+    public function decisionInputChanges(int $cycleId): array
+    {
+        $cycle = DecisionCycle::getByID($cycleId);
+        if (!$cycle instanceof DecisionCycle) {
+            return ['decision cycle is missing'];
+        }
+        $snapshot = ((array) $cycle->observations)['input_snapshot'] ?? null;
+        if (!is_array($snapshot) || ($snapshot['version'] ?? null) !== 1
+            || !is_array($snapshot['dependencies'] ?? null)
+            || !isset($snapshot['dependencies']['intention:' . (int) $cycle->intention_id])) {
+            return ['decision input snapshot is missing or unsupported'];
+        }
+        $changes = [];
+        foreach ($snapshot['dependencies'] as $key => $dependency) {
+            if (!is_array($dependency)
+                || !is_string($dependency['type'] ?? null)
+                || !in_array($dependency['type'], ['intention', 'memory', 'sense_event'], true)
+                || !is_int($dependency['id'] ?? null) || $dependency['id'] < 1
+                || $key !== $dependency['type'] . ':' . $dependency['id']
+                || !is_string($dependency['hash'] ?? null)
+                || preg_match('/^[a-f0-9]{64}$/D', $dependency['hash']) !== 1) {
+                $changes[] = 'decision input snapshot contains a malformed dependency';
+                continue;
+            }
+            $current = $this->dependencyData((string) $dependency['type'], (int) $dependency['id']);
+            if ($current === null || !hash_equals((string) $dependency['hash'], hash('sha256', $this->encode($current)))) {
+                $changes[] = $key . ' changed or disappeared';
+            } elseif ($dependency['type'] === 'memory' && ($current['status'] ?? null) !== 'active') {
+                $changes[] = $key . ' is not active';
+            } elseif ($dependency['type'] === 'memory' && !$current['expiry_valid']) {
+                $changes[] = $key . ' has an invalid expiry';
+            } elseif ($dependency['type'] === 'memory' && $current['expires_at'] !== null
+                && $current['expires_at'] <= time()) {
+                $changes[] = $key . ' has expired';
+            }
+        }
+        $intention = Intention::getByID((int) $cycle->intention_id);
+        if (!$intention instanceof Intention || $intention->status !== 'active') {
+            $changes[] = 'intention is no longer active';
+        }
+        if ($cycle->thread_id !== null) {
+            $thread = CognitiveThread::getByID((int) $cycle->thread_id);
+            if (!$thread instanceof CognitiveThread || (int) $thread->parent_intention_id !== (int) $cycle->intention_id) {
+                $changes[] = 'decision thread ownership changed';
+            }
+        }
+        return $changes;
+    }
+
+    /** @param array<string, mixed> $snapshot
+     *  @param array<string, mixed>|null $supplied Actual retrieval result, before truncation.
+     */
+    private function captureDependency(array &$snapshot, string $type, int $id, ?array $supplied = null): void
+    {
+        if ($id < 1 || isset($snapshot['dependencies'][$type . ':' . $id])) {
+            return;
+        }
+        $data = $this->dependencyData($type, $id, $supplied);
+        $snapshot['dependencies'][$type . ':' . $id] = [
+            'type' => $type, 'id' => $id, 'hash' => hash('sha256', $this->encode($data)),
+        ];
+    }
+
+    /** @param array<string, mixed>|null $supplied
+     *  @return array<string, mixed>|null
+     */
+    private function dependencyData(string $type, int $id, ?array $supplied = null): ?array
+    {
+        $fields = match ($type) {
+            'intention' => ['title', 'reason', 'authority', 'status', 'next_action',
+                'success_condition', 'release_condition', 'dependencies', 'parent_id'],
+            'memory' => ['tier', 'status', 'content', 'confidence', 'source_event_id', 'source_event_kind',
+                'source_memory_id', 'supersedes_id', 'expires_at'],
+            // Outcome/consumption and tuning telemetry do not revise the evidence.
+            'sense_event' => ['sense_key', 'source_key', 'summary', 'before', 'after', 'reading_id'],
+            default => throw new RuntimeException('Unsupported decision input dependency: ' . $type),
+        };
+        if ($supplied === null) {
+            $record = match ($type) {
+                'intention' => Intention::getByID($id),
+                'memory' => Memory::inspectByID($id),
+                'sense_event' => SenseEvent::getByID($id),
+            };
+            if ($record === null) {
+                return null;
+            }
+            $supplied = $record->getData();
+        }
+        $data = [];
+        foreach ($fields as $field) {
+            $data[$field] = $supplied[$field] ?? null;
+        }
+        if ($type === 'memory') {
+            $expiresAt = $this->timestamp($data['expires_at']);
+            $data['expiry_valid'] = $data['expires_at'] === null || $expiresAt !== null;
+            $data['expires_at'] = $expiresAt;
+        }
+        if ($type === 'sense_event') {
+            $sources = SensorySource::getAllByWhere(['source_key' => (string) ($supplied['source_key'] ?? '')], ['limit' => 1]);
+            $source = $sources[0] ?? null;
+            $data['source_grant'] = $source instanceof SensorySource ? [
+                'authority' => $source->authority, 'status' => $source->status,
+                'reveals' => $source->reveals, 'effect_ceiling' => $source->effect_ceiling,
+                'acquisition' => $source->acquisition,
+            ] : null;
+        }
+        return $data;
     }
 
     /** @return array<string, mixed> */

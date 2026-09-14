@@ -296,6 +296,10 @@ final class Memory extends ActiveRecord
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $source_event_id = null;
 
+    // Null preserves the unknown namespace of records written before typed lineage.
+    #[Column(type: 'enum', values: ['event', 'sense_event'], notnull: false)]
+    protected ?string $source_event_kind = null;
+
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $source_memory_id = null;
 

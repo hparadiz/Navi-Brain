@@ -55,12 +55,21 @@ final class ActivityBus
             '',
         ]);
 
-        foreach ($targets as $target) {
-            $socket = @socket_create(AF_UNIX, SOCK_DGRAM, 0);
-            if ($socket === false) {
+        $socket = @socket_create(AF_UNIX, SOCK_DGRAM, 0);
+        if ($socket === false) {
+            return;
+        }
+        try {
+            // Advisory observers must never hold up executive publication.
+            // Failure to enable nonblocking sends drops this publication.
+            if (!@socket_set_nonblock($socket)) {
                 return;
             }
-            @socket_sendto($socket, $packet, strlen($packet), 0, $target);
+            $packetBytes = strlen($packet);
+            foreach ($targets as $target) {
+                @socket_sendto($socket, $packet, $packetBytes, 0, $target);
+            }
+        } finally {
             socket_close($socket);
         }
     }

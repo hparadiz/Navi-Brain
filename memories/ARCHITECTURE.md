@@ -59,10 +59,10 @@ and uses an atomic directory exchange, preserving the immutable content blob.
 Ambiguous post-rename failures fail closed. Names are restricted to fixed
 basenames, decimal positive IDs, and safe tier characters.
 
-## Ten-line metadata protocol
+## Positional metadata protocol
 
-After lossless token decoding, metadata is exactly ten LF-terminated lines in
-this fixed order:
+After lossless token decoding, legacy metadata has ten LF-terminated lines in
+this fixed order. Typed source provenance appends an optional eleventh line:
 
 ~~~text
 1  id
@@ -75,6 +75,7 @@ this fixed order:
 8  source_memory_id
 9  supersedes_id
 10 expires_at
+11 source_event_kind (optional: event or sense_event)
 ~~~
 
 There are no braces, field names, colons, or schema words in the payload.
@@ -84,6 +85,14 @@ LF to blur field boundaries. Confidence is exactly 16 lowercase hex digits
 containing its IEEE-754 binary64 bits. Nullable positions contain the single
 reserved token - for NULL; non-null integer positions contain canonical decimal
 integers, and non-null expires_at uses the text encoding.
+
+A missing source_event_kind means unknown namespace, not an inferred Event or
+SenseEvent identity. A typed source requires a positive source_event_id. Legacy
+untyped records retain their exact ten-line encoding. New readers accept both
+forms, but old readers/daemons cannot necessarily accept typed records/writes;
+TOKMEM/1 currently remains unchanged, so rollout must coordinate all readers and
+writers. A retry changing an untyped source into a typed one changes semantic
+receipt identity.
 
 ## Online formation and resident recall
 
@@ -116,10 +125,13 @@ ACTIVATE admits active working, semantic, and procedural traces; raw episodic
 captures require explicit recall. It uses the same token/link scoring pass, then
 measures distinct contiguous cue-span hits and matched cue bytes against decoded
 candidate content. That sequence-level coverage outranks loose constituent
-overlap. Among equally covered traces, prior memory access and then newer update
-time outrank occurrence and association strength. Only the strongest
-equal-coverage cohort can enter the returned workspace, where byte-identical
-content is collapsed. It packs whole active traces in that order, charging the
+overlap. Ordering is lexicographic: span hits, matched span bytes, direct cue match
+score, total query score, then update time and ID. Memory access counts record
+exposure and no longer determine recall rank. When span hits exist, only the strongest equal-span-hit/byte cohort can
+enter the workspace; without span hits, eligibility is the strongest
+equal-direct-match-score cohort. Byte-identical
+content is collapsed using a separate decoded-content SHA-256 computed once
+at resident publication; encoded-blob digests remain the durability identity. It packs whole active traces in that order, charging the
 resident tokenization of separators to the same budget. If no whole trace fits,
 it emits a prefix of the strongest trace ending at a native token boundary. No
 metadata, score, ID, field name, wrapper, or echoed cue enters the result.
@@ -158,7 +170,9 @@ QUERY's window converges independently of total graph size even after batched
 changes. Memory/posting orders are restored initially and remain
 correctness-neutral; direct postings are always exhaustive. Exact result
 selection uses one touched-candidate top-k heap rather than K full-memory scans.
-All six queues compact consumed prefixes before growing, so sustained partial
+ACTIVATE currently retains and sorts all eligible touched candidates before
+packing its bounded output; the output token budget does not bound ranking
+work. All six queues compact consumed prefixes before growing, so sustained partial
 drain and re-enqueue is bounded by the live high-water mark.
 
 ## Application and SQLite boundary
@@ -185,7 +199,8 @@ PAGE walks the resident ID index after a cursor without materializing or sorting
 the corpus. COUNT uses the visibility-aware resident tier/status index and a
 binary ID cursor without changing counters. PROVENANCE uses resident
 source-memory/source-event indexes to return the highest-ID exact match under
-optional tier/status filters, also counter-neutral. RANK_RECORDS returns at most 100 full candidates while counting cue
+optional tier/status filters, also counter-neutral. Typed EVENT and SENSE_EVENT
+selectors distinguish source namespaces; legacy untyped provenance remains unknown. RANK_RECORDS returns at most 100 full candidates while counting cue
 usage/reinforcement but not candidate reads; accepted IDs are counted through
 OBSERVE.
 RECALL_RECORDS runs the
@@ -230,9 +245,9 @@ queue priority and wins a single atomic transition, takes the exclusive barrier
 after admitted state work finishes, flushes dirty queues, then causes the writer
 to discard every non-CLOSE reply before workers and writer are joined.
 
-Import uses a real read transaction and selects all eleven columns in ID order.
-The ten non-content fields enter the positional metadata blob; content alone
-enters recall. Import and export construct sibling staging targets, fsync them,
+Import uses a real read transaction and selects records in ID order, reading
+the optional source namespace when present. Non-content fields enter the
+positional metadata blob; content alone enters recall. Import and export construct sibling staging targets, fsync them,
 and publish with atomic no-clobber renames. Export reconstructs the table, its
 three indexes, NULLness, values, explicit IDs, and sqlite_sequence without
 incrementing cognitive counters. An offline catch-up compares every source row
@@ -250,3 +265,17 @@ cleanly, the trailing rows are deleted transactionally and the daemon
 poison-closes so its resident trie is discarded. If publication visibility is
 ambiguous, the rows are retained so a possibly-published record remains
 decodable, and the daemon still fails closed for startup reconciliation.
+
+## Accounting and backup qualifications
+
+Neutral import suppresses cognitive write counters, but new records still pass
+through content tokenization, pair formation and structural posting/link
+construction. It is not a graph-identical replay of the original store. SQLite
+export preserves application records, not the native registry, learned-state
+queues/history or operation receipts. An exact native backup must preserve the
+coherent complete store and its registry.
+
+Query read accounting commits after a bounded response is constructed, before
+socket delivery is acknowledged. A later disconnect does not undo that
+experience; retrying a query is another query. RANK_RECORDS avoids candidate
+read accounting but still trains cue usage and traversed directional links.

@@ -8,6 +8,7 @@ use Divergence\IO\Database\Connections;
 use InvalidArgumentException;
 use NaviBrain\Model\CapsuleSlot;
 use NaviBrain\Model\CognitiveThread;
+use NaviBrain\Model\DecisionCycle;
 use NaviBrain\Model\Memory;
 use NaviBrain\Model\WorkingMemorySlot;
 use NaviBrain\Storage\TokenMemoryDaemon;
@@ -23,6 +24,11 @@ use RuntimeException;
  */
 final class WorkingMemory
 {
+    private int $maintenanceCursor = 0;
+    private int $maintenancePriorityCursor = 0;
+    private int $maintenanceAuditCursor = 0;
+    private bool $maintenanceAuditNext = false;
+
     private const MARKER = '/^\[workspace scope=([^\]]+) slot=([^\]]+)\] /';
     private const LEGACY_MARKER = '/^\[workspace thread=(\d+) slot=([^\]]+)\] /';
 
@@ -172,6 +178,103 @@ final class WorkingMemory
     }
 
     /**
+     * Commit both reasoning roles and projection intents under the same SQLite
+     * freshness fence. Native projection writes happen only after that commit.
+     *
+     * @param array{claim:string, confidence:float} $plan
+     * @param array{claim:string, confidence:float} $basis
+     */
+    public function publishDecisionReasoning(int $cycleId, array $plan, array $basis): void
+    {
+        $payloads = ['current_plan' => $plan, 'decision_basis' => $basis];
+        foreach ($payloads as $payload) {
+            if (!is_string($payload['claim'] ?? null) || !is_numeric($payload['confidence'] ?? null)
+                || !is_finite((float) $payload['confidence'])
+                || $payload['confidence'] < 0.0 || $payload['confidence'] > 1.0) {
+                throw new InvalidArgumentException('Invalid decision reasoning slot payload.');
+            }
+        }
+        $connection = Connections::getConnection();
+        if ($connection->inTransaction()) {
+            throw new RuntimeException('Decision publication cannot run inside an application transaction.');
+        }
+        for ($attempt = 0; $attempt < 16; $attempt++) {
+            $pending = [];
+            $published = [];
+            $connection->exec('BEGIN IMMEDIATE');
+            try {
+                $cycle = DecisionCycle::getByID($cycleId);
+                if (!$cycle instanceof DecisionCycle || $cycle->status !== 'running' || $cycle->state !== 'reason') {
+                    throw new RuntimeException('Decision is no longer awaiting reasoning publication.');
+                }
+                $threadId = $cycle->thread_id === null ? null : (int) $cycle->thread_id;
+                $scope = $threadId === null ? 'shared' : 'thread:' . $threadId;
+                // A writer cannot replace a canonical row until its prior
+                // projection intent is replayed. Check both before either write.
+                foreach ($payloads as $role => $payload) {
+                    $slot = $this->find($scope, $role);
+                    if ($slot instanceof WorkingMemorySlot && $this->projectionState($slot)['pending'] !== null) {
+                        $pending[] = $slot;
+                    }
+                }
+                if ($pending === []) {
+                    $changes = $this->core->decisionStateMachine()->decisionInputChanges($cycleId);
+                    if ($changes !== []) {
+                        throw new RuntimeException('Stale decision input; start a fresh cycle: ' . implode('; ', $changes));
+                    }
+                    $now = time();
+                    foreach ($payloads as $role => $payload) {
+                        $claim = trim($payload['claim']);
+                        if ($claim === '') {
+                            continue;
+                        }
+                        $fields = [
+                            'scope_key' => $scope, 'slot_role' => $role, 'status' => 'active',
+                            'updated_at' => $now, 'thread_id' => $threadId, 'source_capsule_id' => null,
+                            'record_type' => 'decision_cycle', 'record_id' => $cycleId,
+                            'claim' => mb_substr($claim, 0, 800), 'confidence' => (float) $payload['confidence'],
+                            'score' => (float) $payload['confidence'], 'recorded_at' => $now,
+                            'carryover_depth' => 0, 'reserved' => 0, 'expires_at' => $now + 900,
+                        ];
+                        $slot = $this->find($scope, $role);
+                        if ($slot instanceof WorkingMemorySlot) {
+                            $slot->setFields($fields);
+                            $slot->save();
+                        } else {
+                            $slot = $this->core->insertRecord(WorkingMemorySlot::class, $fields);
+                        }
+                        $this->installProjectionIntent($slot);
+                        $published[] = $slot;
+                    }
+                }
+                $connection->commit();
+            } catch (\Throwable $throwable) {
+                if ($connection->inTransaction()) {
+                    $connection->rollBack();
+                }
+                throw $throwable;
+            }
+            foreach ($pending as $slot) {
+                $this->replayProjection($slot);
+            }
+            if ($pending !== []) {
+                continue;
+            }
+            foreach ($published as $slot) {
+                try {
+                    $this->replayProjection($slot);
+                } catch (\Throwable $throwable) {
+                    // Canonical publication already committed. Leave its durable
+                    // intent for normal recovery; do not falsely reject it.
+                    error_log('Decision workspace projection remains pending: ' . $throwable->getMessage());
+                }
+            }
+            return;
+        }
+        throw new RuntimeException('Decision workspace projection remained busy after bounded retries.');
+    }
+
+    /**
      * Current state used as incumbents in the next capsule competition.
      *
      * @return array<string, array<string, mixed>>
@@ -180,37 +283,55 @@ final class WorkingMemory
     {
         $this->expireStale();
         $byRole = [];
+        $memoryObservations = [];
         foreach ($this->activeInScope('thread:' . $threadId) as $slot) {
-            if (in_array($slot->record_type, ['memory', 'procedure'], true)) {
-                $memory = $slot->record_id === null ? null : Memory::inspectByID((int) $slot->record_id);
-                if (!$memory instanceof Memory || $memory->status !== 'active' || $memory->tier === 'working') {
-                    continue;
-                }
+            $current = $this->serializeCurrentSlot($slot, $memoryObservations);
+            if ($current !== null) {
+                $byRole[(string) $slot->slot_role] = $current;
             }
-            $byRole[(string) $slot->slot_role] = $this->serializeSlot($slot);
         }
         return $byRole;
     }
 
     /**
      * Uniform prompt payload. Thread state overrides a shared role of the same
-     * name, keeping the result bounded to one occupant per role.
+     * name, keeping the result bounded to one occupant per role. The optional
+     * observation output retains full source records separately from slot text
+     * for queue-time fingerprints; it must not be sent to the model.
      *
+     * @param array<int, array<string, mixed>|null>|null $memoryObservations
      * @return list<array<string, mixed>>
      */
-    public function snapshot(?int $threadId = null, bool $privacySafe = false): array
+    public function snapshot(
+        ?int $threadId = null,
+        bool $privacySafe = false,
+        ?array &$memoryObservations = null
+    ): array
     {
+        // Invocation-local observation only; never retain across decision gates.
+        $memoryObservations = [];
         $this->expireStale();
         $byRole = [];
         foreach ($this->activeInScope('shared') as $slot) {
             if ($privacySafe && !in_array($slot->slot_role, self::PRIVACY_SAFE_ROLES, true)) {
                 continue;
             }
-            $byRole[(string) $slot->slot_role] = $this->serializeSlot($slot);
+            // A permitted role can contain a redacted summary of private
+            // evidence; source hydration must not undo that redaction.
+            if ($privacySafe && in_array($slot->record_type, ['memory', 'procedure'], true)) {
+                continue;
+            }
+            $current = $this->serializeCurrentSlot($slot, $memoryObservations);
+            if ($current !== null) {
+                $byRole[(string) $slot->slot_role] = $current;
+            }
         }
         if ($threadId !== null && !$privacySafe) {
             foreach ($this->activeInScope('thread:' . $threadId) as $slot) {
-                $byRole[(string) $slot->slot_role] = $this->serializeSlot($slot);
+                $current = $this->serializeCurrentSlot($slot, $memoryObservations);
+                if ($current !== null) {
+                    $byRole[(string) $slot->slot_role] = $current;
+                }
             }
         }
         ksort($byRole);
@@ -218,10 +339,16 @@ final class WorkingMemory
     }
 
     /** @param array<string, mixed> $inputRefs
+     *  @param array<int, array<string, mixed>|null>|null $memoryObservations
      *  @return list<array<string, mixed>>
      */
-    public function contextForWork(?int $parentIntentionId, array $inputRefs): array
+    public function contextForWork(
+        ?int $parentIntentionId,
+        array $inputRefs,
+        ?array &$memoryObservations = null
+    ): array
     {
+        $memoryObservations = [];
         $scope = (string) ($inputRefs['context_scope'] ?? '');
         if ($scope === 'no_workspace') {
             return [];
@@ -236,7 +363,7 @@ final class WorkingMemory
                 $threadId = (int) $thread->id;
             }
         }
-        $snapshot = $this->snapshot($threadId, $privacySafe);
+        $snapshot = $this->snapshot($threadId, $privacySafe, $memoryObservations);
         if ($this->core->otherModel()->isAblated()) {
             $snapshot = array_values(array_filter(
                 $snapshot,
@@ -244,6 +371,205 @@ final class WorkingMemory
             ));
         }
         return $snapshot;
+    }
+
+    /**
+     * Bounded local upkeep. Pointerless legacy projections need an unbounded
+     * adoption scan in findProjection, so leave them to explicit/foreground
+     * recovery rather than hiding that work in this batch.
+     *
+     * @return array<string, mixed>
+     */
+    public function maintainBatch(int $limit = 32): array
+    {
+        if ($limit < 1 || $limit > 128) {
+            throw new InvalidArgumentException('Workspace maintenance limit must be between 1 and 128.');
+        }
+        $connection = Connections::getConnection();
+        if ($connection->inTransaction()) {
+            throw new RuntimeException('Workspace maintenance requires its own transaction boundaries.');
+        }
+        $slots = $this->selectMaintenanceBatch($limit);
+        $result = ['visited' => 0, 'replayed' => 0, 'expired' => 0, 'refreshed' => 0,
+            'unchanged' => 0, 'raced' => 0, 'deferred_legacy' => 0, 'errors' => []];
+        foreach ($slots as $slot) {
+            $id = (int) $slot->id;
+            $this->maintenanceCursor = $id;
+            $result['visited']++;
+            try {
+                $state = $this->projectionState($slot);
+                if ($state['memory_id'] === null) {
+                    $result['deferred_legacy']++;
+                    continue;
+                }
+                if ($state['pending'] !== null) {
+                    $this->replayProjection($slot, false);
+                    $result['replayed']++;
+                }
+                $slot = WorkingMemorySlot::getByID($id);
+                if (!$slot instanceof WorkingMemorySlot) {
+                    throw new RuntimeException('Workspace maintenance source slot disappeared.');
+                }
+                $fields = [];
+                $now = time();
+                $change = 'unchanged';
+                if ($slot->status === 'active') {
+                    $expiry = $slot->expires_at;
+                    if ($expiry !== null && (($this->timestamp($expiry) ?? 0) <= $now)) {
+                        $fields = ['status' => 'expired'];
+                    } elseif (in_array($slot->record_type, ['memory', 'procedure'], true)) {
+                        $sourceId = (int) ($slot->record_id ?? 0);
+                        $source = $sourceId < 1 ? null : Memory::inspectByID($sourceId);
+                        if (!$this->eligibleBackingRecord((string) $slot->record_type,
+                            $source instanceof Memory ? $source->getData() : null, $now)) {
+                            $fields = ['status' => 'expired'];
+                        } else {
+                            $claim = mb_substr((string) $source->content, 0, 800);
+                            $confidence = round((float) $source->confidence, 4);
+                            if ((string) $slot->claim !== $claim || (float) $slot->confidence !== $confidence) {
+                                $fields = ['claim' => $claim, 'confidence' => $confidence];
+                            }
+                        }
+                        unset($source);
+                    }
+                    if ($fields !== []) {
+                        $change = isset($fields['status']) ? 'expired' : 'refreshed';
+                        $fields['updated_at'] = $now;
+                    }
+                }
+                if ($fields !== []) {
+                    $fresh = $this->maintainSlotIfUnchanged($slot, $fields);
+                    if ($fresh === null) {
+                        $result['raced']++;
+                        continue;
+                    }
+                    $slot = $fresh;
+                }
+                // Canonical mutation, when needed, has committed its journal.
+                // Synchronization keeps native writes outside SQLite.
+                $this->synchronizeProjection($slot, false);
+                $result[$change]++;
+            } catch (\Throwable $error) {
+                $result['errors'][] = ['slot_id' => $id, 'error' => $error->getMessage()];
+            }
+        }
+        // Legacy field remains the last actually visited ID, not either
+        // queue's high-water mark. The independent cursors are explicit below.
+        $result['after_id'] = $this->maintenanceCursor;
+        $result['priority_after_id'] = $this->maintenancePriorityCursor;
+        $result['audit_after_id'] = $this->maintenanceAuditCursor;
+        return $result;
+    }
+
+    /**
+     * Selection progress survives --once and process replacement. This short
+     * transaction contains only SQLite reads/writes; projection/source work
+     * starts after commit and keeps its independent identity checks.
+     *
+     * @return list<WorkingMemorySlot>
+     */
+    private function selectMaintenanceBatch(int $limit): array
+    {
+        $connection = Connections::getConnection();
+        $connection->exec('BEGIN IMMEDIATE');
+        try {
+            $query = $connection->query(
+                'SELECT priority_after_id,audit_after_id,audit_next FROM workspace_maintenance_scan WHERE id = 1'
+            );
+            $state = $query->fetch(PDO::FETCH_ASSOC);
+            $query->closeCursor();
+            if (!is_array($state)) {
+                throw new RuntimeException('Workspace maintenance cursor is missing.');
+            }
+            $this->maintenancePriorityCursor = (int) $state['priority_after_id'];
+            $this->maintenanceAuditCursor = (int) $state['audit_after_id'];
+            $this->maintenanceAuditNext = (int) $state['audit_next'] === 1;
+            if ($limit === 1) {
+                $priority = !$this->maintenanceAuditNext;
+                $this->maintenanceAuditNext = !$this->maintenanceAuditNext;
+                $slots = $this->maintenancePage($priority, 1);
+                if ($slots === []) {
+                    $slots = $this->maintenancePage(!$priority, 1);
+                }
+            } else {
+                // Preserve active/journal priority and a retired-history audit
+                // allowance. Both predicates observe the same SQL snapshot.
+                $slots = $this->maintenancePage(true, $limit - 1);
+                $audit = $this->maintenancePage(false, $limit - count($slots));
+                $slots = array_merge($slots, $audit);
+            }
+            $save = $connection->prepare(
+                'UPDATE workspace_maintenance_scan SET priority_after_id = :priority,
+                 audit_after_id = :audit, audit_next = :next WHERE id = 1'
+            );
+            $save->execute(['priority' => $this->maintenancePriorityCursor,
+                'audit' => $this->maintenanceAuditCursor, 'next' => $this->maintenanceAuditNext ? 1 : 0]);
+            if ($save->rowCount() !== 1) {
+                throw new RuntimeException('Workspace maintenance cursor could not advance.');
+            }
+            $connection->commit();
+            return $slots;
+        } catch (\Throwable $error) {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            throw $error;
+        }
+    }
+
+    /** @return list<WorkingMemorySlot> */
+    private function maintenancePage(bool $priority, int $limit): array
+    {
+        $cursor = $priority ? $this->maintenancePriorityCursor : $this->maintenanceAuditCursor;
+        // Keep these predicates identical to the Schema23 partial indexes.
+        // Inactive rows with pending journals remain in the priority queue.
+        $predicate = $priority ? "(status = 'active' OR projection_pending IS NOT NULL)"
+            : "(status <> 'active' AND projection_pending IS NULL)";
+        $read = static fn (int $after): array => WorkingMemorySlot::getAllByWhere(
+            ['id > ' . $after, $predicate], ['order' => ['id' => 'ASC'], 'limit' => $limit]
+        );
+        $rows = $read($cursor);
+        if ($rows === [] && $cursor > 0) {
+            $cursor = 0;
+            $rows = $read(0);
+        }
+        if ($rows !== []) {
+            $cursor = (int) $rows[array_key_last($rows)]->id;
+        }
+        if ($priority) {
+            $this->maintenancePriorityCursor = $cursor;
+        } else {
+            $this->maintenanceAuditCursor = $cursor;
+        }
+        return $rows;
+    }
+
+    /** @param array<string, mixed> $fields */
+    private function maintainSlotIfUnchanged(WorkingMemorySlot $observed, array $fields): ?WorkingMemorySlot
+    {
+        $connection = Connections::getConnection();
+        $expected = serialize($observed->getData());
+        $connection->exec('BEGIN IMMEDIATE');
+        try {
+            $current = WorkingMemorySlot::getByID((int) $observed->id);
+            $state = $current instanceof WorkingMemorySlot ? $this->projectionState($current) : null;
+            if (!$current instanceof WorkingMemorySlot
+                || serialize($current->getData()) !== $expected
+                || $state['pending'] !== null || $state['memory_id'] === null) {
+                $connection->commit();
+                return null;
+            }
+            $current->setFields($fields);
+            $current->save();
+            $this->installProjectionIntent($current);
+            $connection->commit();
+            return $current;
+        } catch (\Throwable $error) {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            throw $error;
+        }
     }
 
     public function expireStale(?int $now = null): int
@@ -282,13 +608,29 @@ final class WorkingMemory
             $identity = $this->identity((string) $memory->content);
             $expiresAt = $this->timestamp($memory->expires_at);
             if ($identity !== null && $expiresAt !== null && $expiresAt <= $now) {
-                $memory->setFields(['status' => 'expired', 'updated_at' => $now]);
-                $memory->saveWithOperation($this->projectionOperationKey(
-                    'expire-legacy',
-                    (string) $identity['scope'],
-                    (string) $identity['slot'],
-                    ['id' => (int) $memory->id, 'status' => 'expired']
-                ));
+                $lock = $this->acquireProjectionLock($identity['scope'], $identity['slot'], true);
+                try {
+                    // A canonical slot owns its projection lifecycle. Recheck
+                    // after ownership so adoption or a TTL refresh cannot race
+                    // this legacy-only retirement.
+                    if ($this->find($identity['scope'], $identity['slot']) instanceof WorkingMemorySlot) {
+                        continue;
+                    }
+                    $fresh = Memory::inspectByID((int) $memory->id);
+                    $expiry = $fresh instanceof Memory ? $this->timestamp($fresh->expires_at) : null;
+                    if (!$fresh instanceof Memory || $fresh->status !== 'active'
+                        || $expiry === null || $expiry > $now) {
+                        continue;
+                    }
+                    $fresh->setFields(['status' => 'expired', 'updated_at' => $now]);
+                    $fresh->saveWithOperation($this->projectionOperationKey(
+                        'expire-legacy', $identity['scope'], $identity['slot'],
+                        ['id' => (int) $fresh->id, 'status' => 'expired']
+                    ));
+                } finally {
+                    flock($lock, LOCK_UN);
+                    fclose($lock);
+                }
             }
         }
         return $expired;
@@ -457,15 +799,15 @@ final class WorkingMemory
         }
     }
 
-    private function synchronizeProjection(WorkingMemorySlot $slot): ?Memory
+    private function synchronizeProjection(WorkingMemorySlot $slot, bool $allowLegacyScan = true): ?Memory
     {
         $state = $this->projectionState($slot);
         if ($state['pending'] !== null) {
-            return $this->replayProjection($slot);
+            return $this->replayProjection($slot, $allowLegacyScan);
         }
         $memory = $state['memory_id'] === null
             ? null
-            : $this->findProjection($slot, (string) $slot->scope_key, (string) $slot->slot_role);
+            : $this->findProjection($slot, (string) $slot->scope_key, (string) $slot->slot_role, $allowLegacyScan);
         if ($this->projectionMatches($slot, $memory)) {
             return $memory;
         }
@@ -492,7 +834,7 @@ final class WorkingMemory
             }
             throw $throwable;
         }
-        return $this->replayProjection($fresh);
+        return $this->replayProjection($fresh, $allowLegacyScan);
     }
 
     private function find(string $scope, string $role): ?WorkingMemorySlot
@@ -512,7 +854,7 @@ final class WorkingMemory
         );
     }
 
-    private function findProjection(WorkingMemorySlot $slot, string $scope, string $role): ?Memory
+    private function findProjection(WorkingMemorySlot $slot, string $scope, string $role, bool $allowLegacyScan = true): ?Memory
     {
         $pointer = $this->projectionState($slot)['memory_id'];
         if ($pointer !== null) {
@@ -526,6 +868,10 @@ final class WorkingMemory
                 throw new RuntimeException('Working-memory projection pointer is invalid.');
             }
             return $memory;
+        }
+
+        if (!$allowLegacyScan) {
+            throw new RuntimeException('Pointerless projection requires explicit legacy recovery.');
         }
 
         // Content is immutable in the token store. Only an active projection
@@ -545,12 +891,88 @@ final class WorkingMemory
                     $found = $memory;
                 }
             }
-        } while (count($page) === 100);
+        } while ($page !== []);
         return $found;
     }
 
-    private function replayProjection(WorkingMemorySlot $slot): ?Memory
+    /** @return resource */
+    private function acquireProjectionLock(string $scope, string $role, bool $wait)
     {
+        if (Connections::getConnection()->inTransaction()) {
+            throw new RuntimeException('Projection ownership requires no active application transaction.');
+        }
+        $directory = dirname(__DIR__, 2) . '/var/working-memory-locks';
+        if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) {
+            throw new RuntimeException('Unable to create working-memory lock directory.');
+        }
+        clearstatcache(true, $directory);
+        $directoryState = @lstat($directory);
+        if (!is_array($directoryState) || ($directoryState['mode'] & 0170000) !== 0040000
+            || ($directoryState['mode'] & 0077) !== 0) {
+            throw new RuntimeException('Working-memory lock directory must be a private real directory.');
+        }
+        // Never unlink lock files: another process can still own that inode.
+        $path = $directory . '/' . hash('sha256', $scope . "\0" . $role) . '.lock';
+        clearstatcache(true, $path);
+        $pathState = @lstat($path);
+        if (is_array($pathState) && ($pathState['mode'] & 0170000) !== 0100000) {
+            throw new RuntimeException('Working-memory lock must be a regular file.');
+        }
+        $lock = @fopen($path, 'c');
+        if (!is_resource($lock)) {
+            throw new RuntimeException('Unable to open working-memory projection lock.');
+        }
+        try {
+            $opened = fstat($lock);
+            clearstatcache(true, $path);
+            $pathState = @lstat($path);
+            if (!is_array($opened) || !is_array($pathState)
+                || ($opened['mode'] & 0170000) !== 0100000
+                || ($pathState['mode'] & 0170000) !== 0100000
+                || $opened['dev'] !== $pathState['dev'] || $opened['ino'] !== $pathState['ino']
+                || !@chmod($path, 0600)) {
+                throw new RuntimeException('Working-memory projection lock identity is invalid.');
+            }
+            $deadline = hrtime(true) + 5000000000;
+            while (!flock($lock, LOCK_EX | LOCK_NB)) {
+                if (!$wait || hrtime(true) >= $deadline) {
+                    throw new RuntimeException('Working-memory projection is busy; retry its durable journal.');
+                }
+                usleep(10000);
+            }
+            return $lock;
+        } catch (\Throwable $error) {
+            fclose($lock);
+            throw $error;
+        }
+    }
+
+    private function replayProjection(WorkingMemorySlot $slot, bool $allowLegacyScan = true): ?Memory
+    {
+        $scope = (string) $slot->scope_key;
+        $role = (string) $slot->slot_role;
+        $lock = $this->acquireProjectionLock($scope, $role, $allowLegacyScan);
+        try {
+            // A second replayer cannot clear this intent while its native
+            // write is in flight. Canonical writers already wait for pending
+            // intents, so ownership spans the entire cross-store publication.
+            $fresh = WorkingMemorySlot::getByID((int) $slot->id);
+            if (!$fresh instanceof WorkingMemorySlot || $fresh->scope_key !== $scope || $fresh->slot_role !== $role) {
+                throw new RuntimeException('Working-memory slot identity changed before projection ownership.');
+            }
+            return $this->replayProjectionLocked($fresh, $allowLegacyScan);
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
+
+    /** Called only while this scope/role's projection lock is held. */
+    private function replayProjectionLocked(WorkingMemorySlot $slot, bool $allowLegacyScan, int $remainingReplays = 16): ?Memory
+    {
+        if ($remainingReplays < 1) {
+            throw new RuntimeException('Bounded projection replay lost repeated concurrent races.');
+        }
         $state = $this->projectionState($slot);
         $pending = $state['pending'];
         if ($pending === null) {
@@ -565,7 +987,7 @@ final class WorkingMemory
             ) {
                 return $this->upgradeLegacyProjectionIntent(
                     (int) $slot->id,
-                    (string) $state['encoded']
+                    (string) $state['encoded'], $allowLegacyScan, $remainingReplays - 1
                 );
             }
             throw new RuntimeException('Working-memory projection journal is malformed.');
@@ -585,7 +1007,7 @@ final class WorkingMemory
         $memory = $this->findProjection(
             $fresh,
             (string) $fresh->scope_key,
-            (string) $fresh->slot_role
+            (string) $fresh->slot_role, $allowLegacyScan
         );
         if ($expectedPointer === null && $memory instanceof Memory) {
             $statement = Connections::getConnection()->prepare(
@@ -599,7 +1021,7 @@ final class WorkingMemory
                 'pending' => $state['encoded'],
             ]);
             if ($statement->rowCount() !== 1) {
-                return $this->replayProjection($fresh);
+                return $this->replayProjectionLocked($fresh, $allowLegacyScan, $remainingReplays - 1);
             }
             $expectedPointer = (int) $memory->id;
         }
@@ -614,7 +1036,7 @@ final class WorkingMemory
         )) {
             return $result;
         }
-        return $this->replayProjection($fresh);
+        return $this->replayProjectionLocked($fresh, $allowLegacyScan, $remainingReplays - 1);
     }
 
     /**
@@ -622,7 +1044,7 @@ final class WorkingMemory
      * surviving crash journal is converted by exact CAS before it is replayed;
      * current code never creates that second copy of memory content.
      */
-    private function upgradeLegacyProjectionIntent(int $slotId, string $encoded): ?Memory
+    private function upgradeLegacyProjectionIntent(int $slotId, string $encoded, bool $allowLegacyScan = true, int $remainingReplays = 16): ?Memory
     {
         $connection = Connections::getConnection();
         if ($connection->inTransaction()) {
@@ -663,7 +1085,7 @@ final class WorkingMemory
                 throw new RuntimeException('Working-memory slot disappeared during journal retry.');
             }
         }
-        return $this->replayProjection($fresh);
+        return $this->replayProjectionLocked($fresh, $allowLegacyScan, $remainingReplays);
     }
 
     private function applyProjection(
@@ -835,6 +1257,57 @@ final class WorkingMemory
             return ['scope' => 'thread:' . (int) $matches[1], 'slot' => (string) $matches[2]];
         }
         return null;
+    }
+
+    /**
+     * A slot caches presentation, not source authority. Hydrate memory-backed
+     * claims with counter-neutral reads so corrections propagate immediately;
+     * an inactive, expired, or missing source cannot retain an incumbent vote.
+     *
+     * @param array<int, array<string, mixed>|null> $memoryObservations
+     * @return array<string, mixed>|null
+     */
+    private function serializeCurrentSlot(WorkingMemorySlot $slot, array &$memoryObservations): ?array
+    {
+        $row = $this->serializeSlot($slot);
+        if (!in_array($slot->record_type, ['memory', 'procedure'], true)) {
+            return $row;
+        }
+        $id = (int) ($slot->record_id ?? 0);
+        if (!array_key_exists($id, $memoryObservations)) {
+            $memory = $id < 1 ? null : Memory::inspectByID($id);
+            $memoryObservations[$id] = $memory instanceof Memory ? $memory->getData() : null;
+        }
+        $record = $memoryObservations[$id];
+        if (!$this->eligibleBackingRecord((string) $slot->record_type, $record, time())) {
+            return null;
+        }
+        $row['claim'] = mb_substr((string) $record['content'], 0, 800);
+        $row['confidence'] = round((float) $record['confidence'], 4);
+        $row['recorded_at'] = $record['updated_at'];
+        return $row;
+    }
+
+    /**
+     * Both reference kinds address native Memory IDs, never SQL Procedure IDs.
+     * `memory` is the generic nonworking namespace used by decision retrieval;
+     * `procedure` promises specifically a native procedural record.
+     *
+     * @param array<string, mixed>|null $record
+     */
+    private function eligibleBackingRecord(string $type, ?array $record, int $now): bool
+    {
+        $tiers = match ($type) {
+            'procedure' => ['procedural'],
+            'memory' => ['episodic', 'semantic', 'procedural'],
+            default => [],
+        };
+        if ($record === null || ($record['status'] ?? null) !== 'active'
+            || !in_array($record['tier'] ?? null, $tiers, true)) {
+            return false;
+        }
+        $expiry = $record['expires_at'] ?? null;
+        return $expiry === null || ($this->timestamp($expiry) ?? 0) > $now;
     }
 
     /** @return array<string, mixed> */

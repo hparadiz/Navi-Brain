@@ -10,10 +10,11 @@ use NaviBrain\Model\ThoughtArtifact;
 /** Render accepted remembered self-context for Codex SessionStart hooks. */
 final class CodexContext
 {
-    public static function render(): string
+    public static function render(bool $includeBackgroundIntentions = true): string
     {
         $personality = self::latestAccepted(NarrativeSynthesis::PERSONALITY_KIND);
-        $intentions = self::latestAccepted(NarrativeSynthesis::INTENTION_KIND);
+        $intentions = $includeBackgroundIntentions
+            ? self::latestAccepted(NarrativeSynthesis::INTENTION_KIND) : null;
 
         $parts = [
             implode("\n", [

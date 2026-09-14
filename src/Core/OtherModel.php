@@ -23,7 +23,8 @@ use Throwable;
  *
  * Mental propositions are never observations. Authorized readings establish a
  * small behavioural state; hypotheses remain expiring candidates until sealed
- * predictions resolve and forward/backward checks make them usable.
+ * predictions resolve and forecast checks make them usable. Forecast support
+ * does not establish the truth of a proposition; provenance is not inversion.
  */
 final class OtherModel
 {
@@ -33,12 +34,18 @@ final class OtherModel
     private const PSEUDOCOUNT = 1.0;
     private const USABLE_POSTERIOR = 0.55;
     private const USABLE_FORWARD_SCORE = 0.5;
-    private const USABLE_BACKWARD_SCORE = 0.6;
+    private const ASSESSMENT_SEMANTICS = [
+        'usable' => 'forecast_eligible_not_semantically_validated',
+        'posterior' => 'forecast_support_not_proposition_probability',
+        'backward_score' => 'fixed_provenance_weight_not_inverse_consistency',
+    ];
 
     private AgentObservationProjector $projector;
+    private readonly ExecutiveCore $core;
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(ExecutiveCore $core)
     {
+        $this->core = $core;
         $this->projector = new AgentObservationProjector($core);
     }
 
@@ -404,6 +411,7 @@ final class OtherModel
             $live
         )));
         $cycle->save();
+        // Retain the persisted phase name for compatibility; no inverse check exists.
         $this->advance($cycle, 'validate_forward_backward', 'infer_minimal_model', $started);
 
         $started = hrtime(true);
@@ -560,6 +568,7 @@ final class OtherModel
                 'prediction_ids' => $candidate['prediction_ids'] ?? [],
             ],
             'forward_score' => 0.0,
+            // Legacy storage name: a fixed provenance weight, never inverse consistency.
             'backward_score' => $reported ? 0.9 : 0.65,
             'predictions_resolved' => 0,
             'validation' => 'pending',
@@ -643,13 +652,16 @@ final class OtherModel
         foreach ($hypotheses as $hypothesis) {
             $resolved = (int) $hypothesis->predictions_resolved;
             $forward = (float) $hypothesis->forward_score;
-            $backward = (float) $hypothesis->backward_score;
             $posterior = (float) $hypothesis->posterior;
+            // Default-zero legacy rows have no initialized provenance weight.
+            // This is a provenance-presence check, not an inverse score threshold.
+            $hasProvenance = (float) $hypothesis->backward_score > 0.0
+                && trim((string) $hypothesis->provenance_kind) !== '';
             $validation = 'pending';
             $status = 'active';
             if ($resolved >= 1
+                && $hasProvenance
                 && $forward >= self::USABLE_FORWARD_SCORE
-                && $backward >= self::USABLE_BACKWARD_SCORE
                 && $posterior >= self::USABLE_POSTERIOR
             ) {
                 $validation = 'usable';
@@ -708,6 +720,7 @@ final class OtherModel
                 'kind' => (string) $hypothesis->kind,
                 'proposition' => (string) $hypothesis->proposition,
                 'status' => 'reported_not_prediction_validated',
+                'assessment' => $this->hypothesisAssessment($hypothesis->getData()),
                 'expires_at' => $this->timestamp($hypothesis->expires_at),
             ];
         }
@@ -729,6 +742,7 @@ final class OtherModel
             'reachability' => $context['reachability'] ?? 'unknown',
             'attention_mode' => $context['attention_mode'] ?? 'uncertain',
             'confidence' => round((float) ($cycle->observability['weight'] ?? 0.0), 4),
+            'assessment_semantics' => self::ASSESSMENT_SEMANTICS,
             'selected_hypothesis' => $selected instanceof OtherModelHypothesis ? [
                 'id' => (int) $selected->id,
                 'kind' => (string) $selected->kind,
@@ -736,6 +750,7 @@ final class OtherModel
                 'posterior' => (float) $selected->posterior,
                 'forward_score' => (float) $selected->forward_score,
                 'backward_score' => (float) $selected->backward_score,
+                'assessment' => $this->hypothesisAssessment($selected->getData()),
                 'expires_at' => $this->timestamp($selected->expires_at),
             ] : null,
             'reported_not_validated' => array_slice($reportedPending, 0, self::MAX_HYPOTHESES),
@@ -917,14 +932,16 @@ final class OtherModel
         $baseline = is_array($prediction->baseline_distribution) ? $prediction->baseline_distribution : [];
         $likelihood = ProbabilityScorer::probability($distribution, $observed);
         $baselineLikelihood = ProbabilityScorer::probability($baseline, $observed);
-        $posterior = max(0.001, min(0.999, (float) $hypothesis->posterior));
-        $odds = ($posterior / (1.0 - $posterior)) * max(0.1, min(10.0, $likelihood / $baselineLikelihood));
-        $posterior = $odds / (1.0 + $odds);
+        // The predictor uses kind/context, not proposition content. Keep this
+        // legacy posterior as forecast support, never semantic truth evidence.
+        $forecastSupport = max(0.001, min(0.999, (float) $hypothesis->posterior));
+        $odds = ($forecastSupport / (1.0 - $forecastSupport)) * max(0.1, min(10.0, $likelihood / $baselineLikelihood));
+        $forecastSupport = $odds / (1.0 + $odds);
         $resolved = (int) $hypothesis->predictions_resolved;
         $quality = 1.0 - min(1.0, ((float) $prediction->brier_score) / 2.0);
         $forward = (($resolved * (float) $hypothesis->forward_score) + $quality) / ($resolved + 1);
         $hypothesis->setFields([
-            'posterior' => round($posterior, 4),
+            'posterior' => round($forecastSupport, 4),
             'forward_score' => round($forward, 4),
             'predictions_resolved' => $resolved + 1,
             'updated_at' => time(),
@@ -1395,6 +1412,8 @@ final class OtherModel
             $expiresAt = $this->timestamp($candidate['expires_at'] ?? null);
             if ($candidate !== [] && $expiresAt !== null && $expiresAt > time()) {
                 $state = $candidate;
+                // Annotate older snapshots on read without rewriting their evidence.
+                $state['assessment_semantics'] = self::ASSESSMENT_SEMANTICS;
                 break;
             }
         }
@@ -1481,10 +1500,12 @@ final class OtherModel
     /** Capture the pre-ToM social proxy once, before new cycles can change it. */
     public function captureBaseline(): ?array
     {
-        $existing = MetricSnapshot::getByWhere([
+        // Fully consume the lookup so initialization leaves no SQLite read
+        // cursor open across the next native-memory request.
+        $existing = MetricSnapshot::getAllByWhere([
             'protocol_version' => 'other-model-pre-v1',
             'scope_key' => 'social-feedback',
-        ], ['order' => ['id' => 'ASC']]);
+        ], ['order' => ['id' => 'ASC'], 'limit' => 1])[0] ?? null;
         if ($existing instanceof MetricSnapshot) {
             return $existing->getData();
         }
@@ -1653,9 +1674,38 @@ final class OtherModel
     private function recordData(array $records): array
     {
         return array_values(array_map(
-            static fn (object $record): array => $record->getData(),
+            fn (object $record): array => $record instanceof OtherModelHypothesis
+                ? array_merge($record->getData(), ['assessment' => $this->hypothesisAssessment($record->getData())])
+                : $record->getData(),
             $records
         ));
+    }
+
+    /** @param array<string, mixed> $hypothesis @return array<string, mixed> */
+    private function hypothesisAssessment(array $hypothesis): array
+    {
+        return [
+            'forecast_scope' => 'kind_and_context_conditioned_observable_category',
+            'forecast_support' => $hypothesis['posterior'] ?? null,
+            'forecast_quality' => (int) ($hypothesis['predictions_resolved'] ?? 0) > 0
+                ? ($hypothesis['forward_score'] ?? null)
+                : null,
+            'validation_scope' => 'forecast_eligibility_only',
+            'proposition_support' => ($hypothesis['status'] ?? null) === 'corrected'
+                ? 'corrected_by_user'
+                : match ($hypothesis['representation'] ?? null) {
+                    'stated' => 'reported_unverified',
+                    'inferred' => 'inferred_unverified',
+                    default => 'unverified',
+                },
+            'proposition_probability' => null,
+            'provenance_kind' => $hypothesis['provenance_kind'] ?? null,
+            'provenance_weight' => (float) ($hypothesis['backward_score'] ?? 0.0) > 0.0
+                ? $hypothesis['backward_score']
+                : null,
+            'inverse_consistency_score' => null,
+            'legacy_fields' => self::ASSESSMENT_SEMANTICS,
+        ];
     }
 
     private function timestamp(mixed $value): ?int

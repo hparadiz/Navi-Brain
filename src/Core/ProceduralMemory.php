@@ -11,9 +11,11 @@ use NaviBrain\Model\ActionTrace;
 use NaviBrain\Model\Event;
 use NaviBrain\Model\Intention;
 use NaviBrain\Model\Memory;
+use NaviBrain\Model\MemorySource;
 use NaviBrain\Model\Procedure;
 use NaviBrain\Model\ProcedureRun;
 use NaviBrain\Model\SensorySource;
+use NaviBrain\Perception\CommandSense;
 use NaviBrain\Storage\TokenMemoryDaemon;
 use PDO;
 use RuntimeException;
@@ -75,12 +77,16 @@ final class ProceduralMemory
             'effect' => 'observe',
             'required' => ['command' => 'string', 'because' => 'string'],
             'optional' => [],
+            'observation_contract' => 'fixed_kernel_files_v1',
             'verifier' => ['kind' => 'exit_code_zero'],
         ],
     ];
 
-    public function __construct(private readonly ExecutiveCore $core)
+    private readonly ExecutiveCore $core;
+
+    public function __construct(ExecutiveCore $core)
     {
+        $this->core = $core;
     }
 
     /** @return list<array<string, mixed>> */
@@ -88,6 +94,9 @@ final class ProceduralMemory
     {
         $rows = [];
         foreach (self::ADAPTERS as $kind => $adapter) {
+            if ($kind === 'machine.look') {
+                $adapter['operations'] = CommandSense::operations();
+            }
             $rows[] = ['action_kind' => $kind] + $adapter;
         }
         return $rows;
@@ -210,17 +219,20 @@ final class ProceduralMemory
             ];
         }
         if ($actionKind === 'machine.look') {
+            $operation = CommandSense::resolveOperation((string) $arguments['command']);
             $source = SensorySource::getByField('source_key', 'machine_inspection');
-            $feasible = $source instanceof SensorySource
+            $feasible = $operation !== null && $source instanceof SensorySource
                 && $source->status === 'active'
                 && $source->effect_ceiling === 'observe';
             return [
                 'feasible' => $feasible,
                 'confidence' => $feasible ? 0.8 : 0.0,
-                'predicted' => ['request_queued' => true, 'feedback' => 'sandboxed machine observation'],
+                'predicted' => ['request_queued' => $feasible, 'operation' => $operation, 'effect_contract' => 'fixed_kernel_files_v1'],
                 'reason' => $feasible
-                    ? 'The user-authorized observe-only source is active.'
-                    : 'The user-authorized machine inspection source is unavailable.',
+                    ? 'The authorized source supports this fixed-file kernel observation.'
+                    : ($operation === null
+                        ? 'Unsupported observation; choose a named operation: ' . implode(', ', array_keys(CommandSense::operations()))
+                        : 'The user-authorized machine inspection source is unavailable.'),
             ];
         }
         return ['feasible' => false, 'confidence' => 0.0, 'predicted' => [], 'reason' => 'No simulation exists.'];
@@ -352,10 +364,12 @@ final class ProceduralMemory
             (int) $execution->verified === 1,
             (string) $execution->status
         );
-        if ((string) $execution->action_kind === 'machine.look') {
+        if (($observed['dispatch_not_attempted'] ?? false) === true) {
+            $repairNote = 'No adapter was attempted; start a fresh decision after cognition resumes.';
+        } elseif ((string) $execution->action_kind === 'machine.look') {
             $repairNote = $matched
-                ? 'No repair required; sandboxed look returned successfully.'
-                : 'The sandboxed look did not return successfully.';
+                ? 'No repair required; fixed-file observation returned successfully.'
+                : 'The fixed-file observation did not return successfully.';
         } elseif (isset($observed['error']) && is_string($observed['error'])) {
             $repairNote = 'Adapter dispatch failed: ' . $observed['error'];
         } else {
@@ -402,6 +416,10 @@ final class ProceduralMemory
         if (!$execution instanceof ActionExecution) {
             return $this->observeLegacy($action, $event, $episode);
         }
+        if ((((array) $execution->observed)['dispatch_not_attempted'] ?? false) === true) {
+            // An operator pause supplies no evidence about adapter quality.
+            return null;
+        }
 
         $shape = $this->typedShape($action, $execution);
         $existing = $this->findDefinition($shape['key']);
@@ -416,7 +434,7 @@ final class ProceduralMemory
             $existingMemory = Memory::inspectByID((int) $existing->memory_id);
             if ($existingMemory instanceof Memory
                 && $existingMemory->status === 'active'
-                && (int) ($existingMemory->source_event_id ?? 0) === (int) $event->id
+                && $this->typedMemorySourceMatches($existing, $existingMemory, $event)
             ) {
                 $existingGeneration = $this->generation(
                     is_array($existing->evidence_action_ids) ? $existing->evidence_action_ids : []
@@ -457,6 +475,7 @@ final class ProceduralMemory
         foreach ($this->actionWindowThrough((int) $action->id) as $candidate) {
             $candidateExecution = ActionExecution::getByField('action_trace_id', (int) $candidate->id);
             if (!$candidateExecution instanceof ActionExecution
+                || (((array) $candidateExecution->observed)['dispatch_not_attempted'] ?? false) === true
                 || $this->typedShape($candidate, $candidateExecution)['key'] !== $shape['key']
             ) {
                 continue;
@@ -505,8 +524,10 @@ final class ProceduralMemory
             && $seedGeneration === $generation
         ) {
             $installedMemory = Memory::inspectByID((int) $existing->memory_id);
-            if (!$installedMemory instanceof Memory) {
-                throw new RuntimeException('Installed pending procedure memory disappeared.');
+            if (!$installedMemory instanceof Memory
+                || !$this->typedMemorySourceMatches($existing, $installedMemory, $event)
+            ) {
+                throw new RuntimeException('Installed pending procedure memory has no matching source.');
             }
             $previousMemoryId = $installedMemory->supersedes_id === null
                 ? null
@@ -542,7 +563,9 @@ final class ProceduralMemory
             }
             $currentMemory = Memory::inspectByID((int) $existing->memory_id);
             $currentSource = Event::getByID((int) ($existing->source_event_id ?? 0));
-            if (!$currentMemory instanceof Memory || !$currentSource instanceof Event) {
+            if (!$currentMemory instanceof Memory || !$currentSource instanceof Event
+                || !$this->typedMemorySourceMatches($existing, $currentMemory, $currentSource)
+            ) {
                 throw new RuntimeException('Current typed procedure generation is incomplete.');
             }
             return [
@@ -599,6 +622,7 @@ final class ProceduralMemory
                 'confidence' => $confidence,
                 'status' => 'active',
                 'source_event_id' => (int) $event->id,
+                'source_event_kind' => 'event',
                 'source_memory_id' => (int) $episode->id,
                 'created_at' => $eventTime,
                 'updated_at' => $eventTime,
@@ -642,6 +666,7 @@ final class ProceduralMemory
                 'confidence' => $confidence,
                 'status' => 'active',
                 'source_event_id' => (int) $event->id,
+                'source_event_kind' => 'event',
                 'source_memory_id' => (int) $episode->id,
                 'created_at' => $eventTime,
                 'updated_at' => $eventTime,
@@ -810,6 +835,12 @@ final class ProceduralMemory
                 ];
             }
             $durableStatus = (string) ($dispatchClaim['execution']['status'] ?? '');
+            if ($durableStatus === 'pending') {
+                // An explicit pause can land between action admission and
+                // dispatch. Procedure steps may replay their exact identity;
+                // held decision actions require a fresh cycle after resume.
+                return ['status' => 'held', 'reason' => 'cognition_paused', 'started' => $started];
+            }
             if ($durableStatus === 'dispatching') {
                 return ['status' => 'in_progress', 'started' => $started];
             }
@@ -1244,6 +1275,9 @@ final class ProceduralMemory
         $actionIds = is_array($run->action_trace_ids) ? array_map('intval', $run->action_trace_ids) : [];
 
         while ((int) $run->current_step < count($steps)) {
+            if (ExecutiveControl::status()['paused']) {
+                return $this->heldRun($run, $procedure);
+            }
             $currentProcedure = $this->activeRunProcedure($run, false);
             if (!$currentProcedure instanceof Procedure) {
                 return $this->cancelStaleRun($run);
@@ -1272,27 +1306,40 @@ final class ProceduralMemory
             // A composite exposes the union of its inputs, but each adapter
             // receives only the names belonging to its own step.
             $arguments = array_replace($defaults, array_intersect_key($runtime, $defaults));
-            $outcome = $this->executeAction(
-                (int) $run->intention_id,
-                (string) ($step['action_kind'] ?? ''),
-                $arguments,
-                (string) ($step['description'] ?? $procedure->description),
-                (string) ($step['expected'] ?? 'Installed postcondition verifies.'),
-                $sourceProcedureId,
-                $sourceProcedureMemoryId,
-                (int) $run->id,
-                $index,
-                is_array($step['verifier'] ?? null) ? $step['verifier'] : null
-            );
+            try {
+                $outcome = $this->executeAction(
+                    (int) $run->intention_id,
+                    (string) ($step['action_kind'] ?? ''),
+                    $arguments,
+                    (string) ($step['description'] ?? $procedure->description),
+                    (string) ($step['expected'] ?? 'Installed postcondition verifies.'),
+                    $sourceProcedureId,
+                    $sourceProcedureMemoryId,
+                    (int) $run->id,
+                    $index,
+                    is_array($step['verifier'] ?? null) ? $step['verifier'] : null
+                );
+            } catch (CognitionPaused) {
+                // The final admission gate can observe a pause after the
+                // precheck. Catch only that typed, pre-creation refusal.
+                $durableRun = ProcedureRun::getByID((int) $run->id);
+                if (!$durableRun instanceof ProcedureRun) {
+                    throw new RuntimeException('Paused procedure run disappeared.');
+                }
+                if (in_array($durableRun->status, ['succeeded', 'failed', 'cancelled'], true)) {
+                    return $this->replayTerminalRun($durableRun);
+                }
+                return $this->heldRun($durableRun, $procedure);
+            }
             $actionId = (int) ($outcome['started']['action']['id'] ?? 0);
             if ($actionId > 0) {
                 $actionIds[] = $actionId;
             }
             $run->setField('action_trace_ids', array_values(array_unique($actionIds)));
 
-            if (($outcome['status'] ?? null) === 'in_progress') {
+            if (in_array($outcome['status'] ?? null, ['in_progress', 'held'], true)) {
                 return [
-                    'status' => 'in_progress',
+                    'status' => $outcome['status'],
                     'procedure' => $procedure->getData(),
                     'run' => $run->getData(),
                     'step' => $outcome,
@@ -1412,6 +1459,17 @@ final class ProceduralMemory
             'procedure' => $procedure->getData(),
             'run' => $terminal['run'],
             'event' => $terminal['event'],
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    private function heldRun(ProcedureRun $run, Procedure $procedure): array
+    {
+        return [
+            'status' => 'held',
+            'reason' => 'cognition_paused',
+            'procedure' => $procedure->getData(),
+            'run' => $run->getData(),
         ];
     }
 
@@ -1765,6 +1823,9 @@ final class ProceduralMemory
         }
 
         if ($kind === 'machine.look') {
+            if (CommandSense::resolveOperation((string) $arguments['command']) === null) {
+                throw new InvalidArgumentException('machine.look requires a named fixed-file observation; arbitrary commands are unsupported.');
+            }
             $source = SensorySource::getByField('source_key', 'machine_inspection');
             if (!$source instanceof SensorySource
                 || $source->status !== 'active'
@@ -2163,7 +2224,7 @@ final class ProceduralMemory
         $memory = Memory::inspectByID((int) $procedure->memory_id);
         if (!$memory instanceof Memory
             || (string) $memory->status !== 'active'
-            || (int) ($memory->source_event_id ?? 0) !== (int) $sourceEvent->id
+            || !$this->typedMemorySourceMatches($procedure, $memory, $sourceEvent)
         ) {
             return null;
         }
@@ -2250,7 +2311,7 @@ final class ProceduralMemory
         if (!$replayingPendingGeneration
             && $existing instanceof Memory
             && $existing->status === 'active'
-            && (int) ($existing->source_event_id ?? 0) === (int) $event->id
+            && $this->legacyMemorySourceMatches($existing, $event, $shape['key'])
         ) {
             $existingGeneration = $this->generation($this->legacyEvidenceIds($existing));
             if ($this->canReplayProcedureGeneration($shape['key'], $existingGeneration)) {
@@ -2305,7 +2366,7 @@ final class ProceduralMemory
         $previousMemoryId = $existing instanceof Memory ? (int) $existing->id : null;
         if ($replayingPendingGeneration
             && $existing instanceof Memory
-            && (int) ($existing->source_event_id ?? 0) === (int) $event->id
+            && $this->legacyMemorySourceMatches($existing, $event, $shape['key'])
             && $seedGeneration === $generation
         ) {
             $previousMemoryId = $existing->supersedes_id === null
@@ -2338,7 +2399,7 @@ final class ProceduralMemory
             ) {
                 return null;
             }
-            $currentSource = Event::getByID((int) ($existing->source_event_id ?? 0));
+            $currentSource = $this->legacySourceEvent($existing, $shape['key']);
             if (!$currentSource instanceof Event) {
                 throw new RuntimeException('Current legacy procedure generation is incomplete.');
             }
@@ -2373,6 +2434,7 @@ final class ProceduralMemory
                 'confidence' => $confidence,
                 'status' => 'active',
                 'source_event_id' => (int) $event->id,
+                'source_event_kind' => 'event',
                 'source_memory_id' => (int) $episode->id,
                 'created_at' => $eventTime,
                 'updated_at' => $eventTime,
@@ -2389,6 +2451,7 @@ final class ProceduralMemory
                 'confidence' => $confidence,
                 'status' => 'active',
                 'source_event_id' => (int) $event->id,
+                'source_event_kind' => 'event',
                 'source_memory_id' => (int) $episode->id,
                 'created_at' => $eventTime,
                 'updated_at' => $eventTime,
@@ -2413,7 +2476,7 @@ final class ProceduralMemory
     ): ?array {
         if (!$memory instanceof Memory
             || (string) $memory->status !== 'active'
-            || (int) ($memory->source_event_id ?? 0) !== (int) $sourceEvent->id
+            || !$this->legacyMemorySourceMatches($memory, $sourceEvent, $shapeKey)
             || $this->generation($this->legacyEvidenceIds($memory)) !== $generation
         ) {
             return null;
@@ -2426,6 +2489,70 @@ final class ProceduralMemory
             'created' => false,
             'deduplicated' => true,
         ];
+    }
+
+    private function typedMemorySourceMatches(
+        Procedure $procedure,
+        Memory $memory,
+        Event $event
+    ): bool {
+        // A Procedure has an independently typed executive Event relationship.
+        // That exact join permits old memory receipts without retagging them.
+        return (int) $procedure->memory_id === (int) $memory->id
+            && (int) ($procedure->source_event_id ?? 0) === (int) $event->id
+            && (int) ($memory->source_event_id ?? 0) === (int) $event->id
+            && in_array($memory->source_event_kind, [null, 'event'], true);
+    }
+
+    private function legacyMemorySourceMatches(
+        Memory $memory,
+        Event $event,
+        string $shapeKey
+    ): bool {
+        if ((int) ($memory->source_event_id ?? 0) !== (int) $event->id) {
+            return false;
+        }
+        return $memory->source_event_kind === 'event'
+            || ($memory->source_event_kind === null
+                && $this->hasLegacyCompiledReceipt($memory, $shapeKey));
+    }
+
+    private function legacySourceEvent(Memory $memory, string $shapeKey): ?Event
+    {
+        if ($memory->source_event_kind === 'event') {
+            $event = MemorySource::inspect($memory->getData());
+            return $event instanceof Event ? $event : null;
+        }
+        if ($memory->source_event_kind !== null
+            || !$this->hasLegacyCompiledReceipt($memory, $shapeKey)
+        ) {
+            return null;
+        }
+        // Resolve the namespace only after its durable compilation binding.
+        return Event::getByID((int) $memory->source_event_id);
+    }
+
+    private function hasLegacyCompiledReceipt(Memory $memory, string $shapeKey): bool
+    {
+        $sourceId = (int) ($memory->source_event_id ?? 0);
+        if ($sourceId < 1 || $memory->tier !== 'procedural') {
+            return false;
+        }
+        $statement = Connections::getConnection()->prepare(
+            'SELECT id FROM events WHERE dedupe_key = :key LIMIT 1'
+        );
+        $statement->execute(['key' => 'procedure.compiled:' . $sourceId . ':' . $shapeKey]);
+        $id = $statement->fetchColumn();
+        $statement->closeCursor();
+        $receipt = $id === false ? null : Event::getByID((int) $id);
+        if (!$receipt instanceof Event || $receipt->kind !== 'procedure.compiled') {
+            return false;
+        }
+        $payload = is_array($receipt->payload) ? $receipt->payload : [];
+        return (int) ($payload['memory_id'] ?? 0) === (int) $memory->id
+            && ($payload['procedure_key'] ?? null) === $shapeKey
+            && ($payload['adapter_installed'] ?? null) === false
+            && ($payload['action_ids'] ?? null) === $this->legacyEvidenceIds($memory);
     }
 
     /** @return array{key: string, description: string, expected: string} */
@@ -2459,7 +2586,7 @@ final class ProceduralMemory
                     $match = $memory;
                 }
             }
-        } while (count($page) === 256);
+        } while ($page !== []);
 
         if ($activeOnly && $match instanceof Memory) {
             Memory::observeRecords([$match]);

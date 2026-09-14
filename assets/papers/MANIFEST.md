@@ -6,7 +6,7 @@ expected filenames, bibliographic records, retrieval sources, and page counts;
 copy. After obtaining the papers, verify the corpus from this directory with
 `sha256sum -c SHA256SUMS`.
 
-Collected 2026-08-07 and expanded 2026-08-08 through 2026-08-10. All 83 numbered
+Collected 2026-08-07 and expanded 2026-08-08 through 2026-08-10. All 84 numbered
 records were validated as parseable PDFs. Numbered filenames retain the
 reading-list order; records #28–#30 were supplied by the user and normalized to
 canonical filenames without being downloaded again. Records #31–#45 form a
@@ -16,7 +16,9 @@ workspaces for neural modules, verbal self-correction, agentic memory
 management, self-evolving agents, and long-horizon benchmarks and runtimes.
 Records #71–#80 trace computational theory of mind from Bayesian inverse
 planning through language-grounded and automated agent models; #81–#83 are
-evaluation guardrails against treating benchmark fluency as functional ToM.
+evaluation guardrails against treating benchmark fluency as functional ToM;
+#84 extends the long-horizon set with a living-world benchmark for proactive,
+persistent life agents.
 
 | # | Paper | Expected filename | Bibliographic record | Retrieval source | Pages |
 |---:|---|---|---|---|---:|
@@ -103,6 +105,7 @@ evaluation guardrails against treating benchmark fluency as functional ToM.
 | 81 | Muchovej et al. — GPT-4o Lacks Core Features of Theory of Mind | `81-muchovej-et-al-2026-gpt4o-lacks-tom.pdf` | [arXiv:2602.12150](https://arxiv.org/abs/2602.12150) | [arXiv PDF](https://arxiv.org/pdf/2602.12150) | 8 |
 | 82 | Bawatneh et al. — OmniToM: Benchmarking Theory of Mind in LLMs via Explicit Belief Modeling | `82-bawatneh-et-al-2026-omnitom.pdf` | [arXiv:2605.26322](https://arxiv.org/abs/2605.26322) | [arXiv PDF](https://arxiv.org/pdf/2605.26322) | 30 |
 | 83 | Riemer et al. — Position: Theory of Mind Benchmarks are Broken for Large Language Models | `83-riemer-et-al-2025-tom-benchmarks-broken.pdf` | [ICML 2025 / PMLR 267](https://proceedings.mlr.press/v267/riemer25a.html) | [PMLR PDF](https://raw.githubusercontent.com/mlresearch/v267/main/assets/riemer25a/riemer25a.pdf) | 40 |
+| 84 | Xiaohongshu Dots Studio & Evolvent AI — VibeLifeBench: Can Your Life Agent Be Proactive and Persistent in a Living World? | `84-xiaohongshu-2026-vibelifebench.pdf` | [arXiv:2608.10875](https://arxiv.org/abs/2608.10875) | [arXiv PDF](https://arxiv.org/pdf/2608.10875) | 19 |
 
 ## Version notes
 
@@ -144,6 +147,8 @@ evaluation guardrails against treating benchmark fluency as functional ToM.
   requested *Scaling Model-based Mental Inference via Automated Agent Modeling*
   title and adds Shunchi Zhang to the earlier four-author workshop version.
 - #81–#83 are catalogued as evaluation guardrails for the theory-of-mind set.
+- #84 is the arXiv v1 preprint. Its cover credits Xiaohongshu Dots Studio and
+  Evolvent AI; arXiv's PDF metadata identifies the author as Xiaohongshu Inc.
 - #64 was requested as "EvolveMem: Self-Evolving Memory Architecture via
   Autonomous Optimization" by Xia et al. The actual paper is *EvolveMem:
   Self-Evolving Memory Architecture via AutoResearch for LLM Agents*, whose

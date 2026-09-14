@@ -5,29 +5,134 @@ declare(strict_types=1);
 
 use NaviBrain\Core\ExecutiveCore;
 use NaviBrain\Core\CodexSparkWorker;
+use NaviBrain\Core\DreamCycle;
+use NaviBrain\Core\NativeMaintenance;
+use NaviBrain\Core\OpenCodeQuota;
 use NaviBrain\Core\PublicReflection;
+
+$arguments = array_slice($argv, 1);
+if ($arguments === ['--help']) {
+    fwrite(STDOUT, "Usage: navi-brain-model-worker [--once|--status]\n"
+        . "Runs the profile selected in config/cognition.php.\n"
+        . "--once runs one bounded pass and exits; it performs the configured work.\n"
+        . "--status prints configuration and a read-only quota snapshot without starting the application.\n");
+    exit(0);
+}
+if ($arguments !== [] && $arguments !== ['--once'] && $arguments !== ['--status']) {
+    fwrite(STDERR, "Usage: navi-brain-model-worker [--once|--status|--help]\n");
+    exit(2);
+}
+$once = $arguments === ['--once'];
+
+$config = require dirname(__DIR__) . '/config/cognition.php';
+if (!is_array($config)) {
+    throw new RuntimeException('Cognition configuration must be an array.');
+}
+$profile = $config['profile'] ?? 'disabled';
+if (!in_array($profile, ['native-maintenance', 'dream-cycle', 'public-reflection', 'codex-spark', 'disabled'], true)) {
+    throw new RuntimeException('Unknown cognition profile; worker will not guess a provider.');
+}
+$nativeConfig = [];
+$dreamConfig = [];
+if (in_array($profile, ['native-maintenance', 'dream-cycle'], true)) {
+    $nativeConfig = $config['native'] ?? [];
+    if (!is_array($nativeConfig)) {
+        throw new RuntimeException('Native maintenance configuration must be an array.');
+    }
+    foreach ([
+        'interval_seconds' => [30, 1, 3600],
+        'error_backoff_seconds' => [60, 1, 3600],
+        'slot_limit' => [32, 1, 128],
+        'recovery_limit' => [16, 1, 128],
+    ] as $key => [$default, $minimum, $maximum]) {
+        $value = $nativeConfig[$key] ?? $default;
+        if (!is_int($value) || $value < $minimum || $value > $maximum) {
+            throw new RuntimeException("Native maintenance {$key} must be an integer from {$minimum} to {$maximum}.");
+        }
+        $nativeConfig[$key] = $value;
+    }
+    if ($nativeConfig['error_backoff_seconds'] < $nativeConfig['interval_seconds']) {
+        throw new RuntimeException('Native maintenance error backoff must be at least its normal interval.');
+    }
+}
+if ($profile === 'dream-cycle') {
+    $dreamConfig = $config['dream'] ?? [];
+    if (!is_array($dreamConfig)) {
+        throw new RuntimeException('Dream configuration must be an array.');
+    }
+    $dreamConfig = array_replace([
+        'enabled' => false, 'allow_private_memory' => false,
+        'model' => 'muse-spark-1.3-contributor-free', 'interval_seconds' => 5400,
+        'max_prompts_per_cycle' => 1, 'source_limit' => 32,
+    ], $dreamConfig);
+    foreach (['enabled', 'allow_private_memory'] as $key) {
+        if (!is_bool($dreamConfig[$key])) {
+            throw new RuntimeException('Dream ' . $key . ' must be a boolean.');
+        }
+    }
+    foreach (['interval_seconds' => [5400, 86400], 'max_prompts_per_cycle' => [1, 2],
+        'source_limit' => [1, 32]] as $key => [$minimum, $maximum]) {
+        if (!is_int($dreamConfig[$key]) || $dreamConfig[$key] < $minimum || $dreamConfig[$key] > $maximum) {
+            throw new RuntimeException('Dream ' . $key . ' is outside its supported integer bounds.');
+        }
+    }
+    if ($dreamConfig['model'] !== 'muse-spark-1.3-contributor-free') {
+        throw new RuntimeException('Dream model must be an explicitly supported OpenCode free model.');
+    }
+}
+
+if ($arguments === ['--status']) {
+    // Loading this class has no bootstrap, constructor or provider side effects.
+    require dirname(__DIR__) . '/src/Core/OpenCodeQuota.php';
+    $quota = OpenCodeQuota::snapshot(dirname(__DIR__) . '/var/opencode-worker');
+    $privacy = match ($profile) {
+        'disabled' => 'background_disabled',
+        'native-maintenance' => 'local_only',
+        'dream-cycle' => !$dreamConfig['enabled'] ? 'dream_disabled'
+            : ($dreamConfig['allow_private_memory'] ? 'private_memory_allowed_by_config' : 'privacy_decision_required'),
+        'public-reflection' => 'public_code_only_policy',
+        'codex-spark' => 'not_evaluated_for_profile',
+    };
+    fwrite(STDOUT, json_encode([
+        'status' => 'snapshot',
+        'read_only' => true,
+        'profile' => $profile,
+        'configuration_privacy' => $privacy,
+        'configured_opencode_policy' => in_array($profile, ['dream-cycle', 'public-reflection'], true)
+            ? [
+                'interval_seconds' => $profile === 'dream-cycle' ? $dreamConfig['interval_seconds'] : 5400,
+                'max_attempts' => $profile === 'dream-cycle' ? $dreamConfig['max_prompts_per_cycle'] : 1,
+            ] : null,
+        'shared_opencode_quota' => $quota,
+        'not_checked' => ['durable_pause', 'ready_evidence', 'provider_credentials',
+            'model_catalogue', 'provider_lock', 'continuation_entitlement'],
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . PHP_EOL);
+    // Uninitialized state is normal for the local-only default. Other read or
+    // validation failures are also reported explicitly in the JSON snapshot.
+    exit(in_array($quota['snapshot'], ['valid', 'missing_or_unreadable'], true) ? 0 : 1);
+}
+if ($profile === 'disabled') {
+    fwrite(STDOUT, "Background cognition is disabled by config/cognition.php.\n");
+    exit(0);
+}
 
 require dirname(__DIR__) . '/bootstrap/app.php';
 
 $core = new ExecutiveCore();
 $core->initialize();
-$config = require dirname(__DIR__) . '/config/cognition.php';
-$profile = $config['profile'] ?? 'disabled';
 $worker = match ($profile) {
+    'native-maintenance' => new NativeMaintenance($core, $nativeConfig),
+    'dream-cycle' => new DreamCycle($core, $dreamConfig, $nativeConfig),
     'public-reflection' => new PublicReflection($core),
     'codex-spark' => new CodexSparkWorker($core),
-    'disabled' => null,
     default => throw new RuntimeException('Unknown cognition profile; worker will not guess a provider.'),
 };
-if ($worker === null) {
-    fwrite(STDOUT, "Background cognition is disabled by config/cognition.php.\n");
-    exit(0);
-}
 $nodeId = getenv('NAVI_BRAIN_NODE_ID');
 if (!is_string($nodeId) || trim($nodeId) === '') {
     $nodeId = gethostname() ?: 'local';
 }
-$owner = sprintf('%s:model-worker:%d', $nodeId, getmypid());
+$owner = sprintf('%s:%s:%d', $nodeId,
+    in_array($profile, ['native-maintenance', 'dream-cycle'], true) ? $profile : 'model-worker', getmypid());
 $running = true;
 $lastIdleStatus = null;
 
@@ -49,7 +154,7 @@ while ($running) {
         $record['type'] = $throwable::class;
     }
     $status = $record['worker']['status'] ?? null;
-    $idle = in_array($status, ['idle', 'disabled', 'awaiting_review', 'unchanged_evidence', 'evidence_already_reviewed', 'publication_required', 'provider_busy', 'provider_cooling_down'], true);
+    $idle = in_array($status, ['idle', 'disabled', 'awaiting_review', 'unchanged_evidence', 'evidence_already_reviewed', 'publication_required', 'provider_busy', 'provider_cooling_down', 'budget_exhausted'], true);
     if (!$idle || $status !== $lastIdleStatus) {
         fwrite(STDOUT, json_encode(
             $record,
@@ -58,12 +163,18 @@ while ($running) {
         fflush(STDOUT);
     }
     $lastIdleStatus = $idle ? $status : null;
-    $pause = match ($status) {
-        'spark_model_unavailable', 'spark_model_cooling_down', 'model_pool_unavailable', 'model_discovery_failed' => 30,
-        'disabled', 'awaiting_review', 'unchanged_evidence', 'evidence_already_reviewed', 'publication_required', 'provider_busy', 'provider_cooling_down' => 30,
-        'idle' => 2,
-        default => 1,
-    };
+    if ($once) {
+        exit($record['ok'] && !in_array($status, ['backoff', 'error', 'failed'], true) ? 0 : 1);
+    }
+    $pause = in_array($profile, ['native-maintenance', 'dream-cycle'], true)
+        ? ($record['ok'] && !in_array($status, ['backoff', 'error', 'failed'], true)
+            ? $nativeConfig['interval_seconds'] : $nativeConfig['error_backoff_seconds'])
+        : match ($status) {
+            'spark_model_unavailable', 'spark_model_cooling_down', 'model_pool_unavailable', 'model_discovery_failed' => 30,
+            'disabled', 'awaiting_review', 'unchanged_evidence', 'evidence_already_reviewed', 'publication_required', 'provider_busy', 'provider_cooling_down', 'budget_exhausted' => 30,
+            'idle' => 2,
+            default => 1,
+        };
     for ($seconds = 0; $running && $seconds < $pause; $seconds++) {
         sleep(1);
     }

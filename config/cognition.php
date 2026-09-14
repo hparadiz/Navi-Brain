@@ -2,9 +2,28 @@
 
 declare(strict_types=1);
 
-// Explicit non-sensitive code egress allowlist. No memory, sensors or review notes.
 return [
-    'profile' => 'public-reflection',
+    // Local upkeep plus Aku's selected free Muse consolidation lane.
+    'profile' => 'dream-cycle',
+    'native' => [
+        'interval_seconds' => 30,
+        'error_backoff_seconds' => 60,
+        'slot_limit' => 32,
+        'recovery_limit' => 16,
+    ],
+    // Selecting dream-cycle keeps native upkeep and adds this optional lane.
+    // The pinned free offers may use submitted data to improve their models.
+    'dream' => [
+        'enabled' => true,
+        'allow_private_memory' => false,
+        'model' => 'muse-spark-1.3-contributor-free',
+        'interval_seconds' => 5400,
+        'max_prompts_per_cycle' => 1,
+        'source_limit' => 32,
+    ],
+
+    // Used only when profile is explicitly set to public-reflection.
+    // Non-sensitive code egress allowlist: no memory, sensors or review notes.
     'model' => 'opencode/muse-spark-1.3-contributor-free',
     'sources' => [
         'src/Core/BackgroundStateCompiler.php' => '44d73ab06c0bc8a2ea25ea8b86f37c938bc6918c9aaba55f1d8f3860ef2afb31',

@@ -96,6 +96,13 @@ typedef struct {
 } CueSpan;
 
 typedef struct {
+    size_t token_index;
+    size_t byte_offset;
+    size_t size;
+    uint64_t folded_hash;
+} MemorySpan;
+
+typedef struct {
     unsigned char byte;
     TrieNode *child;
 } TrieEdge;
@@ -145,6 +152,12 @@ typedef struct {
     size_t posting_cursor;
 } Token;
 
+typedef enum {
+    SOURCE_EVENT_UNKNOWN = 0,
+    SOURCE_EVENT_EXECUTIVE,
+    SOURCE_EVENT_SENSE
+} SourceEventKind;
+
 typedef struct {
     int64_t id;
     Bytes created_at;
@@ -154,6 +167,7 @@ typedef struct {
     Bytes status;
     bool has_source_event_id;
     int64_t source_event_id;
+    SourceEventKind source_event_kind;
     bool has_source_memory_id;
     int64_t source_memory_id;
     bool has_supersedes_id;
@@ -168,9 +182,11 @@ struct Memory {
     char *tier_name;
     uint64_t *tokens;
     size_t token_count;
+    size_t content_byte_count;
     uint64_t *metadata_tokens;
     size_t metadata_token_count;
     unsigned char content_digest[32];
+    unsigned char content_bytes_digest[32];
     unsigned char metadata_digest[32];
     uint64_t access_count;
     uint64_t query_score;
@@ -380,7 +396,7 @@ static void usage(FILE *out)
             "  tokmem daemon STORE [SOCKET]\n"
             "  tokmem verify STORE\n"
             "  tokmem tokens STORE [LIMIT]\n"
-            "  tokmem client SOCKET stats|flush|close\n"
+            "  tokmem client SOCKET capabilities|stats|flush|close\n"
             "  tokmem client SOCKET get TIER ID\n"
             "  tokmem client SOCKET fetch ID\n"
             "  tokmem client SOCKET list TIER|- STATUS|- id|updated_at ASC|DESC LIMIT\n"
@@ -1529,7 +1545,9 @@ static int initialize_store(const char *store_path)
             "op_key TEXT PRIMARY KEY,request_sha256 BLOB NOT NULL "
             "CHECK(length(request_sha256)=32),kind TEXT NOT NULL,"
             "memory_id INTEGER NOT NULL,state INTEGER NOT NULL "
-            "CHECK(state IN (0,1))) WITHOUT ROWID") != 0 ||
+            "CHECK(state IN (0,1))) WITHOUT ROWID;"
+            "CREATE INDEX operation_receipt_memory_id "
+            "ON operation_receipt(memory_id)") != 0 ||
         sqlite_exec_checked(db, "BEGIN IMMEDIATE") != 0 ||
         sqlite3_prepare_v2(db,
             "INSERT INTO token_translation VALUES("
@@ -1807,6 +1825,11 @@ static void append_metadata(Buffer *buffer, const Metadata *metadata)
     else buffer_append_text(buffer, "-\n");
     if (metadata->has_expires_at) append_hex_field(buffer, &metadata->expires_at);
     else buffer_append_text(buffer, "-\n");
+    /* Omit the extension for legacy records to preserve their exact digests. */
+    if (metadata->source_event_kind == SOURCE_EVENT_EXECUTIVE)
+        buffer_append_text(buffer, "event\n");
+    else if (metadata->source_event_kind == SOURCE_EVENT_SENSE)
+        buffer_append_text(buffer, "sense_event\n");
 }
 
 static int metadata_encode(const Metadata *metadata, unsigned char **result,
@@ -1896,6 +1919,18 @@ static int parse_nullable_i64(const unsigned char *line, size_t size,
     return 0;
 }
 
+static int parse_source_event_kind(const unsigned char *bytes, size_t size,
+                                   SourceEventKind *kind)
+{
+    if (size == 5 && memcmp(bytes, "event", 5) == 0)
+        *kind = SOURCE_EVENT_EXECUTIVE;
+    else if (size == 11 && memcmp(bytes, "sense_event", 11) == 0)
+        *kind = SOURCE_EVENT_SENSE;
+    else
+        return -1;
+    return 0;
+}
+
 static int metadata_decode(const unsigned char *bytes, size_t size, Metadata *metadata,
                            bool allow_zero_id)
 {
@@ -1913,8 +1948,7 @@ static int metadata_decode(const unsigned char *bytes, size_t size, Metadata *me
         lengths[line] = end - start;
         start = end + 1;
     }
-    if (start != size ||
-        parse_i64_line(lines[0], lengths[0], &metadata->id, !allow_zero_id) != 0 ||
+    if (parse_i64_line(lines[0], lengths[0], &metadata->id, !allow_zero_id) != 0 ||
         (allow_zero_id && metadata->id < 0) ||
         parse_hex_field(lines[1], lengths[1], &metadata->created_at) != 0 ||
         parse_hex_field(lines[2], lengths[2], &metadata->updated_at) != 0 ||
@@ -1940,6 +1974,12 @@ static int metadata_decode(const unsigned char *bytes, size_t size, Metadata *me
         if (parse_hex_field(lines[9], lengths[9], &metadata->expires_at) != 0) goto invalid;
         metadata->has_expires_at = true;
     }
+    if (start < size &&
+        (bytes[size - 1] != '\n' ||
+         parse_source_event_kind(bytes + start, size - start - 1,
+                                  &metadata->source_event_kind) != 0 ||
+         !metadata->has_source_event_id || metadata->source_event_id <= 0))
+        goto invalid;
     if (safe_name(metadata->tier.data, metadata->tier.size) != 0) goto invalid;
     return 0;
 
@@ -1952,7 +1992,8 @@ static int safe_read_regular(const char *path, unsigned char **result, size_t *r
 {
     struct stat before;
     struct stat after;
-    int flags = O_RDONLY | O_CLOEXEC;
+    /* A path replaced by a FIFO must reach fstat instead of blocking in open. */
+    int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
     int fd;
     int rc = -1;
     if (lstat(path, &before) != 0 || !S_ISREG(before.st_mode)) {
@@ -1984,7 +2025,12 @@ static int safe_read_regular(const char *path, unsigned char **result, size_t *r
     *result_size = (size_t)after.st_size;
     rc = 0;
 done:
-    if (close(fd) != 0 && rc == 0) rc = -1;
+    if (close(fd) != 0 && rc == 0) {
+        free(*result);
+        *result = NULL;
+        *result_size = 0;
+        rc = -1;
+    }
     return rc;
 }
 
@@ -2035,19 +2081,27 @@ static int ensure_real_directory(const char *path, bool *created)
     return 0;
 }
 
+static int manifest_for_digests(const unsigned char content_digest[32],
+                                const unsigned char metadata_digest[32],
+                                Buffer *manifest)
+{
+    char hex[65];
+    digest_hex(content_digest, hex);
+    buffer_printf(manifest, "%s  content.memory\n", hex);
+    digest_hex(metadata_digest, hex);
+    buffer_printf(manifest, "%s  metadata.memory\n", hex);
+    return 0;
+}
+
 static int manifest_for_blobs(const unsigned char *content, size_t content_size,
                               const unsigned char *metadata, size_t metadata_size,
                               Buffer *manifest)
 {
-    unsigned char digest[32];
-    char hex[65];
-    sha256_bytes(content, content_size, digest);
-    digest_hex(digest, hex);
-    buffer_printf(manifest, "%s  content.memory\n", hex);
-    sha256_bytes(metadata, metadata_size, digest);
-    digest_hex(digest, hex);
-    buffer_printf(manifest, "%s  metadata.memory\n", hex);
-    return 0;
+    unsigned char content_digest[32];
+    unsigned char metadata_digest[32];
+    sha256_bytes(content, content_size, content_digest);
+    sha256_bytes(metadata, metadata_size, metadata_digest);
+    return manifest_for_digests(content_digest, metadata_digest, manifest);
 }
 
 static int verify_manifest_bytes(const unsigned char *manifest, size_t manifest_size,
@@ -2199,7 +2253,8 @@ static int publish_metadata_replacement(Engine *engine, const Memory *memory,
                                         const unsigned char *content,
                                         size_t content_size,
                                         const unsigned char *metadata,
-                                        size_t metadata_size)
+                                        size_t metadata_size,
+                                        const unsigned char metadata_digest[32])
 {
     char *tier_dir = path_join(engine->memory_dir, memory->tier_name);
     char *final_dir = path_join(tier_dir, memory->key);
@@ -2217,7 +2272,8 @@ static int publish_metadata_replacement(Engine *engine, const Memory *memory,
     content_path = path_join(staged_dir, "content.memory");
     metadata_path = path_join(staged_dir, "metadata.memory");
     manifest_path = path_join(staged_dir, "manifest.sha256");
-    manifest_for_blobs(content, content_size, metadata, metadata_size, &manifest);
+    /* Canonical re-encoding of immutable content retains its blob digest. */
+    manifest_for_digests(memory->content_digest, metadata_digest, &manifest);
     if (write_file_sync(content_path, content, content_size) != 0 ||
         write_file_sync(metadata_path, metadata, metadata_size) != 0 ||
         write_file_sync(manifest_path, manifest.items, manifest.count) != 0 ||
@@ -2451,7 +2507,6 @@ static int index_postings(Engine *engine, Memory *memory)
 {
     TokenVector stack = {0};
     TokenVector expanded = {0};
-    uint64_t *sorted;
     size_t position = 0;
     if (memory->token_count == 0) return 0;
     if (!posting_expansion_within_budget(engine, memory->tokens,
@@ -2470,18 +2525,15 @@ static int index_postings(Engine *engine, Memory *memory)
             }
         }
     }
-    sorted = xmalloc(expanded.count * sizeof(*sorted));
-    memcpy(sorted, expanded.items, expanded.count * sizeof(*sorted));
     if (expanded.count > 1)
-        qsort(sorted, expanded.count, sizeof(*sorted), compare_u64);
+        qsort(expanded.items, expanded.count, sizeof(*expanded.items), compare_u64);
     while (position < expanded.count) {
         size_t end = position + 1;
-        while (end < expanded.count && sorted[end] == sorted[position]) ++end;
-        append_posting(&engine->tokens[sorted[position]], memory,
+        while (end < expanded.count && expanded.items[end] == expanded.items[position]) ++end;
+        append_posting(&engine->tokens[expanded.items[position]], memory,
                        (uint64_t)(end - position));
         position = end;
     }
-    free(sorted);
     free(stack.items);
     free(expanded.items);
     return 0;
@@ -2794,6 +2846,7 @@ static int memory_publish_resident(Engine *engine, Metadata *metadata,
                                    bool visible)
 {
     Memory *memory = xcalloc(1, sizeof(*memory));
+    Sha256 content_bytes_sha;
     char key[64];
     snprintf(key, sizeof(key), "%" PRId64, metadata->id);
     memory->metadata = *metadata;
@@ -2808,6 +2861,23 @@ static int memory_publish_resident(Engine *engine, Metadata *metadata,
     memset(metadata_tokens, 0, sizeof(*metadata_tokens));
     memcpy(memory->content_digest, content_digest, 32);
     memcpy(memory->metadata_digest, metadata_digest, 32);
+    /* Blob identity depends on historical tokenization. Content identity does
+     * not; hash registry segments directly without materializing the prose. */
+    sha256_init(&content_bytes_sha);
+    for (size_t i = 0; i < memory->token_count; ++i) {
+        uint64_t id = memory->tokens[i];
+        const Token *token;
+        if (id >= engine->token_count ||
+            engine->tokens[id].segment_size >
+                MAX_MEMORY_BLOB_BYTES - memory->content_byte_count) {
+            memory_free(memory);
+            return -1;
+        }
+        token = &engine->tokens[id];
+        memory->content_byte_count += token->segment_size;
+        sha256_update(&content_bytes_sha, token->segment, token->segment_size);
+    }
+    sha256_final(&content_bytes_sha, memory->content_bytes_digest);
     memory->insertion_index = engine->memory_count;
     memory->visible = visible;
     if (index_postings(engine, memory) != 0) {
@@ -3712,6 +3782,9 @@ static int engine_open(Engine *engine, const char *store_path, bool with_ranker)
             "memory_id INTEGER NOT NULL,state INTEGER NOT NULL "
             "CHECK(state IN (0,1))) WITHOUT ROWID") != 0) goto fail;
     if (sqlite_exec_checked(engine->db,
+            "CREATE INDEX IF NOT EXISTS operation_receipt_memory_id "
+            "ON operation_receipt(memory_id)") != 0) goto fail;
+    if (sqlite_exec_checked(engine->db,
             "CREATE TABLE IF NOT EXISTS neutral_accounting_intent("
             "memory_id INTEGER PRIMARY KEY,tier TEXT NOT NULL,"
             "content_sha256 BLOB NOT NULL CHECK(length(content_sha256)=32),"
@@ -4394,7 +4467,7 @@ static int add_default_record(Engine *engine, const char *tier, const char *key,
 static bool bytes_equal(const Bytes *left, const Bytes *right)
 {
     return left->size == right->size &&
-           memcmp(left->data, right->data, left->size) == 0;
+           (left->size == 0 || memcmp(left->data, right->data, left->size) == 0);
 }
 
 static bool nullable_id_equal(bool left_has, int64_t left,
@@ -4415,6 +4488,7 @@ static bool metadata_semantically_equal(const Metadata *left,
            bytes_equal(&left->status, &right->status) &&
            nullable_id_equal(left->has_source_event_id, left->source_event_id,
                              right->has_source_event_id, right->source_event_id) &&
+           left->source_event_kind == right->source_event_kind &&
            nullable_id_equal(left->has_source_memory_id, left->source_memory_id,
                              right->has_source_memory_id, right->source_memory_id) &&
            nullable_id_equal(left->has_supersedes_id, left->supersedes_id,
@@ -4422,6 +4496,13 @@ static bool metadata_semantically_equal(const Metadata *left,
            left->has_expires_at == right->has_expires_at &&
            (!left->has_expires_at || bytes_equal(&left->expires_at,
                                                  &right->expires_at));
+}
+
+static bool metadata_exactly_equal(const Metadata *left, const Metadata *right)
+{
+    return metadata_semantically_equal(left, right) &&
+           bytes_equal(&left->created_at, &right->created_at) &&
+           bytes_equal(&left->updated_at, &right->updated_at);
 }
 
 static void operation_request_digest(const Metadata *first,
@@ -4457,10 +4538,9 @@ static int next_memory_id(Engine *engine, int64_t *id)
     int64_t maximum = 0;
     int64_t sequence;
     sqlite3_stmt *statement = NULL;
-    for (size_t i = 0; i < engine->memory_count; ++i) {
-        if (engine->memory_order[i]->metadata.id > maximum)
-            maximum = engine->memory_order[i]->metadata.id;
-    }
+    /* The ID index includes hidden pending records as well as visible ones. */
+    if (engine->memory_count != 0)
+        maximum = engine->memory_id_order[engine->memory_count - 1]->metadata.id;
     if (sqlite3_prepare_v2(engine->db,
             "SELECT COALESCE(MAX(memory_id),0) FROM operation_receipt",
             -1, &statement, NULL) != SQLITE_OK ||
@@ -4598,36 +4678,39 @@ done:
     return rc;
 }
 
+static bool memory_content_equals(const Engine *engine, const Memory *memory,
+                                   const unsigned char *content, size_t content_size)
+{
+    size_t offset = 0;
+    if (content_size != memory->content_byte_count ||
+        content_size > MAX_MEMORY_BLOB_BYTES) return false;
+    for (size_t i = 0; i < memory->token_count; ++i) {
+        uint64_t id = memory->tokens[i];
+        const Token *token;
+        if (id >= engine->token_count) return false;
+        token = &engine->tokens[id];
+        if (token->segment_size > content_size - offset ||
+            (token->segment_size != 0 &&
+             memcmp(token->segment, content + offset, token->segment_size) != 0))
+            return false;
+        offset += token->segment_size;
+    }
+    return offset == content_size;
+}
+
 static bool record_matches(Engine *engine, int64_t id, const Metadata *metadata,
                            const unsigned char *content, size_t content_size)
 {
     Memory *memory;
-    unsigned char *stored_content = NULL;
-    size_t stored_content_size = 0;
-    unsigned char *wanted_metadata = NULL;
-    size_t wanted_metadata_size = 0;
-    unsigned char *stored_metadata = NULL;
-    size_t stored_metadata_size = 0;
-    TokenVector tokens;
     bool matches = false;
     pthread_mutex_lock(&engine->mutex);
     memory = memory_find_id(engine, id);
     if (memory == NULL) goto done;
-    tokens = (TokenVector){memory->tokens, memory->token_count, memory->token_count};
-    metadata_encode(metadata, &wanted_metadata, &wanted_metadata_size);
-    metadata_encode(&memory->metadata, &stored_metadata, &stored_metadata_size);
-    if (wanted_metadata_size != stored_metadata_size ||
-        memcmp(wanted_metadata, stored_metadata, wanted_metadata_size) != 0 ||
-        decode_tokens_to_bytes(engine, &tokens, &stored_content,
-                               &stored_content_size) != 0 ||
-        stored_content_size != content_size ||
-        memcmp(stored_content, content, content_size) != 0) goto done;
+    if (!metadata_exactly_equal(metadata, &memory->metadata) ||
+        !memory_content_equals(engine, memory, content, content_size)) goto done;
     matches = true;
 done:
     pthread_mutex_unlock(&engine->mutex);
-    free(stored_content);
-    free(wanted_metadata);
-    free(stored_metadata);
     return matches;
 }
 
@@ -4637,23 +4720,15 @@ static bool record_semantically_matches(Engine *engine, int64_t id,
                                         size_t content_size)
 {
     Memory *memory;
-    unsigned char *stored_content = NULL;
-    size_t stored_content_size = 0;
-    TokenVector tokens;
     bool matches = false;
     pthread_mutex_lock(&engine->mutex);
     memory = memory_find_id(engine, id);
     if (memory == NULL ||
         !metadata_semantically_equal(&memory->metadata, metadata)) goto done;
-    tokens = (TokenVector){memory->tokens, memory->token_count, memory->token_count};
-    if (decode_tokens_to_bytes(engine, &tokens, &stored_content,
-                               &stored_content_size) != 0 ||
-        stored_content_size != content_size ||
-        memcmp(stored_content, content, content_size) != 0) goto done;
+    if (!memory_content_equals(engine, memory, content, content_size)) goto done;
     matches = true;
 done:
     pthread_mutex_unlock(&engine->mutex);
-    free(stored_content);
     return matches;
 }
 
@@ -4695,8 +4770,6 @@ static int update_record_metadata(Engine *engine, Metadata *metadata,
                                   size_t content_size, bool cognitive_write)
 {
     Memory *memory;
-    unsigned char *existing_content = NULL;
-    size_t existing_content_size = 0;
     unsigned char *metadata_text = NULL;
     size_t metadata_text_size = 0;
     TokenVector metadata_tokens = {0};
@@ -4736,24 +4809,13 @@ static int update_record_metadata(Engine *engine, Metadata *metadata,
     }
     existing_tokens = (TokenVector){memory->tokens, memory->token_count,
                                     memory->token_count};
-    if (decode_tokens_to_bytes(engine, &existing_tokens, &existing_content,
-                               &existing_content_size) != 0 ||
-        existing_content_size != content_size ||
-        memcmp(existing_content, content, content_size) != 0) {
+    if (!memory_content_equals(engine, memory, content, content_size)) {
         fputs("memory content is immutable; create a replacement memory\n", stderr);
         goto done;
     }
-    {
-        unsigned char *old_text = NULL;
-        size_t old_text_size = 0;
-        metadata_encode(&memory->metadata, &old_text, &old_text_size);
-        if (old_text_size == metadata_text_size &&
-            memcmp(old_text, metadata_text, metadata_text_size) == 0) {
-            free(old_text);
-            rc = 0;
-            goto done;
-        }
-        free(old_text);
+    if (metadata_exactly_equal(&memory->metadata, metadata)) {
+        rc = 0;
+        goto done;
     }
     if (sqlite_exec_checked(engine->db, "BEGIN IMMEDIATE") != 0) goto done;
     transaction = true;
@@ -4777,7 +4839,8 @@ static int update_record_metadata(Engine *engine, Metadata *metadata,
                                                    content_blob,
                                                    content_blob_size,
                                                    metadata_blob,
-                                                   metadata_blob_size);
+                                                   metadata_blob_size,
+                                                   metadata_digest);
     if (publication_rc != 0) goto done;
     if (!cognitive_write) neutral_fault_point("after_publish");
 
@@ -4831,7 +4894,6 @@ done:
     }
     if (publication_rc == PUBLISH_AMBIGUOUS_FAILURE) engine->poisoned = true;
     pthread_mutex_unlock(&engine->mutex);
-    free(existing_content);
     free(metadata_text);
     free(metadata_tokens.items);
     free(content_blob);
@@ -4850,43 +4912,67 @@ static int append_token_sequence(Buffer *out, const uint64_t *tokens, size_t cou
     return out->count <= MAX_RESPONSE_BYTES ? 0 : -1;
 }
 
+static int append_memory_content(const Engine *engine, const Memory *memory,
+                                  Buffer *out)
+{
+    size_t start = out->count;
+    size_t written = 0;
+    if (memory->content_byte_count > MAX_MEMORY_BLOB_BYTES ||
+        start > MAX_RESPONSE_BYTES ||
+        memory->content_byte_count > MAX_RESPONSE_BYTES - start) return -1;
+    buffer_reserve(out, memory->content_byte_count);
+    for (size_t i = 0; i < memory->token_count; ++i) {
+        uint64_t id = memory->tokens[i];
+        const Token *token;
+        if (id >= engine->token_count) goto invalid;
+        token = &engine->tokens[id];
+        if (token->segment_size > memory->content_byte_count - written) goto invalid;
+        if (token->segment_size != 0)
+            buffer_append(out, token->segment, token->segment_size);
+        written += token->segment_size;
+    }
+    if (written != memory->content_byte_count) goto invalid;
+    return 0;
+invalid:
+    out->count = start;
+    return -1;
+}
+
+enum { RECORD_WIRE_CAPACITY_EXCEEDED = -2 };
+
 static int append_record_wire(const Engine *engine, const Memory *memory,
                               Buffer *out)
 {
     size_t metadata_size = 0;
-    size_t content_size = 0;
+    size_t content_size = memory->content_byte_count;
     size_t start = out->count;
     char header[96];
     int header_size;
-    for (size_t i = 0; i < memory->token_count; ++i) {
-        uint64_t token_id = memory->tokens[i];
-        if (token_id >= engine->token_count ||
-            engine->tokens[token_id].segment_size >
-                MAX_MEMORY_BLOB_BYTES - content_size)
-            return -1;
-        content_size += engine->tokens[token_id].segment_size;
-    }
+    if (content_size > MAX_MEMORY_BLOB_BYTES) return -1;
     append_metadata(out, &memory->metadata);
     metadata_size = out->count - start;
     header_size = snprintf(header, sizeof(header), "%zu %zu\n",
                            metadata_size, content_size);
-    if (header_size < 0 || (size_t)header_size >= sizeof(header) ||
-        start > MAX_RESPONSE_BYTES ||
+    if (header_size < 0 || (size_t)header_size >= sizeof(header)) {
+        out->count = start;
+        return -1;
+    }
+    if (start > MAX_RESPONSE_BYTES ||
         (size_t)header_size > MAX_RESPONSE_BYTES - start ||
         metadata_size > MAX_RESPONSE_BYTES - start - (size_t)header_size ||
         content_size > MAX_RESPONSE_BYTES - start - (size_t)header_size -
                        metadata_size) {
         out->count = start;
-        return -1;
+        return RECORD_WIRE_CAPACITY_EXCEEDED;
     }
     buffer_reserve(out, (size_t)header_size + content_size);
     memmove(out->items + start + (size_t)header_size,
             out->items + start, metadata_size);
     memcpy(out->items + start, header, (size_t)header_size);
     out->count += (size_t)header_size;
-    for (size_t i = 0; i < memory->token_count; ++i) {
-        const Token *token = &engine->tokens[memory->tokens[i]];
-        buffer_append(out, token->segment, token->segment_size);
+    if (append_memory_content(engine, memory, out) != 0) {
+        out->count = start;
+        return -1;
     }
     return 0;
 }
@@ -4957,8 +5043,8 @@ static int append_activation_context(Engine *engine, Memory **results,
             break;
         if (memory->token_count == 0) continue;
         for (size_t j = 0; j < selected; ++j) {
-            if (memcmp(memory->content_digest, results[j]->content_digest,
-                       sizeof(memory->content_digest)) == 0) {
+            if (memcmp(memory->content_bytes_digest, results[j]->content_bytes_digest,
+                       sizeof(memory->content_bytes_digest)) == 0) {
                 duplicate = true;
                 break;
             }
@@ -4973,8 +5059,7 @@ static int append_activation_context(Engine *engine, Memory **results,
         if ((selected != 0 &&
              append_decoded_token_sequence(engine, out, separator.items,
                                            separator.count) != 0) ||
-            append_decoded_token_sequence(engine, out, memory->tokens,
-                                          memory->token_count) != 0) {
+            append_memory_content(engine, memory, out) != 0) {
             out->count = start;
             continue;
         }
@@ -5063,6 +5148,9 @@ static int list_memory_records(Engine *engine, const char *tier,
     size_t count = 0;
     size_t capacity;
     size_t start = 0;
+    size_t header_start = out->count;
+    size_t count_header_size;
+    size_t emitted = 0;
     size_t ordered_count;
     Memory **ordered;
     int rc = -1;
@@ -5108,11 +5196,39 @@ static int list_memory_records(Engine *engine, const char *tier,
             records[count++] = memory;
     }
     buffer_printf(out, "%zu\n", count);
+    count_header_size = out->count - header_start;
     for (size_t i = 0; i < count; ++i) {
-        if (append_record_wire(engine, records[i], out) != 0) goto done;
+        int appended = append_record_wire(engine, records[i], out);
+        if (appended == 0) {
+            ++emitted;
+            continue;
+        }
+        if (appended != RECORD_WIRE_CAPACITY_EXCEEDED || limit == 0) goto done;
+        if (emitted == 0) {
+            /* The requested count's wider header must not exclude a first
+             * record that fits with the exact single-record count header. */
+            if (count_header_size <= 2) goto done;
+            out->count = header_start;
+            buffer_append_text(out, "1\n");
+            count_header_size = 2;
+            if (append_record_wire(engine, records[0], out) != 0) goto done;
+            emitted = 1;
+        }
+        break;
+    }
+    if (emitted != count) {
+        char header[32];
+        int size = snprintf(header, sizeof(header), "%zu\n", emitted);
+        size_t body_start = header_start + count_header_size;
+        if (size < 0 || (size_t)size >= sizeof(header) ||
+            (size_t)size > count_header_size) goto done;
+        memmove(out->items + header_start + (size_t)size,
+                out->items + body_start, out->count - body_start);
+        out->count -= count_header_size - (size_t)size;
+        memcpy(out->items + header_start, header, (size_t)size);
     }
     if (counted) {
-        for (size_t i = 0; i < count; ++i) count_memory_read(engine, records[i]);
+        for (size_t i = 0; i < emitted; ++i) count_memory_read(engine, records[i]);
     }
     rc = 0;
 done:
@@ -5122,6 +5238,7 @@ done:
 }
 
 static int provenance_memory_record(Engine *engine, bool by_memory,
+                                    SourceEventKind source_kind,
                                     int64_t source_id, const char *tier,
                                     const char *status, Buffer *out)
 {
@@ -5151,6 +5268,7 @@ static int provenance_memory_record(Engine *engine, bool by_memory,
     while (high > low) {
         Memory *memory = order[--high];
         if (memory->visible &&
+            (by_memory || memory->metadata.source_event_kind == source_kind) &&
             metadata_field_matches(&memory->metadata.tier, tier) &&
             metadata_field_matches(&memory->metadata.status, status)) {
             match = memory;
@@ -5285,48 +5403,85 @@ static uint64_t saturating_add_scaled(uint64_t value, uint64_t add, uint64_t sca
     return UINT64_MAX - value < scaled ? UINT64_MAX : value + scaled;
 }
 
+static bool memory_span_matches(const Engine *engine, const Memory *memory,
+                                 const MemorySpan *span, const CueSpan *cue)
+{
+    size_t compared = 0;
+    for (size_t i = span->token_index;
+         i < memory->token_count && compared < span->size; ++i) {
+        const Token *token = &engine->tokens[memory->tokens[i]];
+        size_t offset = i == span->token_index ? span->byte_offset : 0;
+        size_t count = token->segment_size - offset;
+        if (count > span->size - compared) count = span->size - compared;
+        if (count != 0 && !folded_bytes_equal(cue->data + compared,
+                                              token->segment + offset, count))
+            return false;
+        compared += count;
+    }
+    return compared == span->size;
+}
+
+static void score_memory_span(const Engine *engine, Memory *memory,
+                               const MemorySpan *span, const CueSpan *spans,
+                               size_t span_count, bool *matched)
+{
+    uint64_t hash = span->folded_hash;
+    hash ^= hash >> 33;
+    hash *= UINT64_C(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    for (size_t i = 0; i < span_count; ++i) {
+        if (!matched[i] && spans[i].size == span->size &&
+            spans[i].folded_hash == hash &&
+            memory_span_matches(engine, memory, span, &spans[i])) {
+            matched[i] = true;
+            memory->query_span_hits = saturating_increment(memory->query_span_hits);
+            memory->query_span_bytes = saturating_add_scaled(
+                memory->query_span_bytes, spans[i].size, 1);
+            break;
+        }
+    }
+}
+
 static int score_memory_cue_spans(const Engine *engine, Memory *memory,
                                   const CueSpan *spans, size_t span_count)
 {
-    Buffer decoded = {0};
     bool matched[MAX_CUE_LINK_SOURCES] = {false};
-    size_t offset = 0;
+    MemorySpan span = {0};
+    size_t decoded_size = 0;
 
     memory->query_span_hits = 0;
     memory->query_span_bytes = 0;
     if (span_count == 0) return 0;
-    if (append_decoded_token_sequence(engine, &decoded, memory->tokens,
-                                      memory->token_count) != 0) {
-        free(decoded.items);
-        return -1;
+    /* Preserve whole-sequence validation even if all spans match near its start. */
+    for (size_t i = 0; i < memory->token_count; ++i) {
+        uint64_t id = memory->tokens[i];
+        if (id >= engine->token_count ||
+            engine->tokens[id].segment_size > MAX_RESPONSE_BYTES - decoded_size)
+            return -1;
+        decoded_size += engine->tokens[id].segment_size;
     }
-    while (offset < decoded.count && memory->query_span_hits < span_count) {
-        size_t start;
-        size_t size;
-        uint64_t hash;
-        while (offset < decoded.count && !cue_span_byte(decoded.items[offset]))
-            ++offset;
-        start = offset;
-        while (offset < decoded.count && cue_span_byte(decoded.items[offset]))
-            ++offset;
-        size = offset - start;
-        if (size == 0) continue;
-        hash = hash_folded_bytes(decoded.items + start, size);
-        for (size_t i = 0; i < span_count; ++i) {
-            if (!matched[i] && spans[i].size == size &&
-                spans[i].folded_hash == hash &&
-                folded_bytes_equal(spans[i].data, decoded.items + start,
-                                   size)) {
-                matched[i] = true;
-                memory->query_span_hits = saturating_increment(
-                    memory->query_span_hits);
-                memory->query_span_bytes = saturating_add_scaled(
-                    memory->query_span_bytes, spans[i].size, 1);
-                break;
+    for (size_t i = 0; i < memory->token_count; ++i) {
+        const Token *token = &engine->tokens[memory->tokens[i]];
+        for (size_t j = 0; j < token->segment_size; ++j) {
+            unsigned char byte = token->segment[j];
+            if (cue_span_byte(byte)) {
+                if (span.size == 0) {
+                    span.token_index = i;
+                    span.byte_offset = j;
+                    span.folded_hash = UINT64_C(1469598103934665603);
+                }
+                ++span.size;
+                span.folded_hash ^= fold_ascii(byte);
+                span.folded_hash *= UINT64_C(1099511628211);
+            } else if (span.size != 0) {
+                score_memory_span(engine, memory, &span, spans, span_count, matched);
+                span.size = 0;
+                if (memory->query_span_hits == span_count) return 0;
             }
         }
     }
-    free(decoded.items);
+    if (span.size != 0)
+        score_memory_span(engine, memory, &span, spans, span_count, matched);
     return 0;
 }
 
@@ -5358,26 +5513,34 @@ static void score_postings(Engine *engine, const Token *token, uint64_t weight,
 
 static bool scored_memory_better(const Memory *left, const Memory *right)
 {
-    uint64_t a = left->query_score;
-    uint64_t b = right->query_score;
-    int updated;
     if (left->query_span_hits != right->query_span_hits)
         return left->query_span_hits > right->query_span_hits;
     if (left->query_span_bytes != right->query_span_bytes)
         return left->query_span_bytes > right->query_span_bytes;
-    if (left->access_count != right->access_count)
-        return left->access_count > right->access_count;
-    updated = memory_updated_compare(left, right);
-    if (updated != 0) return updated > 0;
     if (left->query_match_score != right->query_match_score)
         return left->query_match_score > right->query_match_score;
-    if (a != b) return a > b;
-    return left->insertion_index < right->insertion_index;
+    if (left->query_score != right->query_score)
+        return left->query_score > right->query_score;
+    /* Reads measure exposure, not relevance. Equal evidence favors freshness;
+     * memory_updated_compare supplies the final deterministic ID tie-break. */
+    return memory_updated_compare(left, right) > 0;
 }
 
 static bool scored_memory_worse(const Memory *left, const Memory *right)
 {
     return scored_memory_better(right, left);
+}
+
+static int activation_cohort_compare(const Memory *left, const Memory *right)
+{
+    if (left->query_span_hits != right->query_span_hits)
+        return left->query_span_hits > right->query_span_hits ? 1 : -1;
+    if (left->query_span_bytes != right->query_span_bytes)
+        return left->query_span_bytes > right->query_span_bytes ? 1 : -1;
+    if (left->query_span_hits == 0 &&
+        left->query_match_score != right->query_match_score)
+        return left->query_match_score > right->query_match_score ? 1 : -1;
+    return 0;
 }
 
 static void topk_offer(Memory **heap, size_t *count, size_t capacity,
@@ -5694,14 +5857,20 @@ static int query_memories(Engine *engine, const unsigned char *cue, size_t cue_s
              metadata_field_matches(&memory->metadata.tier, tier_filter)) &&
             (status_filter == NULL ||
              metadata_field_matches(&memory->metadata.status, status_filter))) {
+            /* All comparator fields must be final before building the heap. */
+            if (context_token_budget != 0) {
+                if (score_memory_cue_spans(engine, memory,
+                                           cue_spans, cue_span_count) != 0)
+                    goto done;
+                /* Every retained heap member shares the same packable cohort.
+                 * A better cohort replaces it; no member of the winner is capped. */
+                if (result_count != 0) {
+                    int cohort = activation_cohort_compare(memory, engine->query_results[0]);
+                    if (cohort < 0) continue;
+                    if (cohort > 0) result_count = 0;
+                }
+            }
             topk_offer(engine->query_results, &result_count, limit, memory);
-        }
-    }
-    if (context_token_budget != 0) {
-        for (size_t i = 0; i < result_count; ++i) {
-            if (score_memory_cue_spans(engine, engine->query_results[i],
-                                       cue_spans, cue_span_count) != 0)
-                goto done;
         }
     }
     sort_scored_results(engine->query_results, result_count);
@@ -5823,6 +5992,29 @@ static Bytes column_bytes(sqlite3_stmt *statement, int column)
                       size < 0 ? 0 : (size_t)size);
 }
 
+static int prepare_sqlite_memories(sqlite3 *db, sqlite3_stmt **statement)
+{
+    sqlite3_stmt *columns = NULL;
+    bool has_source_kind = false;
+    int step;
+    if (sqlite3_prepare_v2(db, "PRAGMA table_info(memories)", -1,
+                           &columns, NULL) != SQLITE_OK) return -1;
+    while ((step = sqlite3_step(columns)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(columns, 1);
+        if (name != NULL && strcmp((const char *)name, "source_event_kind") == 0)
+            has_source_kind = true;
+    }
+    sqlite3_finalize(columns);
+    if (step != SQLITE_DONE) return -1;
+    return sqlite3_prepare_v2(db, has_source_kind ?
+        "SELECT id,created_at,updated_at,tier,CAST(content AS BLOB),confidence,status,"
+        "source_event_id,source_memory_id,supersedes_id,expires_at,source_event_kind "
+        "FROM memories ORDER BY id ASC" :
+        "SELECT id,created_at,updated_at,tier,CAST(content AS BLOB),confidence,status,"
+        "source_event_id,source_memory_id,supersedes_id,expires_at,NULL "
+        "FROM memories ORDER BY id ASC", -1, statement, NULL);
+}
+
 static int metadata_from_row(sqlite3_stmt *statement, Metadata *metadata)
 {
     sqlite3_int64 id = sqlite3_column_int64(statement, 0);
@@ -5849,6 +6041,15 @@ static int metadata_from_row(sqlite3_stmt *statement, Metadata *metadata)
     if (sqlite3_column_type(statement, 10) != SQLITE_NULL) {
         metadata->has_expires_at = true;
         metadata->expires_at = column_bytes(statement, 10);
+    }
+    if (sqlite3_column_type(statement, 11) != SQLITE_NULL) {
+        const unsigned char *kind = sqlite3_column_text(statement, 11);
+        int kind_size = sqlite3_column_bytes(statement, 11);
+        if (kind == NULL || kind_size <= 0 ||
+            parse_source_event_kind(kind, (size_t)kind_size,
+                                     &metadata->source_event_kind) != 0 ||
+            !metadata->has_source_event_id || metadata->source_event_id <= 0)
+            return -1;
     }
     return safe_name(metadata->tier.data, metadata->tier.size);
 }
@@ -5902,11 +6103,7 @@ static int catchup_sqlite(const char *store_path, const char *source_path)
         goto done;
     }
     source_transaction = true;
-    if (sqlite3_prepare_v2(source,
-            "SELECT id,created_at,updated_at,tier,CAST(content AS BLOB),confidence,status,"
-            "source_event_id,source_memory_id,supersedes_id,expires_at "
-            "FROM memories ORDER BY id ASC",
-            -1, &statement, NULL) != SQLITE_OK) {
+    if (prepare_sqlite_memories(source, &statement) != SQLITE_OK) {
         fputs("open SQLite catch-up source or memories table failed\n", stderr);
         goto done;
     }
@@ -5936,6 +6133,13 @@ static int catchup_sqlite(const char *store_path, const char *source_path)
         if (memory->insertion_index < initial_memory_count)
             seen[memory->insertion_index] = true;
         ++compared;
+        if (memory->metadata.source_event_kind != SOURCE_EVENT_UNKNOWN &&
+            metadata.source_event_kind == SOURCE_EVENT_UNKNOWN) {
+            fprintf(stderr, "catch-up would erase typed lineage at memory %" PRId64 "\n",
+                    metadata.id);
+            metadata_free(&metadata);
+            goto done;
+        }
         if (record_matches(&engine, metadata.id, &metadata, content_bytes_pointer,
                            (size_t)content_bytes)) {
             metadata_free(&metadata);
@@ -5948,23 +6152,12 @@ static int catchup_sqlite(const char *store_path, const char *source_path)
             metadata_free(&metadata);
             goto done;
         }
-        {
-            unsigned char *existing_content = NULL;
-            size_t existing_content_size = 0;
-            TokenVector existing = {memory->tokens, memory->token_count,
-                                    memory->token_count};
-            if (decode_tokens_to_bytes(&engine, &existing, &existing_content,
-                                       &existing_content_size) != 0 ||
-                existing_content_size != (size_t)content_bytes ||
-                memcmp(existing_content, content_bytes_pointer,
-                       (size_t)content_bytes) != 0) {
-                fprintf(stderr, "catch-up content drift at memory %" PRId64 "\n",
-                        metadata.id);
-                free(existing_content);
-                metadata_free(&metadata);
-                goto done;
-            }
-            free(existing_content);
+        if (!memory_content_equals(&engine, memory, content_bytes_pointer,
+                                    (size_t)content_bytes)) {
+            fprintf(stderr, "catch-up content drift at memory %" PRId64 "\n",
+                    metadata.id);
+            metadata_free(&metadata);
+            goto done;
         }
         if (update_record_metadata(&engine, &metadata, content_bytes_pointer,
                                    (size_t)content_bytes, false) != 0) {
@@ -6174,10 +6367,7 @@ static int import_sqlite_into(const char *store_path, const char *source_path)
     opened = true;
     if (sqlite3_open_v2(source_path, &source, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
         sqlite_exec_checked(source, "BEGIN") != 0 ||
-        sqlite3_prepare_v2(source,
-            "SELECT id,created_at,updated_at,tier,CAST(content AS BLOB),confidence,status,"
-            "source_event_id,source_memory_id,supersedes_id,expires_at "
-            "FROM memories ORDER BY id", -1, &statement, NULL) != SQLITE_OK) {
+        prepare_sqlite_memories(source, &statement) != SQLITE_OK) {
         fprintf(stderr, "open/import source: %s\n",
                 source == NULL ? "failed" : sqlite3_errmsg(source));
         goto done;
@@ -6318,7 +6508,11 @@ static int export_sqlite_into(const char *store_path, const char *destination)
             "source_event_id INTEGER NULL DEFAULT NULL,"
             "source_memory_id INTEGER NULL DEFAULT NULL,"
             "supersedes_id INTEGER NULL DEFAULT NULL,"
-            "expires_at TEXT NULL DEFAULT NULL)") != 0 ||
+            "expires_at TEXT NULL DEFAULT NULL,"
+            "source_event_kind TEXT NULL DEFAULT NULL "
+            "CHECK(source_event_kind IS NULL OR "
+            "(source_event_kind IN ('event','sense_event') AND "
+            "source_event_id IS NOT NULL AND source_event_id > 0)))") != 0 ||
         sqlite_exec_checked(db,
             "CREATE INDEX memories_tier_status ON memories (tier,status);"
             "CREATE INDEX memories_updated_at ON memories (updated_at);"
@@ -6326,8 +6520,8 @@ static int export_sqlite_into(const char *store_path, const char *destination)
             "BEGIN IMMEDIATE") != 0 ||
         sqlite3_prepare_v2(db,
             "INSERT INTO memories(id,created_at,updated_at,tier,content,confidence,status,"
-            "source_event_id,source_memory_id,supersedes_id,expires_at)"
-            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "source_event_id,source_memory_id,supersedes_id,expires_at,source_event_kind)"
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             -1, &insert, NULL) != SQLITE_OK) {
         goto done;
     }
@@ -6357,6 +6551,12 @@ static int export_sqlite_into(const char *store_path, const char *destination)
         else sqlite3_bind_null(insert, 10);
         if (metadata->has_expires_at) bind_bytes(insert, 11, &metadata->expires_at);
         else sqlite3_bind_null(insert, 11);
+        if (metadata->source_event_kind == SOURCE_EVENT_UNKNOWN)
+            sqlite3_bind_null(insert, 12);
+        else
+            sqlite3_bind_text(insert, 12,
+                metadata->source_event_kind == SOURCE_EVENT_EXECUTIVE ? "event" : "sense_event",
+                -1, SQLITE_STATIC);
         step = sqlite3_step(insert);
         free(content);
         if (step != SQLITE_DONE) {
@@ -6921,6 +7121,7 @@ static bool daemon_command_has_large_response(size_t count, char **words)
            strcmp(words[0], "LIST") == 0 ||
            strcmp(words[0], "PAGE") == 0 ||
            strcmp(words[0], "PROVENANCE") == 0 ||
+           strcmp(words[0], "PROVENANCE_TYPED") == 0 ||
            strcmp(words[0], "BATCH") == 0 ||
            strcmp(words[0], "QUERY") == 0 ||
            strcmp(words[0], "RECALL_RECORDS") == 0 ||
@@ -7020,6 +7221,11 @@ static bool handle_daemon_client(DaemonRuntime *runtime, int client,
     if (versioned && count == 1 && strcmp(words[0], "ABI") == 0) {
         buffer_append_text(&response, PROTOCOL_ABI "\n");
         ok = true;
+    } else if (versioned && count == 1 && strcmp(words[0], "CAPABILITIES") == 0) {
+        buffer_append_text(&response, PROTOCOL_ABI "\n"
+                           "metadata-source-kind-1\n"
+                           "provenance-source-kind-1\n");
+        ok = true;
     } else if (count == 1 && strcmp(words[0], "STATS") == 0) {
         ok = stats_engine(engine, &response) == 0;
     } else if (count == 1 && strcmp(words[0], "FLUSH") == 0) {
@@ -7100,10 +7306,16 @@ static bool handle_daemon_client(DaemonRuntime *runtime, int client,
         ok = count_memory_records(engine, words[1], words[2],
                                   (int64_t)after, &response) == 0;
         if (!ok) error = "count response exceeds bounds\n";
-    } else if (count == 5 && strcmp(words[0], "PROVENANCE") == 0) {
+    } else if (count == 5 && (strcmp(words[0], "PROVENANCE") == 0 ||
+                            strcmp(words[0], "PROVENANCE_TYPED") == 0)) {
         int64_t source_id;
         bool by_memory = strcmp(words[1], "MEMORY") == 0;
-        if ((!by_memory && strcmp(words[1], "EVENT") != 0) ||
+        bool typed_command = strcmp(words[0], "PROVENANCE_TYPED") == 0;
+        SourceEventKind source_kind = strcmp(words[1], "SENSE_EVENT") == 0 ?
+            SOURCE_EVENT_SENSE : SOURCE_EVENT_EXECUTIVE;
+        if ((typed_command && by_memory) ||
+            (!by_memory && strcmp(words[1], "EVENT") != 0 &&
+             strcmp(words[1], "SENSE_EVENT") != 0) ||
             parse_memory_id(words[2], &source_id) != 0 ||
             (strcmp(words[3], "-") != 0 &&
              safe_name((const unsigned char *)words[3], strlen(words[3])) != 0) ||
@@ -7112,7 +7324,7 @@ static bool handle_daemon_client(DaemonRuntime *runtime, int client,
             error = "invalid provenance bounds\n";
             goto respond;
         }
-        ok = provenance_memory_record(engine, by_memory, source_id,
+        ok = provenance_memory_record(engine, by_memory, source_kind, source_id,
                                       words[3], words[4], &response) == 0;
         if (!ok) error = "provenance response exceeds bounds\n";
     } else if (count == 4 && strcmp(words[0], "BATCH") == 0) {
@@ -7928,6 +8140,8 @@ static int run_client(int argc, char **argv)
     size_t second_body_size = 0;
     size_t third_body_size = 0;
     int rc = -1;
+    if (argc == 4 && strcmp(argv[3], "capabilities") == 0)
+        return client_exchange(socket_path, PROTOCOL_ABI " CAPABILITIES\n", NULL, 0);
     if (argc == 4 && (strcmp(argv[3], "stats") == 0 ||
                       strcmp(argv[3], "flush") == 0 ||
                       strcmp(argv[3], "close") == 0)) {

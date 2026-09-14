@@ -1,0 +1,881 @@
+{
+  "sources": 87,
+  "completed": 87,
+  "reviewed": 87,
+  "source_hashes_checked": true,
+  "issues": [],
+  "analyst_models_checked": true,
+  "analyst_model_receipts": [
+    {
+      "paper_id": "01",
+      "thread_id": "01a07591-fcb6-7291-a9e3-2f843df3574f",
+      "configured_model": "gpt-6-astra",
+      "evidence_type": "ephemeral launch command and completed event stream",
+      "runtime_model_metadata_available": false,
+      "launch_sha256": "37d1db63ba18547e24a31a0a3ea00891fe8a5e2432725cf097a23547f48db919",
+      "events_sha256": "31a8cd904f6f6abca2ad7ae06981150c49b0d46e0e8791084bfbae0b695b3b85"
+    },
+    {
+      "paper_id": "02",
+      "thread_id": "01a07599-c8e3-71b2-bb82-0a134812f0ab",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "03",
+      "thread_id": "01a07599-c984-70e0-9ff3-2148e0aedada",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "04",
+      "thread_id": "01a0759f-2092-7560-9714-505b2d754aa9",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "05",
+      "thread_id": "01a075a1-040e-7e41-9e73-d2592ff9501e",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "06",
+      "thread_id": "01a075a5-5316-7623-b2ee-2257734b1157",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "07",
+      "thread_id": "01a075a7-d3cb-78a1-b9a1-5ec14c6c75a2",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "08",
+      "thread_id": "01a075ab-d3a1-7c20-961d-ae723a63e05b",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "09",
+      "thread_id": "01a075ad-2a63-7d73-b2f5-a9a099649d61",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "10",
+      "thread_id": "01a075b1-68ed-7262-a31e-bb6956e3eda1",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "11",
+      "thread_id": "01a075b3-b3ed-7f23-b46e-5b40e1170a83",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "12",
+      "thread_id": "01a075b5-8908-7c03-a3c4-6da1440038c1",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "13",
+      "thread_id": "01a075ba-4417-7c52-866e-a80e717ed5a9",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "14",
+      "thread_id": "01a0758a-46f1-73f3-afaf-39f89e58e5ef",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "15",
+      "thread_id": "01a075bc-9cba-74b1-a900-720d6ab72268",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "16",
+      "thread_id": "01a075c2-7a0d-7ac3-a4fc-e9c310140f7a",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "17",
+      "thread_id": "01a075c2-989a-7aa1-afab-0a2c836c61db",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "18",
+      "thread_id": "01a075c8-d2a4-7253-a24f-2876a8a40b9f",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "19",
+      "thread_id": "01a075c9-6826-79d3-914f-3267b01eb45d",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "20",
+      "thread_id": "01a075ce-b8a3-7272-80fc-e7bcb50a8ee5",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "21",
+      "thread_id": "01a075cf-15b0-78e2-8c23-735ce1ed94e5",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "22",
+      "thread_id": "01a075d4-8c63-7b30-a49e-bb616b703124",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "23",
+      "thread_id": "01a07595-d319-7160-b2fc-fd5f67c46123",
+      "configured_model": "gpt-6-astra",
+      "evidence_type": "ephemeral launch command and completed event stream",
+      "runtime_model_metadata_available": false,
+      "launch_sha256": "7bcfb46e101f8007d573c67c3b3361911ea85e89ad74f5fc8cba0892be51ac21",
+      "events_sha256": "2e29a0a14e10bc3a763190ecf57183682166595bd13323fd6d2ca3c3c2e8027b"
+    },
+    {
+      "paper_id": "24",
+      "thread_id": "01a0759a-70a7-7b63-ad1b-f45e7b44d664",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 2,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "25",
+      "thread_id": "01a075da-2a84-75c3-b4cd-06272d6af718",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "26",
+      "thread_id": "01a075db-aa3e-7dd3-86f9-4e67d7d956a3",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "27",
+      "thread_id": "01a075de-bda1-7d33-9b24-38ded697ebd6",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "28",
+      "thread_id": "01a075e1-c47b-7c50-83e8-0d5099e7badd",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "29",
+      "thread_id": "01a075e5-088d-7d72-8825-15c6a2e1c9c6",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "30",
+      "thread_id": "01a075e7-1ad7-76d3-a1b4-7e94a330ff04",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "31",
+      "thread_id": "01a0758a-7d0e-7c72-a094-c79944e6d850",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "32",
+      "thread_id": "01a075eb-ce88-7153-b347-b59921ed51c7",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "33",
+      "thread_id": "01a075ec-4c46-7cb3-920b-4bfe7a00cc86",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "34",
+      "thread_id": "01a075f0-ef54-7e61-806d-d855e7896086",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "35",
+      "thread_id": "01a075f1-656a-7320-a5a9-dcb2413622fe",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "36",
+      "thread_id": "01a075f6-75dd-75c1-a262-0f464c0efac3",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "37",
+      "thread_id": "01a075f7-41aa-75f0-b783-e721b49b4e6c",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "38",
+      "thread_id": "01a075fc-9870-79f2-8bc8-132609343110",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "39",
+      "thread_id": "01a075fc-d6e0-72e2-b234-b15620dc0267",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "40",
+      "thread_id": "01a07602-bb3d-79f1-9568-5475dfdba60f",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "41",
+      "thread_id": "01a07602-fabf-7433-96d7-3173cdb1b9fe",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "42",
+      "thread_id": "01a07608-69a0-7a91-a3de-733a23431aef",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "43",
+      "thread_id": "01a07609-62dc-7de3-bc1a-4222a46d60a8",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "44",
+      "thread_id": "01a0760e-9c2d-7562-b6e5-f82d81412d0c",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "45",
+      "thread_id": "01a0760e-f90f-74c3-9d94-2c591261fc12",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "46",
+      "thread_id": "01a07614-b6fb-7f22-b5b4-50b8d941d01e",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "47",
+      "thread_id": "01a07614-f49b-7240-a378-6dd3cadbde44",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "48",
+      "thread_id": "01a0761a-5c0f-7173-9593-31ff0f8caf27",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "49",
+      "thread_id": "01a0761e-1d42-70f1-ae30-621caefdb684",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "50",
+      "thread_id": "01a07620-7843-7c43-a3ad-95c47364a5d1",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "51",
+      "thread_id": "01a07622-d88e-7100-aa25-ce550658a87f",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "52",
+      "thread_id": "01a07625-becb-7f61-b560-8c31887e755f",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "53",
+      "thread_id": "01a07628-9e9c-7871-adcf-e6e028d5c93f",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "54",
+      "thread_id": "01a0762b-6cb3-7542-8895-a1507d8c99ec",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "55",
+      "thread_id": "01a0762f-10f4-7522-8625-646648b59af5",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "56",
+      "thread_id": "01a07631-b1c0-7901-bcdc-e00f6e0ea982",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "57",
+      "thread_id": "01a07635-683f-7760-a2da-c19277280532",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "58",
+      "thread_id": "01a07638-cbd1-72e2-b8a6-17a4ca9889e6",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "59",
+      "thread_id": "01a0763b-4702-7220-8d4a-b49fea79dbba",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "60",
+      "thread_id": "01a0763f-0fe4-7760-a735-9787ce65f8ad",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "61",
+      "thread_id": "01a07641-9f57-73d0-bd68-69adffcb9d8b",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "62",
+      "thread_id": "01a07644-b3b9-7ec1-b0f3-226b9b9d0abd",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "63",
+      "thread_id": "01a07647-3c4a-7321-b858-dfa86359765f",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "64",
+      "thread_id": "01a07649-28b6-7620-b7ec-925a0a8e5e36",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "65",
+      "thread_id": "01a0764d-3026-7211-9ec2-f3c872d1f295",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "66",
+      "thread_id": "01a0764f-07bd-7c03-9f37-ee7480a5bb1f",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "67",
+      "thread_id": "01a07653-da02-75d1-a4b1-501d23bf7051",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "68",
+      "thread_id": "01a07654-665b-7112-92fe-f9e9a4799165",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "69",
+      "thread_id": "01a07659-fdb8-7652-ad92-b8b7cabb3eb2",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "70",
+      "thread_id": "01a0765a-832e-73f1-a1f8-e344657bb653",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "71",
+      "thread_id": "01a0765f-54c8-7cc0-bff1-3ada2099817b",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "72",
+      "thread_id": "01a0765f-9ae4-7260-9b6e-ea75389b2ae1",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "73",
+      "thread_id": "01a07664-9510-78b1-a17f-69c98d89f436",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "74",
+      "thread_id": "01a07665-6303-7643-8ffe-38ab650ac5a1",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "75",
+      "thread_id": "01a07669-b645-7562-a7ee-27e482464971",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "76",
+      "thread_id": "01a0766b-e8cc-7682-9a6d-df356ec5d80d",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "77",
+      "thread_id": "01a0766f-3cb9-7622-a1c6-3590a6f789ca",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "78",
+      "thread_id": "01a07673-9372-7351-b58b-43fc426007c4",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "79",
+      "thread_id": "01a07674-c697-7e60-9755-c7032d9047de",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "80",
+      "thread_id": "01a07679-13df-74f3-9128-7c43e2588a08",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "81",
+      "thread_id": "01a0767b-a321-7f21-9491-824bb0608931",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "82",
+      "thread_id": "01a0767f-3e74-77d1-b149-d1a5bade078c",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "83",
+      "thread_id": "01a07682-0bc5-78b2-831e-82ebb47b09a8",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "84",
+      "thread_id": "01a07684-582d-7972-922c-3d4c2d4b0a0c",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "inbox-2604.16592",
+      "thread_id": "01a07688-8f3d-7fc3-ad42-616d1578a6b0",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "inbox-2605.18102",
+      "thread_id": "01a0768b-060e-7ee0-9cc5-59ff3da055a4",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    },
+    {
+      "paper_id": "derived-csbc",
+      "thread_id": "01a0768e-0414-76d1-9419-0efa5252f130",
+      "models": [
+        "gpt-6-astra"
+      ],
+      "turn_contexts": 1,
+      "evidence_type": "persisted session turn_context",
+      "runtime_model_metadata_available": true
+    }
+  ],
+  "model_provenance_limits": [
+    "Papers 01 and 23 used ephemeral CLI sessions: exact requested model is verified from launch and completed event records; persisted runtime model metadata is unavailable."
+  ]
+}

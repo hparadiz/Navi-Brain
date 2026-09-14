@@ -19,6 +19,7 @@ use NaviBrain\Model\DecisionCycle;
 use NaviBrain\Model\Event;
 use NaviBrain\Model\ExecutiveInterrupt;
 use NaviBrain\Model\ForwardPrediction;
+use NaviBrain\Model\HeldValue;
 use NaviBrain\Model\ModelEndpoint;
 use NaviBrain\Model\Intention;
 use NaviBrain\Model\MemoryConsolidationEpisode;
@@ -41,6 +42,8 @@ use NaviBrain\Model\SensorySource;
 use NaviBrain\Model\ThoughtArtifact;
 use NaviBrain\Model\ThreadStep;
 use NaviBrain\Model\UtteranceOutcome;
+use NaviBrain\Model\ValueAppraisal;
+use NaviBrain\Model\ValueRevision;
 use NaviBrain\Model\WorkItem;
 use NaviBrain\Model\WorkingMemorySlot;
 use RuntimeException;
@@ -48,11 +51,131 @@ use Throwable;
 
 final class Schema
 {
-    public const VERSION = 21;
+    public const VERSION = 25;
     private const BASELINE_VERSION = 4;
 
     /** @var array<int, array{name: string, statements: list<string>}> */
     private const STATIC_MIGRATIONS = [
+        // Version 23 is already installed. Keep its original statements and
+        // checksum immutable; subsequent additions belong in version 24.
+        23 => [
+            'name' => 'track_decision_integration_ownership',
+            'statements' => [
+                'CREATE TABLE decision_integration_claims (
+                    cycle_id INTEGER PRIMARY KEY,
+                    work_id INTEGER NOT NULL,
+                    owner TEXT NOT NULL,
+                    claimed_at INTEGER NOT NULL,
+                    settled INTEGER NOT NULL DEFAULT 0 CHECK (settled IN (0,1))
+                )',
+                'CREATE INDEX decision_integration_claims_unsettled
+                 ON decision_integration_claims (settled,cycle_id)',
+            ],
+        ],
+        24 => [
+            'name' => 'add_planning_claims_and_maintenance_cursors',
+            'statements' => [
+                'CREATE TABLE decision_planning_claims (
+                    cycle_id INTEGER PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    claimed_at INTEGER NOT NULL,
+                    settled INTEGER NOT NULL DEFAULT 0 CHECK (settled IN (0,1))
+                )',
+                'CREATE INDEX decision_planning_claims_unsettled
+                 ON decision_planning_claims (settled,cycle_id)',
+                'CREATE TABLE decision_recovery_scan (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    planning_after_id INTEGER NOT NULL DEFAULT 0 CHECK (planning_after_id >= 0),
+                    integration_after_id INTEGER NOT NULL DEFAULT 0 CHECK (integration_after_id >= 0),
+                    action_after_id INTEGER NOT NULL DEFAULT 0 CHECK (action_after_id >= 0),
+                    unattempted_action_after_id INTEGER NOT NULL DEFAULT 0 CHECK (unattempted_action_after_id >= 0)
+                )',
+                'INSERT INTO decision_recovery_scan (id) VALUES (1)',
+                "CREATE INDEX decision_async_claims_recovery ON decision_async_claims(action_id)
+                 WHERE status IN ('started','held','waiting')",
+                "CREATE TABLE work_item_lanes (
+                    work_id INTEGER PRIMARY KEY,
+                    lane TEXT NOT NULL CHECK (lane = 'opencode-dream')
+                )",
+                "CREATE INDEX work_items_active_type_id ON work_items(work_type,id)
+                 WHERE status IN ('queued','leased')",
+                "CREATE INDEX working_memory_maintenance_priority ON working_memory_slots(id)
+                 WHERE status = 'active' OR projection_pending IS NOT NULL",
+                "CREATE INDEX working_memory_maintenance_audit ON working_memory_slots(id)
+                 WHERE status <> 'active' AND projection_pending IS NULL",
+                'CREATE TABLE memory_consolidation_scan (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    ascending_after_id INTEGER NOT NULL DEFAULT 0 CHECK (ascending_after_id >= 0),
+                    selection_turn INTEGER NOT NULL DEFAULT 0 CHECK (selection_turn >= 0),
+                    pending_after_id INTEGER NOT NULL DEFAULT 0 CHECK (pending_after_id >= 0),
+                    queued_after_id INTEGER NOT NULL DEFAULT 0 CHECK (queued_after_id >= 0),
+                    work_after_id INTEGER NOT NULL DEFAULT 0 CHECK (work_after_id >= 0)
+                )',
+                'INSERT INTO memory_consolidation_scan (id,ascending_after_id,selection_turn)
+                 VALUES (1,0,0)',
+                'CREATE TABLE workspace_maintenance_scan (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    priority_after_id INTEGER NOT NULL DEFAULT 0 CHECK (priority_after_id >= 0),
+                    audit_after_id INTEGER NOT NULL DEFAULT 0 CHECK (audit_after_id >= 0),
+                    audit_next INTEGER NOT NULL DEFAULT 0 CHECK (audit_next IN (0,1))
+                )',
+                'INSERT INTO workspace_maintenance_scan (id) VALUES (1)',
+            ],
+        ],
+        25 => [
+            'name' => 'add_held_values_and_two_loop_revision',
+            'statements' => [
+                'CREATE TABLE held_values (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT
+                    ,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ,value_key TEXT NOT NULL
+                    ,statement TEXT NOT NULL
+                    ,rationale TEXT NOT NULL
+                    ,weight REAL NOT NULL
+                    ,authority TEXT NOT NULL
+                    ,status TEXT NOT NULL
+                    ,review_interval_hours INTEGER NOT NULL
+                    ,last_reviewed_at TEXT NULL DEFAULT NULL
+                )',
+                'CREATE UNIQUE INDEX held_values_key ON held_values (value_key)',
+                'CREATE INDEX held_values_status ON held_values (status)',
+                'CREATE TABLE value_appraisals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT
+                    ,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ,value_id INTEGER NOT NULL
+                    ,event_id INTEGER NULL DEFAULT NULL
+                    ,intention_id INTEGER NULL DEFAULT NULL
+                    ,alignment REAL NOT NULL
+                    ,evidence TEXT NOT NULL
+                    ,source TEXT NOT NULL
+                    ,generated_intention_id INTEGER NULL DEFAULT NULL
+                )',
+                'CREATE INDEX value_appraisals_value ON value_appraisals (value_id,id)',
+                'CREATE INDEX value_appraisals_intention ON value_appraisals (generated_intention_id)',
+                'CREATE TABLE value_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT
+                    ,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ,value_id INTEGER NOT NULL
+                    ,previous_statement TEXT NOT NULL
+                    ,previous_weight REAL NOT NULL
+                    ,new_statement TEXT NOT NULL
+                    ,new_weight REAL NOT NULL
+                    ,basis TEXT NOT NULL
+                    ,reason TEXT NOT NULL
+                    ,authority TEXT NOT NULL
+                    ,event_id INTEGER NULL DEFAULT NULL
+                )',
+                'CREATE INDEX value_revisions_value ON value_revisions (value_id,id)',
+            ],
+        ],
+        22 => [
+            'name' => 'index_explicit_cognition_control',
+            'statements' => [
+                "CREATE INDEX events_cognition_control_latest ON events (id DESC)
+                 WHERE kind IN ('executive.control.paused', 'executive.control.resumed')",
+            ],
+        ],
         5 => [
             'name' => 'create_schema_migration_ledger',
             'statements' => [
@@ -109,6 +232,9 @@ final class Schema
         OtherModelPrediction::class,
         OtherModelCycle::class,
         MemoryConsolidationEpisode::class,
+        HeldValue::class,
+        ValueAppraisal::class,
+        ValueRevision::class,
     ];
 
     /** @return array{version: int, tables: list<string>} */

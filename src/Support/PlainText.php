@@ -130,12 +130,12 @@ final class PlainText
         }
 
         if (array_is_list($value)) {
-            $visible = array_slice($value, 0, $listLimit);
-            foreach ($visible as $index => $item) {
+            $visibleCount = min(count($value), $listLimit);
+            for ($index = 0; $index < $visibleCount; $index++) {
                 $lines[] = $indent . 'item ' . ($index + 1);
-                self::append($item, $lines, $depth + 1, null, $listLimit);
+                self::append($value[$index], $lines, $depth + 1, null, $listLimit);
             }
-            $omitted = count($value) - count($visible);
+            $omitted = count($value) - $visibleCount;
             if ($omitted > 0) {
                 $lines[] = $indent . $omitted . ' more items omitted';
             }
@@ -152,25 +152,13 @@ final class PlainText
      */
     private static function ordered(array $value): array
     {
-        $indexed = [];
-        $position = 0;
-        foreach ($value as $key => $item) {
-            $indexed[] = [
-                'key' => $key,
-                'value' => $item,
-                'priority' => self::KEY_PRIORITY[(string) $key] ?? 1000,
-                'position' => $position++,
-            ];
-        }
-        usort($indexed, static fn (array $left, array $right): int =>
-            $left['priority'] <=> $right['priority'] ?: $left['position'] <=> $right['position']
+        // PHP 8 preserves insertion order for equal comparisons. Sorting this
+        // local copy avoids a decorated array per field and a second map.
+        uksort($value, static fn (int|string $left, int|string $right): int =>
+            (self::KEY_PRIORITY[(string) $left] ?? 1000)
+                <=> (self::KEY_PRIORITY[(string) $right] ?? 1000)
         );
-
-        $ordered = [];
-        foreach ($indexed as $entry) {
-            $ordered[$entry['key']] = $entry['value'];
-        }
-        return $ordered;
+        return $value;
     }
 
     private static function decodeStructuredString(string $value): mixed

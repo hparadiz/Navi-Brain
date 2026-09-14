@@ -284,7 +284,7 @@ final class CapsuleAssembler
                 // retrieval nests workspace markers on every wake. Procedures
                 // likewise have their own slot and should not impersonate
                 // supporting evidence.
-                if (in_array($memory['tier'] ?? null, ['working', 'procedural'], true)) {
+                if (!$this->eligibleMemoryCandidate($memory, 'memory')) {
                     continue;
                 }
                 $candidates['memory'][] = [
@@ -306,6 +306,9 @@ final class CapsuleAssembler
                 ['tier' => 'procedural', 'status' => 'active'],
                 ['order' => ['updated_at' => 'DESC'], 'limit' => self::CANDIDATES_PER_TYPE]
             ) as $procedure) {
+                if (!$this->eligibleMemoryCandidate($procedure->getData(), 'procedure')) {
+                    continue;
+                }
                 $candidates['procedure'][] = [
                     'record_type' => 'procedure',
                     'record_id' => (int) $procedure->id,
@@ -611,6 +614,19 @@ final class CapsuleAssembler
         }
 
         return round(($coverage * 10.0) + $confidence + $recency, 4);
+    }
+
+    /** @param array<string, mixed> $record */
+    private function eligibleMemoryCandidate(array $record, string $type): bool
+    {
+        // Both types name native Memory IDs. Historical capsules remain an
+        // immutable audit; eligibility belongs before the new contest.
+        $tiers = $type === 'procedure' ? ['procedural'] : ['episodic', 'semantic'];
+        if (($record['status'] ?? null) !== 'active' || !in_array($record['tier'] ?? null, $tiers, true)) {
+            return false;
+        }
+        $expiry = $record['expires_at'] ?? null;
+        return $expiry === null || ($this->timestampOf($expiry) ?? 0) > time();
     }
 
     private function timestampOf(mixed $value): ?int

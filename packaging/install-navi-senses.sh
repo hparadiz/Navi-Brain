@@ -5,17 +5,10 @@
 #
 # What this sets up, and why it is shaped this way:
 #
-# Navi can look at the machine but cannot change it. That is not enforced by a
-# list of forbidden commands in application code — such a list has to anticipate
-# every spelling of a destructive command and is wrong the first time it misses
-# one. It is enforced by the kernel: the process that runs commands is a
-# separate daemon owned by an account with no write permission, reached over a
-# unix socket. The brain cannot execute anything even if it decided to, because
-# the code that executes lives in another process with less authority.
-#
-# This is the ordinary Unix arrangement, the same one OpenSSH, Postfix and
-# Postgres use. Granting Navi a capability later is a permissions change on one
-# account rather than an edit to a regular expression.
+# The service accepts named observations over a Unix socket and reads only
+# fixed kernel information files. It never executes caller-supplied commands
+# or paths. Its separate account adds containment; account permissions alone
+# do not establish a read-only sandbox. New observations require installed code.
 set -eu
 
 SRC_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -30,9 +23,8 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# 1. The account. A system user with no login, no home to write into, and one
-#    supplementary group: `users`, which is read and traverse on akujin's home
-#    because that home is mode 0755. Read access, no write bit.
+# 1. The account. A system user with no login or created home. The users group
+#    permits socket access; it is not a filesystem-wide prohibition on writes.
 if getent passwd "$USER_NAME" >/dev/null 2>&1; then
     echo "user $USER_NAME already exists"
 else

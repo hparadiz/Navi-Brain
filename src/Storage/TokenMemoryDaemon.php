@@ -275,13 +275,17 @@ final class TokenMemoryDaemon
         ?string $status = null
     ): ?array {
         $kind = strtoupper($kind);
-        if (!in_array($kind, ['MEMORY', 'EVENT'], true) || $sourceId < 1) {
+        if (!in_array($kind, ['MEMORY', 'EVENT', 'SENSE_EVENT'], true) || $sourceId < 1) {
             throw new RuntimeException('Token-memory provenance bounds are invalid.');
         }
         $tierWord = $tier === null ? '-' : self::protocolWord($tier);
         $statusWord = $status === null ? '-' : self::protocolWord($status);
+        // Event namespaces require the explicit extension command. An older
+        // daemon must reject it instead of silently applying untyped matching.
+        $command = $kind === 'MEMORY' ? 'PROVENANCE' : 'PROVENANCE_TYPED';
         $payload = self::request(sprintf(
-            "PROVENANCE %s %d %s %s\n",
+            "%s %s %d %s %s\n",
+            $command,
             $kind,
             $sourceId,
             $tierWord,
@@ -297,6 +301,11 @@ final class TokenMemoryDaemon
         $field = $kind === 'MEMORY' ? 'source_memory_id' : 'source_event_id';
         if ((int) ($records[0][$field] ?? 0) !== $sourceId) {
             throw new RuntimeException('Token-memory provenance returned the wrong source record.');
+        }
+        if ($kind !== 'MEMORY'
+            && ($records[0]['source_event_kind'] ?? null) !== strtolower($kind)
+        ) {
+            throw new RuntimeException('Token-memory provenance returned the wrong source namespace.');
         }
         return $records[0];
     }
@@ -706,7 +715,7 @@ final class TokenMemoryDaemon
     {
         $confidence = (float) ($record['confidence'] ?? 0.0);
         $bits = bin2hex(strrev(pack('d', $confidence)));
-        return implode("\n", [
+        $lines = [
             (string) ((int) ($record['id'] ?? 0)),
             self::hexField((string) ($record['created_at'] ?? '')),
             self::hexField((string) ($record['updated_at'] ?? '')),
@@ -719,7 +728,18 @@ final class TokenMemoryDaemon
             ($record['expires_at'] ?? null) === null
                 ? '-'
                 : self::hexField((string) $record['expires_at']),
-        ]) . "\n";
+        ];
+        $sourceKind = $record['source_event_kind'] ?? null;
+        if ($sourceKind !== null) {
+            if (!in_array($sourceKind, ['event', 'sense_event'], true)
+                || (int) ($record['source_event_id'] ?? 0) < 1
+            ) {
+                throw new RuntimeException('Typed memory source requires a known namespace and positive ID.');
+            }
+            $lines[] = $sourceKind;
+        }
+        // Unannotated records retain their original bytes and operation digests.
+        return implode("\n", $lines) . "\n";
     }
 
     private static function hexField(string $value): string
@@ -801,7 +821,7 @@ final class TokenMemoryDaemon
     private static function decodeMetadata(string $metadata): array
     {
         $lines = explode("\n", $metadata);
-        if (count($lines) !== 11 || array_pop($lines) !== '') {
+        if (!in_array(count($lines), [11, 12], true) || array_pop($lines) !== '') {
             throw new RuntimeException('Invalid positional token-memory metadata.');
         }
         if (preg_match('/\A[1-9][0-9]*\z/', $lines[0]) !== 1
@@ -813,6 +833,14 @@ final class TokenMemoryDaemon
         if (!is_string($packed)) {
             throw new RuntimeException('Invalid token-memory confidence bits.');
         }
+        $sourceEventId = self::decodeNullableInteger($lines[6]);
+        $sourceKind = $lines[10] ?? null;
+        if ($sourceKind !== null
+            && (!in_array($sourceKind, ['event', 'sense_event'], true)
+                || $sourceEventId === null || $sourceEventId < 1)
+        ) {
+            throw new RuntimeException('Invalid typed token-memory source.');
+        }
         return [
             'id' => (int) $lines[0],
             'created_at' => self::decodeHexField($lines[1]),
@@ -820,7 +848,8 @@ final class TokenMemoryDaemon
             'tier' => self::decodeHexField($lines[3]),
             'confidence' => unpack('dvalue', strrev($packed))['value'],
             'status' => self::decodeHexField($lines[5]),
-            'source_event_id' => self::decodeNullableInteger($lines[6]),
+            'source_event_id' => $sourceEventId,
+            'source_event_kind' => $sourceKind,
             'source_memory_id' => self::decodeNullableInteger($lines[7]),
             'supersedes_id' => self::decodeNullableInteger($lines[8]),
             'expires_at' => $lines[9] === '-' ? null : self::decodeHexField($lines[9]),

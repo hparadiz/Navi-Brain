@@ -6,6 +6,7 @@
 /var/*.sqlite-wal
 /var/backups/
 /var/opencode-worker/
+/var/intention-agents/
 /var/*.log
 /var/*.err
 /var/*.pid

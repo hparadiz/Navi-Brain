@@ -137,7 +137,8 @@ final class CompilerText
         $lines = [
             'NAVI INTENTION COMPILE',
             'protocol: ' . self::text($result['protocol'] ?? ''),
-            'mode: read-only; intention evidence only; complete open set',
+            'mode: read-only; intention evidence only; ' . (isset($result['mode']['intention_id'])
+                ? 'intention #' . (int) $result['mode']['intention_id'] : 'complete open set'),
             sprintf(
                 'evidence: %d open; %d active; %d blocked; %d dependency-ready; %d dependency-blocked',
                 (int) ($health['open_intention_count'] ?? 0),

@@ -3,6 +3,6 @@
 
 declare(strict_types=1);
 
-require dirname(__DIR__) . '/bootstrap/app.php';
+require dirname(__DIR__) . '/bootstrap/recall.php';
 
 exit((new NaviBrain\Cli\Application())->run($argv));

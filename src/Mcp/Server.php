@@ -27,9 +27,6 @@ final class Server
     {
         try {
             $this->activityBus = new ActivityBus();
-            $this->core = new ExecutiveCore();
-            $this->core->initialize();
-            $this->desktop = new DesktopAwareness();
         } catch (Throwable $throwable) {
             fwrite(STDERR, 'Navi-Brain startup failed: ' . $throwable->getMessage() . PHP_EOL);
             return 1;
@@ -56,6 +53,19 @@ final class Server
 
         $this->sessionPresence?->close();
         return 0;
+    }
+
+    // Recall and the MCP handshake must remain available while executive
+    // migrations are incomplete. Initialize executive state only on demand.
+    private function core(): ExecutiveCore
+    {
+        if (!isset($this->core)) {
+            require dirname(__DIR__, 2) . '/bootstrap/app.php';
+            $core = new ExecutiveCore();
+            $core->initialize();
+            $this->core = $core;
+        }
+        return $this->core;
     }
 
     /** @param array<string, mixed> $message */
@@ -140,6 +150,9 @@ final class Server
         );
 
         try {
+            if (in_array($name, ['desktop_look', 'desktop_presence'], true) && !isset($this->desktop)) {
+                $this->desktop = new DesktopAwareness();
+            }
             if ($name === 'desktop_look') {
                 $capture = $this->desktop->look(
                     $this->requiredString($arguments, 'reason'),
@@ -164,9 +177,9 @@ final class Server
                 'brain_status' => $debug
                     ? array_merge(
                         ['primary_intention' => $this->requiredString($arguments, 'active_intention')],
-                        $this->core->status()
+                        $this->core()->status()
                     )
-                    : $this->core->contextStatus(
+                    : TokenMemoryDaemon::activate(
                         $this->requiredString($arguments, 'active_intention'),
                         $this->optionalInteger(
                             $arguments,
@@ -176,34 +189,42 @@ final class Server
                             TokenMemoryDaemon::MAX_CONTEXT_TOKENS
                         )
                     ),
-                'remember_navi' => $this->core->searchMemory(
+                'remember_navi' => TokenMemoryDaemon::recall(
                     $this->requiredString($arguments, 'thoughts'),
                     $this->optionalInteger($arguments, 'limit', 8, 1, 100)
                 ),
-                'brain_self_model' => $this->core->listSelfModelFacts(),
-                'brain_needs' => $this->core->listNeeds(),
-                'brain_stimulate' => $this->core->satisfyNeed(
+                'brain_self_model' => $this->core()->listSelfModelFacts(),
+                'brain_values' => $this->core()->listValues(),
+                'brain_appraise_value' => $this->core()->appraiseValue(
+                    $this->requiredString($arguments, 'value'),
+                    $this->requiredNumber($arguments, 'alignment'),
+                    $this->requiredString($arguments, 'evidence'),
+                    $this->requiredString($arguments, 'source')
+                ),
+                'brain_review_values' => $this->core()->reviewValuesDue(),
+                'brain_needs' => $this->core()->listNeeds(),
+                'brain_stimulate' => $this->core()->satisfyNeed(
                     $this->requiredString($arguments, 'need'),
                     $this->requiredNumber($arguments, 'amount'),
                     $this->requiredString($arguments, 'source')
                 ),
-                'brain_daydream' => $this->core->daydream(
+                'brain_daydream' => $this->core()->daydream(
                     $this->requiredString($arguments, 'reason')
                 ),
-                'brain_sleep' => $this->core->sleep(
+                'brain_sleep' => $this->core()->sleep(
                     $this->requiredString($arguments, 'reason')
                 ),
-                'brain_heartbeat_status' => $this->core->heartbeatStatus(),
-                'brain_thoughts' => $this->core->listThoughtArtifacts(
+                'brain_heartbeat_status' => $this->core()->heartbeatStatus(),
+                'brain_thoughts' => $this->core()->listThoughtArtifacts(
                     $this->optionalString($arguments, 'status')
                 ),
-                'brain_remember_self' => $this->core->setSelfModelFact(
+                'brain_remember_self' => $this->core()->setSelfModelFact(
                     $this->requiredString($arguments, 'key'),
                     $this->requiredString($arguments, 'value'),
                     $this->requiredNumber($arguments, 'confidence'),
                     $this->requiredString($arguments, 'evidence')
                 ),
-                'brain_checkpoint' => $this->core->checkpoint(
+                'brain_checkpoint' => $this->core()->checkpoint(
                     $this->requiredString($arguments, 'reason')
                 ),
                 default => throw new InvalidArgumentException('Unknown tool: ' . $name),
@@ -410,6 +431,36 @@ final class Server
                     'required' => ['key', 'value', 'confidence', 'evidence'],
                 ],
                 'annotations' => $additiveWrite,
+            ],
+            [
+                'name' => 'brain_values',
+                'title' => 'List Held Values',
+                'description' => 'Read the standing commitments conduct is measured against, with each value\'s weight, current shortfall streak, and whether it is due for offline review. Values are the reference signal: they say which reading a correction licenses.',
+                'inputSchema' => ['type' => 'object', 'properties' => []],
+                'annotations' => $readOnly,
+            ],
+            [
+                'name' => 'brain_appraise_value',
+                'title' => 'Appraise Conduct Against a Value',
+                'description' => 'Score one piece of observed conduct against one held value. Alignment is 1.0 for full alignment and 0.0 for total shortfall. Three consecutive shortfalls form a standing intention automatically; a single low score is treated as noise, not a pattern. Requires concrete evidence, never a mood report.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'value' => ['type' => 'string', 'minLength' => 1, 'maxLength' => 96],
+                        'alignment' => ['type' => 'number', 'minimum' => 0, 'maximum' => 1],
+                        'evidence' => ['type' => 'string', 'minLength' => 1],
+                        'source' => ['type' => 'string', 'enum' => ['user', 'self', 'outcome']],
+                    ],
+                    'required' => ['value', 'alignment', 'evidence', 'source'],
+                ],
+                'annotations' => $additiveWrite,
+            ],
+            [
+                'name' => 'brain_review_values',
+                'title' => 'Review Values Due',
+                'description' => 'The slow loop. Report which values are due for reconsideration and what their record says. This never revises anything: declaring and revising values are deliberate acts outside this interface, because a reference signal that can be edited from inside the loop it regulates has a degenerate solution.',
+                'inputSchema' => ['type' => 'object', 'properties' => []],
+                'annotations' => $readOnly,
             ],
             [
                 'name' => 'brain_checkpoint',
