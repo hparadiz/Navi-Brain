@@ -9,29 +9,15 @@ use NaviBrain\Model\OtherModelCycle;
 use NaviBrain\Model\OtherModelHypothesis;
 use NaviBrain\Model\OtherModelPrediction;
 
-/** Read-only replay and calibration report over the sealed other-model ledger. */
-final class OtherModelEvaluator
+class OtherModelEvaluator
 {
     /** @return array<string, mixed> */
     public function report(int $limit = 500): array
     {
-        $cycles = array_reverse(OtherModelCycle::getAll([
-            'order' => ['id' => 'DESC'],
-            'limit' => $limit,
-        ]));
-        $predictions = OtherModelPrediction::getAll([
-            'order' => ['id' => 'DESC'],
-            'limit' => min(2000, $limit * 4),
-        ]);
+        $cycles = array_reverse(OtherModelCycle::getAll([ 'order' => ['id' => 'DESC'], 'limit' => $limit, ]));
+        $predictions = OtherModelPrediction::getAll([ 'order' => ['id' => 'DESC'], 'limit' => min(2000, $limit * 4), ]);
 
-        $resolved = array_values(array_filter(
-            $predictions,
-            static fn (OtherModelPrediction $prediction): bool => in_array(
-                $prediction->status,
-                ['matched', 'violated'],
-                true
-            )
-        ));
+        $resolved = array_values(array_filter( $predictions, static fn (OtherModelPrediction $prediction): bool => in_array( $prediction->status, ['matched', 'violated'], true ) ));
         $byModel = [];
         $byParserModel = [];
         foreach ($resolved as $prediction) {
@@ -102,47 +88,21 @@ final class OtherModelEvaluator
             ];
         }
 
-        $terminal = array_values(array_filter(
-            $cycles,
-            static fn (OtherModelCycle $cycle): bool => in_array(
-                $cycle->status,
-                ['completed', 'abstained'],
-                true
-            )
-        ));
-        $abstained = count(array_filter(
-            $terminal,
-            static fn (OtherModelCycle $cycle): bool => $cycle->status === 'abstained'
-        ));
-        $modelCalls = array_sum(array_map(
-            static fn (OtherModelCycle $cycle): int => (int) $cycle->model_calls,
-            $terminal
-        ));
-        $hypotheses = OtherModelHypothesis::getAll([
-            'order' => ['id' => 'DESC'],
-            'limit' => min(2000, $limit * 2),
-        ]);
+        $terminal = array_values(array_filter( $cycles, static fn (OtherModelCycle $cycle): bool => in_array( $cycle->status, ['completed', 'abstained'], true ) ));
+        $abstained = count(array_filter( $terminal, static fn (OtherModelCycle $cycle): bool => $cycle->status === 'abstained' ));
+        $modelCalls = array_sum(array_map( static fn (OtherModelCycle $cycle): int => (int) $cycle->model_calls, $terminal ));
+        $hypotheses = OtherModelHypothesis::getAll([ 'order' => ['id' => 'DESC'], 'limit' => min(2000, $limit * 2), ]);
         $integrityViolations = count(array_filter(
             $hypotheses,
             static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->actor !== 'primary_user'
                 || (int) $hypothesis->recursion_order !== 1
                 || ($hypothesis->representation === 'stated' && $hypothesis->knowledge_access !== 'reported')
         ));
-        $forward = array_values(array_filter(array_map(
-            static fn (OtherModelHypothesis $hypothesis): ?float =>
-                (int) $hypothesis->predictions_resolved > 0 ? (float) $hypothesis->forward_score : null,
-            $hypotheses
-        ), static fn (?float $value): bool => $value !== null));
-        $provenanceWeights = array_values(array_filter(array_map(
-            static fn (OtherModelHypothesis $hypothesis): ?float => (float) $hypothesis->backward_score > 0.0
-                ? (float) $hypothesis->backward_score
-                : null,
-            $hypotheses
-        ), static fn (?float $value): bool => $value !== null));
+        $forward = array_values(array_filter(array_map(static fn (OtherModelHypothesis $hypothesis): ?float => (int) $hypothesis->predictions_resolved > 0 ? (float) $hypothesis->forward_score : null, $hypotheses), static fn (?float $value): bool => $value !== null));
+        $provenanceWeights = array_values(array_filter(array_map(static fn (OtherModelHypothesis $hypothesis): ?float => (float) $hypothesis->backward_score > 0.0 ? (float) $hypothesis->backward_score : null, $hypotheses), static fn (?float $value): bool => $value !== null));
         $correctionLatencies = array_values(array_filter(array_map(
             fn (OtherModelHypothesis $hypothesis): ?int => $hypothesis->status === 'corrected'
-                ? max(0, ($this->timestamp($hypothesis->corrected_at) ?? 0)
-                    - ($this->timestamp($hypothesis->created_at) ?? 0))
+                ? max(0, ($this->timestamp($hypothesis->corrected_at) ?? 0) - ($this->timestamp($hypothesis->created_at) ?? 0))
                 : null,
             $hypotheses
         ), static fn (?int $value): bool => $value !== null));
@@ -151,15 +111,9 @@ final class OtherModelEvaluator
             'protocol' => 'other-model-replay-v1',
             'sealed_predictions' => [
                 'score_scope' => 'observed_category_forecasts_not_proposition_truth',
-                'pending' => count(array_filter(
-                    $predictions,
-                    static fn (OtherModelPrediction $prediction): bool => $prediction->status === 'pending'
-                )),
+                'pending' => count(array_filter( $predictions, static fn (OtherModelPrediction $prediction): bool => $prediction->status === 'pending' )),
                 'resolved' => count($resolved),
-                'expired' => count(array_filter(
-                    $predictions,
-                    static fn (OtherModelPrediction $prediction): bool => $prediction->status === 'expired'
-                )),
+                'expired' => count(array_filter( $predictions, static fn (OtherModelPrediction $prediction): bool => $prediction->status === 'expired' )),
                 'by_model' => $byModel,
                 'hypothesis_predictions_by_parser_model' => $byParserModel,
             ],
@@ -174,15 +128,12 @@ final class OtherModelEvaluator
                 'model_calls_per_cycle' => $terminal === []
                     ? null
                     : round($modelCalls / count($terminal), 4),
-                'live_usable_hypotheses' => count(OtherModelHypothesis::getAllByWhere([
-                    'status' => 'active',
-                    'validation' => 'usable',
-                ])),
+                'live_usable_hypotheses' => count(OtherModelHypothesis::getAllByWhere([ 'status' => 'active', 'validation' => 'usable', ])),
                 'corrections' => count(OtherModelHypothesis::getAllByWhere(['status' => 'corrected'])),
                 'mean_hypothesis_forward_score' => $forward === []
                     ? null
                     : round(array_sum($forward) / count($forward), 4),
-                // Retained alias for clients; these are fixed provenance weights.
+
                 'mean_hypothesis_backward_score' => $provenanceWeights === []
                     ? null
                     : round(array_sum($provenanceWeights) / count($provenanceWeights), 4),
@@ -202,19 +153,10 @@ final class OtherModelEvaluator
                     : round(array_sum($correctionLatencies) / count($correctionLatencies), 2),
             ],
             'proposition_pipeline' => [
-                'worker_extractions' => count(array_filter(
-                    $hypotheses,
-                    static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->provenance_kind === 'worker_proposal'
-                )),
-                'deterministic_extractions' => count(array_filter(
-                    $hypotheses,
-                    static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->provenance_kind === 'direct_statement'
-                )),
+                'worker_extractions' => count(array_filter( $hypotheses, static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->provenance_kind === 'worker_proposal' )),
+                'deterministic_extractions' => count(array_filter( $hypotheses, static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->provenance_kind === 'direct_statement' )),
                 'prediction_validated_labels' => null,
-                'forecast_usable_hypotheses' => count(array_filter(
-                    $hypotheses,
-                    static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->validation === 'usable'
-                )),
+                'forecast_usable_hypotheses' => count(array_filter( $hypotheses, static fn (OtherModelHypothesis $hypothesis): bool => $hypothesis->validation === 'usable' )),
                 'extraction_recall' => null,
                 'label_accuracy' => null,
                 'semantic_support' => null,
@@ -234,7 +176,7 @@ final class OtherModelEvaluator
         ];
     }
 
-    /** @param list<OtherModelCycle> $cycles @return array<string, mixed> */
+    /** @param list<OtherModelCycle> $cycles */
     private function onlineBaselines(array $cycles): array
     {
         $series = [];
@@ -279,12 +221,7 @@ final class OtherModelEvaluator
                     $this->addScore($scores['categorical_persistence'], $persistence, $domain, $row['value']);
                     $this->addScore($scores['unconditional_counts'], $unconditional, $domain, $row['value']);
                     $contextual[$previous['context']] ??= array_fill_keys($domain, 1.0);
-                    $this->addScore(
-                        $scores['context_conditioned_counts'],
-                        $contextual[$previous['context']],
-                        $domain,
-                        $row['value']
-                    );
+                    $this->addScore($scores['context_conditioned_counts'], $contextual[$previous['context']], $domain, $row['value']);
                     if (isset($contextual[$previous['context']][$row['value']])) {
                         $contextual[$previous['context']][$row['value']]++;
                     }
@@ -307,8 +244,9 @@ final class OtherModelEvaluator
         return $scores;
     }
 
-    /** @param array<string, int|float> $score @param array<string, int|float> $weights
-     *  @param list<string> $domain
+    /**
+     * @param array<string, int|float> $score
+     * @param list<string> $domain
      */
     private function addScore(array &$score, array $weights, array $domain, string $observed): void
     {
@@ -322,39 +260,18 @@ final class OtherModelEvaluator
     private function functionalUptake(int $limit): array
     {
         $decisions = [];
-        foreach (Event::getAllByWhere(
-            ['kind' => 'action.selected'],
-            ['order' => ['id' => 'DESC'], 'limit' => min(2000, $limit)]
-        ) as $event) {
+        foreach (Event::getAllByWhere(['kind' => 'action.selected'], ['order' => ['id' => 'DESC'], 'limit' => min(2000, $limit)]) as $event) {
             $payload = is_array($event->payload) ? $event->payload : [];
             if (!isset($payload['baseline_chosen'], $payload['counterfactual_other_model_chosen'])) {
                 continue;
             }
             $decisions[] = $payload;
         }
-        $changed = count(array_filter(
-            $decisions,
-            static fn (array $decision): bool => $decision['baseline_chosen']
-                !== $decision['counterfactual_other_model_chosen']
-        ));
-        $actualChoices = array_values(array_filter(
-            $decisions,
-            static fn (array $decision): bool => isset($decision['chosen'])
-        ));
-        $actualCounterfactualMismatch = count(array_filter(
-            $actualChoices,
-            static fn (array $decision): bool => $decision['chosen']
-                !== $decision['counterfactual_other_model_chosen']
-        ));
-        $ablationEvidence = array_values(array_filter(
-            $actualChoices,
-            static fn (array $decision): bool => is_bool($decision['other_agent_model_ablated'] ?? null)
-        ));
-        $unablatedMismatches = count(array_filter(
-            $ablationEvidence,
-            static fn (array $decision): bool => !$decision['other_agent_model_ablated']
-                && $decision['chosen'] !== $decision['counterfactual_other_model_chosen']
-        ));
+        $changed = count(array_filter( $decisions, static fn (array $decision): bool => $decision['baseline_chosen'] !== $decision['counterfactual_other_model_chosen'] ));
+        $actualChoices = array_values(array_filter( $decisions, static fn (array $decision): bool => isset($decision['chosen']) ));
+        $actualCounterfactualMismatch = count(array_filter( $actualChoices, static fn (array $decision): bool => $decision['chosen'] !== $decision['counterfactual_other_model_chosen'] ));
+        $ablationEvidence = array_values(array_filter( $actualChoices, static fn (array $decision): bool => is_bool($decision['other_agent_model_ablated'] ?? null) ));
+        $unablatedMismatches = count(array_filter($ablationEvidence, static fn (array $decision): bool => !$decision['other_agent_model_ablated'] && $decision['chosen'] !== $decision['counterfactual_other_model_chosen']));
         $modelDeltas = [];
         $actualDeltas = [];
         foreach ($decisions as $decision) {
@@ -411,11 +328,11 @@ final class OtherModelEvaluator
             }
             $distribution[$action] = $weight;
         }
-        // ActionSelector rounds each normalized score to four decimal places.
+
         return abs(array_sum($distribution) - 1.0) <= 0.001 ? $distribution : null;
     }
 
-    /** @param array<string, int|float> $left @param array<string, int|float> $right */
+    /** @param array<string, int|float> $left */
     private function totalVariation(array $left, array $right): float
     {
         $keys = array_values(array_unique(array_merge(array_keys($left), array_keys($right))));

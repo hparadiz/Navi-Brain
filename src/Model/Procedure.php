@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** A validated executable procedure, distinct from its human-readable memory. */
-final class Procedure extends ActiveRecord
+class Procedure extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'procedures';
     public static $primaryKey = 'id';
 
@@ -43,11 +38,9 @@ final class Procedure extends ActiveRecord
     #[Column(type: 'clob')]
     protected string $description;
 
-    /** Ordered, typed adapter calls. */
     #[Column(type: 'serialized')]
     protected array $steps = [];
 
-    /** JSON-schema-shaped description of accepted runtime arguments. */
     #[Column(type: 'serialized')]
     protected array $input_schema = [];
 

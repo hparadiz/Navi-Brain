@@ -4,17 +4,13 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use NaviBrain\Model\Memory;
 use NaviBrain\Model\UtteranceOutcome;
 use NaviBrain\Support\PlainText;
 
-/**
- * Rank stored identity and behavioural evidence without writing a persona.
- *
- * The complete ranked set is returned. Presentation layers may truncate what
- * they display, but the compiler itself has no top-N cutoff.
- */
-final class PersonalityCompiler
+class PersonalityCompiler
 {
     private const PROTOCOL = 'personality-evidence-v2';
     private const MIN_MEMORY_CONFIDENCE = 0.55;
@@ -22,7 +18,7 @@ final class PersonalityCompiler
     private const RECURRENCE_OVERLAP = 0.30;
     private const RECURRENCE_SHARED_TERMS = 3;
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
     }
 
@@ -32,16 +28,10 @@ final class PersonalityCompiler
         $context = trim(PlainText::sanitize($context));
         $nodes = $this->candidateNodes();
         $rankedNodes = $this->rankNodes($nodes, $context);
-        $outcomes = UtteranceOutcome::getAllByWhere(
-            ['status' => 'reflected'],
-            ['order' => ['id' => 'DESC']]
-        );
+        $outcomes = UtteranceOutcome::getAllByWhere(['status' => 'reflected'], ['order' => ['id' => 'DESC']]);
         $voiceSamples = $this->contextualVoiceSamples($outcomes, $context);
         $descriptorStats = $this->descriptorEvidence();
-        $establishedDescriptors = count(array_filter(
-            $descriptorStats,
-            static fn (array $row): bool => ($row['established'] ?? false) === true
-        ));
+        $establishedDescriptors = count(array_filter( $descriptorStats, static fn (array $row): bool => ($row['established'] ?? false) === true ));
 
         return [
             'protocol' => self::PROTOCOL,
@@ -62,14 +52,8 @@ final class PersonalityCompiler
             ],
             'evidence_health' => [
                 'ranked_node_count' => count($rankedNodes),
-                'fundamental_identity_node_count' => count(array_filter(
-                    $rankedNodes,
-                    static fn (array $node): bool => ($node['weights']['fundamental_identity'] ?? 0.0) > 0.0
-                )),
-                'semantic_idea_count' => count(array_filter(
-                    $rankedNodes,
-                    static fn (array $node): bool => ($node['node_type'] ?? null) === 'semantic_memory'
-                )),
+                'fundamental_identity_node_count' => count(array_filter( $rankedNodes, static fn (array $node): bool => ($node['weights']['fundamental_identity'] ?? 0.0) > 0.0 )),
+                'semantic_idea_count' => count(array_filter( $rankedNodes, static fn (array $node): bool => ($node['node_type'] ?? null) === 'semantic_memory' )),
                 'reflected_utterance_count' => count($outcomes),
                 'contextual_voice_sample_count' => count($voiceSamples),
                 'descriptor_count' => count($descriptorStats),
@@ -104,10 +88,7 @@ final class PersonalityCompiler
             ];
         }
 
-        foreach (Memory::inspectAllByWhere([
-            'status' => 'active',
-            'tier' => 'semantic',
-        ], ['order' => ['updated_at' => 'DESC']]) as $memory) {
+        foreach (Memory::inspectAllByWhere([ 'status' => 'active', 'tier' => 'semantic', ], ['order' => ['updated_at' => 'DESC']]) as $memory) {
             if ((float) $memory->confidence < self::MIN_MEMORY_CONFIDENCE) {
                 continue;
             }
@@ -154,9 +135,7 @@ final class PersonalityCompiler
         $documentFrequency = [];
         $timestamps = [];
         foreach ($nodes as $index => $node) {
-            $tokens[$index] = $this->tokenSet(
-                trim((string) ($node['key'] ?? '') . ' ' . (string) $node['content'])
-            );
+            $tokens[$index] = $this->tokenSet(trim((string) ($node['key'] ?? '') . ' ' . (string) $node['content']));
             foreach (array_keys($tokens[$index]) as $term) {
                 $documentFrequency[$term] = ($documentFrequency[$term] ?? 0) + 1;
             }
@@ -193,12 +172,7 @@ final class PersonalityCompiler
         $ranked = [];
 
         foreach ($nodes as $index => $node) {
-            [$contextWeight, $matchedTerms] = $this->contextWeight(
-                $contextTokens,
-                $tokens[$index],
-                $documentFrequency,
-                $nodeCount
-            );
+            [$contextWeight, $matchedTerms] = $this->contextWeight($contextTokens, $tokens[$index], $documentFrequency, $nodeCount);
             $supportCount = count($support[$index]);
             $rehearsalWeight = $maxSupport <= 0
                 ? 0.0
@@ -216,9 +190,7 @@ final class PersonalityCompiler
                 + (0.15 * $contextWeight)
                 + (0.10 * $confidenceWeight);
             if ($fundamentalWeight <= 0.0) {
-                // Context gates ordinary ideas without deleting them. They stay
-                // in the uncapped result, but unrelated recent chatter cannot
-                // outrank a relevant, repeatedly supported idea.
+
                 $activation *= $contextWeight;
             }
 
@@ -255,9 +227,6 @@ final class PersonalityCompiler
     }
 
     /**
-     * Reactions remain observables. They are never converted into approval,
-     * reward, or a style rule.
-     *
      * @param list<UtteranceOutcome> $outcomes
      * @return list<array<string, mixed>>
      */
@@ -314,14 +283,8 @@ final class PersonalityCompiler
             ];
         }
 
-        usort($ranked, static fn (array $left, array $right): int =>
-            $right['score'] <=> $left['score'] ?: $right['id'] <=> $left['id']
-        );
-        return array_values(array_map(static function (array $entry): array {
-            $entry['context_relevance'] = round((float) $entry['score'], 4);
-            unset($entry['score']);
-            return $entry;
-        }, $ranked));
+        usort($ranked, static fn (array $left, array $right): int => $right['score'] <=> $left['score'] ?: $right['id'] <=> $left['id']);
+        return array_values(array_map(static function (array $entry): array { $entry['context_relevance'] = round((float) $entry['score'], 4); unset($entry['score']); return $entry; }, $ranked));
     }
 
     /** @return list<array<string, mixed>> */
@@ -339,10 +302,7 @@ final class PersonalityCompiler
     /** @return list<array<string, mixed>> */
     private function activeNeeds(): array
     {
-        $needs = array_values(array_filter(
-            $this->core->listNeeds(),
-            static fn (array $need): bool => ($need['status'] ?? null) === 'active'
-        ));
+        $needs = array_values(array_filter( $this->core->listNeeds(), static fn (array $need): bool => ($need['status'] ?? null) === 'active' ));
         usort($needs, static function (array $left, array $right): int {
             $leftThreshold = max(0.001, (float) ($left['trigger_threshold'] ?? 1.0));
             $rightThreshold = max(0.001, (float) ($right['trigger_threshold'] ?? 1.0));
@@ -369,16 +329,9 @@ final class PersonalityCompiler
      * @param array<string, int> $documentFrequency
      * @return array{0: float, 1: list<string>}
      */
-    private function contextWeight(
-        array $contextTokens,
-        array $documentTokens,
-        array $documentFrequency,
-        int $documentCount
-    ): array {
+    private function contextWeight(array $contextTokens, array $documentTokens, array $documentFrequency, int $documentCount): array {
         if ($contextTokens === []) {
-            // A full identity compile is deliberately unconditioned. Context
-            // is an optional relevance lens, not a gate that erases ordinary
-            // identity evidence when no prompt-local topic was supplied.
+
             return [1.0, []];
         }
         $possible = 0.0;

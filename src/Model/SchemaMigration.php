@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class SchemaMigration extends ActiveRecord
+class SchemaMigration extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'schema_migrations';
     public static $primaryKey = 'version';
     public static $autoCreateTables = false;

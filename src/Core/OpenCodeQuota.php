@@ -6,8 +6,7 @@ namespace NaviBrain\Core;
 
 use RuntimeException;
 
-/** One local provider slot, persistent attempt budget and shared cooldown. */
-final class OpenCodeQuota
+class OpenCodeQuota
 {
     private static ?string $processToken = null;
     private string $path;
@@ -16,11 +15,7 @@ final class OpenCodeQuota
     private mixed $lock = null;
     private array $state = [];
 
-    public function __construct(
-        string $runtimeRoot,
-        int $intervalSeconds = 5400,
-        int $maxAttempts = 1
-    ) {
+    public function __construct(string $runtimeRoot, int $intervalSeconds = 5400, int $maxAttempts = 1) {
         if ($intervalSeconds < 5400 || $intervalSeconds > 86400 || $maxAttempts < 1 || $maxAttempts > 2) {
             throw new RuntimeException('OpenCode budget requires a 5400–86400 second interval and one or two attempts.');
         }
@@ -47,13 +42,7 @@ final class OpenCodeQuota
         return true;
     }
 
-    /**
-     * Informational view of one atomically published file, without a provider
-     * lock or constructor side effects. Never grants dispatch/continuation.
-     * The read is byte-bounded; local filesystem latency is not bounded here.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     public static function snapshot(string $runtimeRoot): array
     {
         $now = time();
@@ -61,8 +50,7 @@ final class OpenCodeQuota
         $path = $runtimeRoot . '/provider-quota.json';
         $before = @lstat($path);
         if ($before === false) {
-            // PHP cannot distinguish a missing path from a denied traversal
-            // here. Neither is proof of an unused provider allowance.
+
             return $unavailable + ['snapshot' => 'missing_or_unreadable'];
         }
         if (($before['mode'] & 0170000) !== 0100000 || $before['size'] < 0 || $before['size'] > 16384) {
@@ -131,7 +119,6 @@ final class OpenCodeQuota
         }
     }
 
-    /** Read eligibility without reserving a call or accumulating missed cycles. */
     public function attemptBudgetStatus(?string $continuationWindowId = null): array
     {
         $this->requireLock();
@@ -168,13 +155,7 @@ final class OpenCodeQuota
         return $status;
     }
 
-    /** Persist before dispatch. Failure, interruption and process restart never refund a call. */
-    public function reserveAttempt(
-        int $workId,
-        int $fence,
-        string $modelId,
-        ?string $continuationWindowId = null
-    ): array {
+    public function reserveAttempt(int $workId, int $fence, string $modelId, ?string $continuationWindowId = null): array {
         if ($workId < 1 || $fence < 1 || preg_match('~\A(?:opencode/)?[a-z0-9][a-z0-9._-]{0,120}-free\z~', $modelId) !== 1) {
             throw new RuntimeException('Invalid OpenCode attempt identity.');
         }
@@ -198,14 +179,9 @@ final class OpenCodeQuota
             }
         }
         $budget['attempts'][] = ['at' => $now, 'work_id' => $workId, 'fence' => $fence, 'model' => $modelId];
-        // Extend from each attempt, including the optional second. A new cycle
-        // cannot burst immediately after a late second call in the old cycle.
-        $budget['next_cycle_at'] = max($budget['next_cycle_at'],
-            $now + max($this->intervalSeconds, $budget['interval_seconds']));
-        $this->save(array_replace($this->state, [
-            'retry_at' => $this->retryAt(), 'failures' => (int) ($this->state['failures'] ?? 0),
-            'attempt_budget' => $budget,
-        ]));
+
+        $budget['next_cycle_at'] = max($budget['next_cycle_at'], $now + max($this->intervalSeconds, $budget['interval_seconds']));
+        $this->save(array_replace($this->state, [ 'retry_at' => $this->retryAt(), 'failures' => (int) ($this->state['failures'] ?? 0), 'attempt_budget' => $budget, ]));
         return ['window_id' => $budget['window_id'], 'attempts' => count($budget['attempts']),
             'next_cycle_at' => $budget['next_cycle_at']];
     }
@@ -217,7 +193,6 @@ final class OpenCodeQuota
         }
     }
 
-    /** Shared acceptance rules; snapshot adds only its separate read/decode caps. */
     private static function validateState(mixed $state): array
     {
         if (!is_array($state) || !is_int($state['retry_at'] ?? null) || $state['retry_at'] < 0
@@ -282,8 +257,7 @@ final class OpenCodeQuota
             if (!rename($temporary, $this->path)) {
                 throw new RuntimeException('Unable to publish OpenCode quota state.');
             }
-            // Retain the published state even if directory synchronization
-            // fails; later error handling must not erase a reserved attempt.
+
             $this->state = $state;
             $directory = fopen(dirname($this->path), 'r');
             if ($directory === false) {

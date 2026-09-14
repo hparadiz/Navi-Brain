@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
-/** Deterministic probability normalization and proper categorical scores. */
-final class ProbabilityScorer
+class ProbabilityScorer
 {
     private const EPSILON = 0.000001;
 
-    /** @param array<string, int|float> $distribution @param list<string> $domain
-     *  @return array<string, float>
+    /**
+     * @param array<string, int|float> $distribution
+     * @return array<string, float>
      */
     public static function normalize(array $distribution, array $domain): array
     {
@@ -23,10 +23,7 @@ final class ProbabilityScorer
             $uniform = $normalized === [] ? 0.0 : 1.0 / count($normalized);
             return array_map(static fn (): float => $uniform, $normalized);
         }
-        return array_map(
-            static fn (float $value): float => round($value / $sum, 6),
-            $normalized
-        );
+        return array_map(static fn (float $value): float => round($value / $sum, 6), $normalized);
     }
 
     /** @param array<string, int|float> $distribution */
@@ -52,7 +49,6 @@ final class ProbabilityScorer
         return round(-log(self::probability($distribution, $observed)), 6);
     }
 
-    /** Normalized entropy from zero (certain) through one (uniform). */
     public static function entropy(array $distribution): float
     {
         $count = count($distribution);

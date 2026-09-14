@@ -4,40 +4,27 @@ declare(strict_types=1);
 
 namespace NaviBrain\Perception;
 
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Model\ForwardPrediction;
 use NaviBrain\Model\SenseReading;
 
-/**
- * One-step predictive model over authorized sensory streams.
- *
- * Friston (2010) describes predictive coding as reciprocal prediction and
- * precision-weighted error. This is the deliberately modest systems version:
- * persist the last one-step forecast, compare it with the next observation,
- * calibrate precision from recent errors, then extrapolate the next state.
- */
-final class ForwardModel
+class ForwardModel
 {
     private const HISTORY = 12;
     private const RETENTION_PER_SOURCE = 64;
     private const MATCH_ERROR = 0.2;
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
     }
 
     /**
      * @return array{
-     *   resolved: array<string, mixed>|null,
-     *   next: array<string, mixed>
+     * resolved: array<string, mixed>|null,
+     * next: array<string, mixed>
      * }
      */
-    public function observe(
-        string $sourceKey,
-        SenseReading $reading,
-        ?SenseReading $previous,
-        int $nominalIntervalSeconds
-    ): array {
+    public function observe(string $sourceKey, SenseReading $reading, ?SenseReading $previous, int $nominalIntervalSeconds): array {
         $now = time();
         $payload = is_array($reading->payload) ? $reading->payload : [];
         $resolved = $this->resolvePending($sourceKey, $reading, $payload, $now);
@@ -49,7 +36,7 @@ final class ForwardModel
         $observedAt = $this->timestamp($reading->observed_at) ?? $now;
 
         /** @var ForwardPrediction $next */
-        $next = $this->core->insertRecord(ForwardPrediction::class, [
+        $next = new ForwardPrediction([
             'source_key' => $sourceKey,
             'based_on_reading_id' => (int) $reading->id,
             'expected_at' => $observedAt + max(1, $nominalIntervalSeconds),
@@ -57,7 +44,8 @@ final class ForwardModel
             'precision' => $precision,
             'observed' => [],
             'status' => 'pending',
-        ]);
+        ], true, true);
+        $next->save();
 
         $this->prune($sourceKey);
 
@@ -65,9 +53,6 @@ final class ForwardModel
     }
 
     /**
-     * Error for the fields an edge says changed. Returns null before a source
-     * has made and resolved its first forecast.
-     *
      * @param array<string, mixed> $after
      * @param array<string, mixed>|null $resolved
      */
@@ -96,27 +81,19 @@ final class ForwardModel
         return $prediction instanceof ForwardPrediction ? $prediction->getData() : null;
     }
 
-    /** Retire forecasts that can no longer receive authorized evidence. */
     public function sourceStatusChanged(string $sourceKey, string $status): int
     {
         if ($status === 'active') {
             return 0;
         }
         $expired = 0;
-        foreach (ForwardPrediction::getAllByWhere([
-            'source_key' => $sourceKey,
-            'status' => 'pending',
-        ]) as $prediction) {
+        foreach (ForwardPrediction::getAllByWhere([ 'source_key' => $sourceKey, 'status' => 'pending', ]) as $prediction) {
             $prediction->setField('status', 'expired');
             $prediction->save();
             $expired++;
         }
         if ($expired > 0) {
-            $this->core->emitEvent('forward.source_inactive', [
-                'source_key' => $sourceKey,
-                'source_status' => $status,
-                'predictions_expired' => $expired,
-            ]);
+            $this->core->emitEvent('forward.source_inactive', [ 'source_key' => $sourceKey, 'source_status' => $status, 'predictions_expired' => $expired, ]);
         }
         return $expired;
     }
@@ -124,34 +101,15 @@ final class ForwardModel
     /** @return array<string, mixed> */
     public function status(): array
     {
-        $pending = ForwardPrediction::getAllByWhere(
-            ['status' => 'pending'],
-            ['order' => ['id' => 'DESC'], 'limit' => 25]
-        );
-        $recent = ForwardPrediction::getAll([
-            'order' => ['id' => 'DESC'],
-            'limit' => 100,
-        ]);
-        $resolved = array_values(array_filter(
-            $recent,
-            static fn (ForwardPrediction $prediction): bool => in_array(
-                $prediction->status,
-                ['matched', 'violated'],
-                true
-            )
-        ));
-        $errors = array_map(
-            static fn (ForwardPrediction $prediction): float => (float) $prediction->prediction_error,
-            $resolved
-        );
+        $pending = ForwardPrediction::getAllByWhere(['status' => 'pending'], ['order' => ['id' => 'DESC'], 'limit' => 25]);
+        $recent = ForwardPrediction::getAll([ 'order' => ['id' => 'DESC'], 'limit' => 100, ]);
+        $resolved = array_values(array_filter( $recent, static fn (ForwardPrediction $prediction): bool => in_array( $prediction->status, ['matched', 'violated'], true ) ));
+        $errors = array_map(static fn (ForwardPrediction $prediction): float => (float) $prediction->prediction_error, $resolved);
         return [
             'pending' => count($pending),
             'resolved' => count($resolved),
             'mean_error' => $errors === [] ? null : round(array_sum($errors) / count($errors), 4),
-            'recent' => array_map(
-                static fn (ForwardPrediction $prediction): array => $prediction->getData(),
-                array_slice($recent, 0, 12)
-            ),
+            'recent' => array_map(static fn (ForwardPrediction $prediction): array => $prediction->getData(), array_slice($recent, 0, 12)),
         ];
     }
 
@@ -174,25 +132,14 @@ final class ForwardModel
             if (count($sourceErrors) < 3) {
                 continue;
             }
-            $result[$source] = round(max(
-                0.0,
-                min(1.0, 1.0 - (array_sum($sourceErrors) / count($sourceErrors)))
-            ), 4);
+            $result[$source] = round(max( 0.0, min(1.0, 1.0 - (array_sum($sourceErrors) / count($sourceErrors))) ), 4);
         }
         return $result;
     }
 
     /** @return array<string, mixed>|null */
-    private function resolvePending(
-        string $sourceKey,
-        SenseReading $reading,
-        array $payload,
-        int $now
-    ): ?array {
-        $pending = ForwardPrediction::getAllByWhere(
-            ['source_key' => $sourceKey, 'status' => 'pending'],
-            ['order' => ['id' => 'DESC']]
-        );
+    private function resolvePending(string $sourceKey, SenseReading $reading, array $payload, int $now): ?array {
+        $pending = ForwardPrediction::getAllByWhere(['source_key' => $sourceKey, 'status' => 'pending'], ['order' => ['id' => 'DESC']]);
         $prediction = array_shift($pending);
         foreach ($pending as $stale) {
             $stale->setField('status', 'expired');
@@ -214,9 +161,6 @@ final class ForwardModel
         ]);
         $prediction->save();
 
-        // Prediction rows retain ordinary matches. Only a violated expectation
-        // becomes an event; otherwise a continuous source would double the
-        // event log merely by behaving exactly as expected.
         if ($status === 'violated') {
             $this->core->emitEvent('forward.violated', [
                 'prediction_id' => (int) $prediction->id,
@@ -234,10 +178,7 @@ final class ForwardModel
     private function precision(string $sourceKey): float
     {
         $errors = [];
-        foreach (ForwardPrediction::getAllByWhere(
-            ['source_key' => $sourceKey],
-            ['order' => ['id' => 'DESC'], 'limit' => self::HISTORY * 2]
-        ) as $prediction) {
+        foreach (ForwardPrediction::getAllByWhere(['source_key' => $sourceKey], ['order' => ['id' => 'DESC'], 'limit' => self::HISTORY * 2]) as $prediction) {
             if (!in_array($prediction->status, ['matched', 'violated'], true)) {
                 continue;
             }
@@ -254,16 +195,13 @@ final class ForwardModel
 
     private function prune(string $sourceKey): void
     {
-        $predictions = ForwardPrediction::getAllByWhere(
-            ['source_key' => $sourceKey],
-            ['order' => ['id' => 'DESC']]
-        );
+        $predictions = ForwardPrediction::getAllByWhere(['source_key' => $sourceKey], ['order' => ['id' => 'DESC']]);
         foreach (array_slice($predictions, self::RETENTION_PER_SOURCE) as $prediction) {
             $prediction->destroy();
         }
     }
 
-    /** @param array<string, mixed> $current @param array<string, mixed> $previous */
+    /** @param array<string, mixed> $current */
     private function predict(array $current, array $previous): array
     {
         $predicted = [];
@@ -276,14 +214,10 @@ final class ForwardModel
                 continue;
             }
             if (is_array($value) && !array_is_list($value)) {
-                $predicted[$field] = $this->predict(
-                    $value,
-                    is_array($prior) && !array_is_list($prior) ? $prior : []
-                );
+                $predicted[$field] = $this->predict($value, is_array($prior) && !array_is_list($prior) ? $prior : []);
                 continue;
             }
-            // Persistence is the safest categorical/text baseline. It makes a
-            // change an explicit violated expectation without inventing one.
+
             $predicted[$field] = $value;
         }
         return $predicted;
@@ -294,8 +228,7 @@ final class ForwardModel
         if ((is_int($predicted) || is_float($predicted))
             && (is_int($observed) || is_float($observed))
         ) {
-            return min(1.0, abs((float) $observed - (float) $predicted)
-                / max(1.0, abs((float) $observed), abs((float) $predicted)));
+            return min(1.0, abs((float) $observed - (float) $predicted) / max(1.0, abs((float) $observed), abs((float) $predicted)));
         }
         if (is_array($predicted) && is_array($observed)) {
             $keys = array_values(array_unique(array_merge(array_keys($predicted), array_keys($observed))));

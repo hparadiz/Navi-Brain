@@ -4,17 +4,11 @@ declare(strict_types=1);
 
 namespace NaviBrain\Perception;
 
-/**
- * Requests named, bounded kernel observations from the unprivileged service.
- * The service enforces a fixed-file contract: no caller-selected path, argv,
- * shell or network operation. Account separation alone is not a read-only
- * sandbox. The legacy command argument now selects an installed observation.
- */
-final class CommandSense
+class CommandSense
 {
     public const PROTOCOL = 'navi-observation-v1';
     private const SOCKET_PATH = '/run/navi-senses/navi-senses.sock';
-    /** Bound waiting for the service; observations themselves use bounded reads. */
+
     private const TIMEOUT_SECONDS = 15;
     private const MAX_RESPONSE_BYTES = 65536;
 
@@ -44,7 +38,7 @@ final class CommandSense
         if (isset(self::operations()[$command])) {
             return $command;
         }
-        // Exact compatibility aliases, not a parser for arbitrary commands.
+
         return match ($command) {
             'cat /proc/uptime' => 'system.uptime',
             'cat /proc/loadavg' => 'system.load',
@@ -55,7 +49,6 @@ final class CommandSense
         };
     }
 
-    /** Is the looking service reachable right now? */
     public function available(): bool
     {
         if (!file_exists($this->socketPath)) {
@@ -69,43 +62,23 @@ final class CommandSense
         return true;
     }
 
-    /**
-     * Look at something and return what was seen.
-     *
-     * Always returns a reading, including when the service is down or refused.
-     * A look that could not happen is an observation about the machine, and
-     * swallowing it as an exception would hide it from perception entirely.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     public function observe(string $command): array
     {
         $command = trim($command);
         $operation = self::resolveOperation($command);
         if ($operation === null) {
-            return $this->unavailable($command, 'Unsupported observation. Choose one of: '
-                . implode(', ', array_keys(self::operations())) . '. Arbitrary commands and paths are not supported.');
+            return $this->unavailable($command, 'Unsupported observation. Choose one of: ' . implode(', ', array_keys(self::operations())) . '. Arbitrary commands and paths are not supported.');
         }
 
-        $socket = @stream_socket_client(
-            'unix://' . $this->socketPath,
-            $errorNumber,
-            $errorMessage,
-            self::TIMEOUT_SECONDS
-        );
+        $socket = @stream_socket_client('unix://' . $this->socketPath, $errorNumber, $errorMessage, self::TIMEOUT_SECONDS);
         if (!is_resource($socket)) {
-            return $this->unavailable($command, sprintf(
-                'the looking service is not reachable: %s',
-                $errorMessage === '' ? 'no socket at ' . $this->socketPath : $errorMessage
-            ));
+            return $this->unavailable($command, sprintf( 'the looking service is not reachable: %s', $errorMessage === '' ? 'no socket at ' . $this->socketPath : $errorMessage ));
         }
 
         try {
             stream_set_timeout($socket, self::TIMEOUT_SECONDS);
-            $payload = json_encode([
-                'protocol' => self::PROTOCOL,
-                'operation' => $operation,
-            ], JSON_UNESCAPED_SLASHES) . "\n";
+            $payload = json_encode([ 'protocol' => self::PROTOCOL, 'operation' => $operation, ], JSON_UNESCAPED_SLASHES) . "\n";
             if (@fwrite($socket, $payload) !== strlen($payload)) {
                 return $this->unavailable($command, 'the looking service closed the connection');
             }

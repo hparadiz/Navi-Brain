@@ -3,7 +3,7 @@
 
 declare(strict_types=1);
 
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Core\CodexSparkWorker;
 use NaviBrain\Core\DreamCycle;
 use NaviBrain\Core\NativeMaintenance;
@@ -82,7 +82,7 @@ if ($profile === 'dream-cycle') {
 }
 
 if ($arguments === ['--status']) {
-    // Loading this class has no bootstrap, constructor or provider side effects.
+
     require dirname(__DIR__) . '/src/Core/OpenCodeQuota.php';
     $quota = OpenCodeQuota::snapshot(dirname(__DIR__) . '/var/opencode-worker');
     $privacy = match ($profile) {
@@ -107,8 +107,7 @@ if ($arguments === ['--status']) {
         'not_checked' => ['durable_pause', 'ready_evidence', 'provider_credentials',
             'model_catalogue', 'provider_lock', 'continuation_entitlement'],
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . PHP_EOL);
-    // Uninitialized state is normal for the local-only default. Other read or
-    // validation failures are also reported explicitly in the JSON snapshot.
+
     exit(in_array($quota['snapshot'], ['valid', 'missing_or_unreadable'], true) ? 0 : 1);
 }
 if ($profile === 'disabled') {
@@ -118,7 +117,7 @@ if ($profile === 'disabled') {
 
 require dirname(__DIR__) . '/bootstrap/app.php';
 
-$core = new ExecutiveCore();
+$core = new Executive();
 $core->initialize();
 $worker = match ($profile) {
     'native-maintenance' => new NativeMaintenance($core, $nativeConfig),
@@ -131,8 +130,7 @@ $nodeId = getenv('NAVI_BRAIN_NODE_ID');
 if (!is_string($nodeId) || trim($nodeId) === '') {
     $nodeId = gethostname() ?: 'local';
 }
-$owner = sprintf('%s:%s:%d', $nodeId,
-    in_array($profile, ['native-maintenance', 'dream-cycle'], true) ? $profile : 'model-worker', getmypid());
+$owner = sprintf('%s:%s:%d', $nodeId, in_array($profile, ['native-maintenance', 'dream-cycle'], true) ? $profile : 'model-worker', getmypid());
 $running = true;
 $lastIdleStatus = null;
 
@@ -156,10 +154,7 @@ while ($running) {
     $status = $record['worker']['status'] ?? null;
     $idle = in_array($status, ['idle', 'disabled', 'awaiting_review', 'unchanged_evidence', 'evidence_already_reviewed', 'publication_required', 'provider_busy', 'provider_cooling_down', 'budget_exhausted'], true);
     if (!$idle || $status !== $lastIdleStatus) {
-        fwrite(STDOUT, json_encode(
-            $record,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-        ) . PHP_EOL);
+        fwrite(STDOUT, json_encode( $record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR ) . PHP_EOL);
         fflush(STDOUT);
     }
     $lastIdleStatus = $idle ? $status : null;

@@ -4,19 +4,20 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use InvalidArgumentException;
 use NaviBrain\Model\WorkItem;
 use RuntimeException;
 use Throwable;
 
-/** One reserved OpenCode CLI invocation for an explicitly routed batch. */
-final class DreamModelWorker
+class DreamModelWorker
 {
-    private readonly ExecutiveCore $core;
+    private readonly Executive $core;
     private readonly array $config;
     private readonly string $runtimeRoot;
 
-    public function __construct(ExecutiveCore $core, array $config = [])
+    public function __construct(Executive $core, array $config = [])
     {
         $this->core = $core;
         $this->config = array_replace([
@@ -64,8 +65,7 @@ final class DreamModelWorker
             && !mkdir($this->runtimeRoot, 0700, true) && !is_dir($this->runtimeRoot)) {
             throw new RuntimeException('Unable to create the private OpenCode runtime directory.');
         }
-        $quota = new OpenCodeQuota($this->runtimeRoot,
-            $this->config['interval_seconds'], $this->config['max_prompts_per_cycle']);
+        $quota = new OpenCodeQuota($this->runtimeRoot, $this->config['interval_seconds'], $this->config['max_prompts_per_cycle']);
         try {
             if (!$quota->acquire()) {
                 return ['status' => 'provider_busy', 'cli_invocations' => 0];
@@ -83,23 +83,24 @@ final class DreamModelWorker
                 throw new RuntimeException('Dream preparation returned work outside its evidence-only lane.');
             }
             $client = new OpenCodeDreamClient($this->core, $this->config['model']);
-            // Availability/configuration checks happen before claiming work or
-            // charging an attempt. Catalogue reads contain no memory evidence.
+
             try {
                 $client->preflight();
             } catch (ModelRateLimit $limited) {
                 return ['status' => 'provider_cooling_down', 'cli_invocations' => 0,
                     'retry_at' => $quota->rateLimited($limited->retryAt)];
             }
-            $claimed = $this->core->claimWork($owner, 180, [],
-                [ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE], (int) $candidate['id'], 'opencode-dream');
+            $claim = new WorkClaim($owner, 180);
+            $claim->includedWorkTypes = [Executive::MEMORY_CONSOLIDATION_WORK_TYPE];
+            $claim->workId = (int) $candidate['id'];
+            $claim->lane = 'opencode-dream';
+            $claimed = $this->core->claimWork($claim);
             if ($claimed === null) {
                 return ['status' => 'busy', 'cli_invocations' => 0];
             }
             $work = $claimed['work_item'];
             if (!$this->isDreamWork($work)) {
-                // This can only follow a conflicting local work mutation. Never
-                // transmit it, even though the exact lane claim succeeded.
+
                 $this->core->deferWork((int) $work['id'], $owner, (int) $work['fencing_token'], time() + 5400);
                 throw new RuntimeException('Claimed dream work changed its evidence-only contract.');
             }
@@ -107,8 +108,7 @@ final class DreamModelWorker
                 $this->core->deferWork((int) $work['id'], $owner, (int) $work['fencing_token'], time() + 30);
                 return ['status' => 'paused', 'cli_invocations' => 0];
             }
-            // Reuse preparation only for the exact immutable work manifest
-            // claimed here. Private prose never enters persisted/logged work.
+
             $preparedPrompt = is_string($prepared['prepared_prompt'] ?? null)
                 && $work['id'] === $candidate['id']
                 && ($work['prompt'] ?? null) === ($candidate['prompt'] ?? null)
@@ -118,8 +118,7 @@ final class DreamModelWorker
             try {
                 $materialized = $this->core->materializeDreamConsolidation($work, $preparedPrompt);
             } catch (Throwable) {
-                // A native transport or incompatible-renderer failure is not
-                // changed evidence and must not consume the provider budget.
+
                 $this->core->deferWork((int) $work['id'], $owner, (int) $work['fencing_token'], time() + 300);
                 return ['status' => 'failed', 'work_id' => (int) $work['id'], 'cli_invocations' => 0,
                     'error' => 'Dream source materialization failed; the exact work is retained for retry.'];
@@ -127,8 +126,7 @@ final class DreamModelWorker
                 unset($preparedPrompt);
             }
             if ($materialized['status'] === 'source_changed') {
-                return $this->core->cancelChangedDreamConsolidation((int) $work['id'], $owner,
-                    (int) $work['fencing_token'], (string) $materialized['reason']) + ['cli_invocations' => 0];
+                return $this->core->cancelChangedDreamConsolidation((int) $work['id'], $owner, (int) $work['fencing_token'], (string) $materialized['reason']) + ['cli_invocations' => 0];
             }
             $prompt = $materialized['prompt'];
             unset($materialized);
@@ -136,14 +134,12 @@ final class DreamModelWorker
                 return ['status' => 'paused', 'work_id' => (int) $work['id'], 'cli_invocations' => 0];
             }
             if (!$this->core->dreamConsolidationLeaseIsCurrent($work, $owner)) {
-                // Leave the lease to ordinary expiry/recovery. No renewal or
-                // rate-limit event is invented for slow local hydration.
+
                 return ['status' => 'busy', 'work_id' => (int) $work['id'], 'cli_invocations' => 0,
                     'reason' => 'dream_lease_or_manifest_requires_recovery'];
             }
-            $reservation = $quota->reserveAttempt((int) $work['id'], (int) $work['fencing_token'],
-                $this->config['model'], $continuationWindowId);
-            return $this->complete($client, $quota, $work, $owner, $reservation, $prompt);
+            $reservation = $quota->reserveAttempt((int) $work['id'], (int) $work['fencing_token'], $this->config['model'], $continuationWindowId);
+            return $this->complete($client, $quota, $work, $reservation, $prompt);
         } finally {
             $quota->release();
         }
@@ -152,18 +148,17 @@ final class DreamModelWorker
     private function isDreamWork(array $work): bool
     {
         return is_int($work['id'] ?? null) && $work['id'] > 0
-            && ($work['work_type'] ?? null) === ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE
-            && in_array($work['input_refs']['dream_protocol'] ?? null,
-                ['dream-consolidation-v1', ExecutiveCore::DREAM_REFERENCE_PROTOCOL], true)
+            && ($work['work_type'] ?? null) === Executive::MEMORY_CONSOLIDATION_WORK_TYPE
+            && in_array($work['input_refs']['dream_protocol'] ?? null, ['dream-consolidation-v1', Executive::DREAM_REFERENCE_PROTOCOL], true)
             && ($work['parent_run_id'] ?? null) === null
             && ($work['parent_intention_id'] ?? null) === null
             && ($work['allowed_actions'] ?? []) === [];
     }
 
     /** @return array<string, mixed> */
-    private function complete(OpenCodeDreamClient $client, OpenCodeQuota $quota,
-        array $work, string $owner, array $reservation, string $prompt): array
+    private function complete(OpenCodeDreamClient $client, OpenCodeQuota $quota, array $work, array $reservation, string $prompt): array
     {
+        $owner = (string) $work['lease_owner'];
         $workId = (int) $work['id'];
         $fence = (int) $work['fencing_token'];
         $base = ['work_id' => $workId, 'window_id' => $reservation['window_id'],
@@ -181,33 +176,29 @@ final class DreamModelWorker
         } catch (ModelProposalRejected $rejected) {
             return $base + $this->rejectResponse($work, $owner);
         } catch (Throwable $error) {
-            // A transport failure is not evidence against the source. Keep the
-            // exact batch, but its next attempt must wait for a new allowance.
+
             $this->core->deferWork($workId, $owner, $fence, (int) $reservation['next_cycle_at']);
             return $base + ['status' => 'failed', 'cli_invocations' => 1, 'error' => $error->getMessage()];
         }
         $model = 'opencode/' . $this->config['model'];
         try {
-            $this->core->finishWork($workId, $owner, $fence, true,
-                $response['proposal'], $model);
+            $this->core->finishWork(WorkCompletion::success(new WorkItem($work), $response['proposal'], $model));
         } catch (Throwable $error) {
             $current = WorkItem::getByID($workId);
             if ($current instanceof WorkItem && $current->status === 'completed') {
-                // Completion may have committed before a later local error.
-                // Recovery owns integration; inference is never repeated here.
+
                 return $base + ['status' => 'integration_pending', 'cli_invocations' => 1];
             }
             if ($error instanceof InvalidArgumentException) {
                 return $base + $this->rejectResponse($work, $owner);
             }
-            // Retain the existing lease on ambiguous local persistence failure.
-            // The durable attempt budget prevents an immediate duplicate call.
+
             throw $error;
         }
         try {
             $quota->succeeded();
         } catch (Throwable) {
-            // Clearing an expired provider brake cannot undo completed work.
+
         }
         try {
             $integration = $this->core->integrateWorkerResult($work, $response['proposal'], $model);
@@ -224,18 +215,15 @@ final class DreamModelWorker
     private function rejectResponse(array $work, string $owner): array
     {
         $reason = 'Dream response failed the proposal validator.';
-        $this->core->finishWork((int) $work['id'], $owner, (int) $work['fencing_token'],
-            false, [], 'opencode/' . $this->config['model'], $reason);
+        $this->core->finishWork(WorkCompletion::failure(new WorkItem($work), $reason, 'opencode/' . $this->config['model']));
         $integration = $this->core->handleWorkerFailure($work, $reason);
         return ['status' => 'failed', 'cli_invocations' => 1,
             'integration' => $this->integrationSummary($integration)];
     }
 
-    /** Logs retain references and outcomes without copying private source packs. */
     private function integrationSummary(array $integration): array
     {
-        $summary = array_intersect_key($integration,
-            array_flip(['status', 'accepted_batch', 'new_assertion']));
+        $summary = array_intersect_key($integration, array_flip(['status', 'accepted_batch', 'new_assertion']));
         if (isset($integration['memory']['id'])) {
             $summary['memory_id'] = (int) $integration['memory']['id'];
         }

@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** Structured execution metadata for an ActionTrace. */
-final class ActionExecution extends ActiveRecord
+class ActionExecution extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'action_executions';
     public static $primaryKey = 'id';
 
@@ -41,7 +36,6 @@ final class ActionExecution extends ActiveRecord
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $procedure_id = null;
 
-    /** Immutable token-memory generation that authorized this action. */
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $procedure_memory_id = null;
 

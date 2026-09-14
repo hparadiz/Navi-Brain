@@ -4,22 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/**
- * An edge: the moment a sense noticed something change.
- *
- * This is the unit that makes perception informative. A constant reading
- * carries no information no matter how often it is sampled; a transition does.
- * Sense events are what reach attention, and their recorded downstream outcome
- * is the only training signal available without a gradient.
- */
-final class SenseEvent extends ActiveRecord
+class SenseEvent extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'sense_events';
     public static $primaryKey = 'id';
 
@@ -44,7 +32,6 @@ final class SenseEvent extends ActiveRecord
     #[Column(type: 'timestamp')]
     protected $observed_at;
 
-    /** Human-readable statement of what changed. This is what attention reads. */
     #[Column(type: 'clob')]
     protected string $summary;
 
@@ -60,17 +47,9 @@ final class SenseEvent extends ActiveRecord
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $reading_id = null;
 
-    /** Tuning version that produced this event, so retunes stay attributable. */
     #[Column(type: 'integer', unsigned: true)]
     protected int $tuning_version = 0;
 
-    /**
-     * pending: not yet consumed.
-     * used: reached a capsule slot or a durable memory.
-     * accepted: contributed to an accepted refinement or an accepted utterance.
-     * ignored: attention saw it and passed over it.
-     * expired: nothing consumed it before it went stale.
-     */
     #[Column(type: 'enum', values: ['pending', 'used', 'accepted', 'ignored', 'expired'])]
     protected string $outcome = 'pending';
 

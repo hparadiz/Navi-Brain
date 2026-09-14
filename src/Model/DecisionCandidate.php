@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** One proposed action and the deterministic evidence used to value it. */
-final class DecisionCandidate extends ActiveRecord
+class DecisionCandidate extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'decision_candidates';
     public static $primaryKey = 'id';
 

@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class Event extends ActiveRecord
+class Event extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'events';
     public static $primaryKey = 'id';
 
@@ -31,4 +27,7 @@ final class Event extends ActiveRecord
 
     #[Column(type: 'serialized')]
     protected array $payload = [];
+
+    #[Column(type: 'string', length: 255, notnull: false)]
+    protected ?string $dedupe_key = null;
 }

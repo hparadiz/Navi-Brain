@@ -4,21 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/**
- * One reading of conduct against one value. The fast loop.
- *
- * Affect alone cannot say what an event means: the same correction licenses
- * "look harder" or "commit to less" depending on which value it implicates.
- * Scoring against a named value is what supplies the reading.
- */
-final class ValueAppraisal extends ActiveRecord
+class ValueAppraisal extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'value_appraisals';
     public static $primaryKey = 'id';
 
@@ -42,7 +31,6 @@ final class ValueAppraisal extends ActiveRecord
     #[Column(type: 'integer', notnull: false)]
     protected ?int $intention_id = null;
 
-    /** 1.0 is full alignment, 0.0 is total shortfall. */
     #[Column(type: 'decimal', precision: 4, scale: 3)]
     protected float $alignment;
 
@@ -52,7 +40,6 @@ final class ValueAppraisal extends ActiveRecord
     #[Column(type: 'enum', values: ['user', 'self', 'outcome'])]
     protected string $source;
 
-    /** Set when a repeated shortfall crossed into a standing intention. */
     #[Column(type: 'integer', notnull: false)]
     protected ?int $generated_intention_id = null;
 }

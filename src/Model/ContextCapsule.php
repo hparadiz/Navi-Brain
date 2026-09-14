@@ -4,22 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/**
- * One assembled bounded workspace for a single cognitive operation.
- *
- * The capsule is neither fresh nor a transcript: it is fixed-size and carried
- * across wakes, so a thread keeps working state between steps without unbounded
- * growth. `checksum` exists so the worker, the curator, and the outcome
- * observer can prove they read the same bytes.
- */
-final class ContextCapsule extends ActiveRecord
+class ContextCapsule extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'context_capsules';
     public static $primaryKey = 'id';
 
@@ -46,11 +34,9 @@ final class ContextCapsule extends ActiveRecord
     #[Column(type: 'string', length: 96)]
     protected string $trigger;
 
-    /** Slot budget (nm). Config, never a constant: the optimum is task-specific. */
     #[Column(type: 'integer', unsigned: true)]
     protected int $slot_budget;
 
-    /** How many candidates survived stage-one narrowing. */
     #[Column(type: 'integer', unsigned: true)]
     protected int $candidate_count = 0;
 
@@ -59,4 +45,58 @@ final class ContextCapsule extends ActiveRecord
 
     #[Column(type: 'string', length: 64)]
     protected string $checksum;
+
+    public static function serializeSlots(int $capsuleId): array
+    {
+        $payload = [];
+        foreach (CapsuleSlot::getAllByWhere(['capsule_id' => $capsuleId], ['order' => ['id' => 'ASC']]) as $slot) {
+            $payload[] = [
+                'slot_role' => (string) $slot->slot_role,
+                'record_type' => $slot->record_type,
+                'record_id' => $slot->record_id === null ? null : (int) $slot->record_id,
+                'claim' => $slot->claim,
+                'confidence' => round((float) $slot->confidence, 4),
+                'carryover_depth' => (int) $slot->carryover_depth,
+            ];
+        }
+        return $payload;
+    }
+
+    public function saveSlots(array $resolved): array
+    {
+        $this->setFields([
+            'filled_slots' => count(array_filter($resolved, static fn (array $slot): bool => $slot['record_id'] !== null)),
+            'checksum' => str_repeat('0', 64),
+        ]);
+        $this->save();
+
+        $slots = [];
+        foreach ($resolved as $slot) {
+            /** @var CapsuleSlot $record */
+            $record = new CapsuleSlot([
+                'capsule_id' => (int) $this->id,
+                'slot_role' => $slot['role'],
+                'record_type' => $slot['record_type'],
+                'record_id' => $slot['record_id'],
+                'claim' => $slot['claim'],
+                'confidence' => (float) $slot['confidence'],
+                'score' => (float) $slot['score'],
+                'recorded_at' => $slot['recorded_at'],
+                'transition' => $slot['transition'],
+                'transition_reason' => $slot['reason'],
+                'carried_from_capsule_id' => $slot['carried_from'] && $this->previous_capsule_id !== null
+                    ? (int) $this->previous_capsule_id
+                    : null,
+                'carryover_depth' => (int) $slot['carryover_depth'],
+                'reserved' => (int) $slot['reserved'],
+            ], true, true);
+            $record->save();
+            $slots[] = $record;
+        }
+
+        $this->setField('checksum', hash('sha256', json_encode(static::serializeSlots((int) $this->id), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)));
+        $this->save();
+
+        return ['capsule' => $this, 'slots' => $slots];
+    }
 }

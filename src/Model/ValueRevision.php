@@ -4,23 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/**
- * A change to a value, with the basis that licensed it. The slow loop.
- *
- * Note the basis enum: there is deliberately no "kept falling short" option.
- * Failing repeatedly is evidence about conduct, not about the value. A value
- * revises when the world says something new about it - it turned out to cost
- * something unknown, it contradicts another held value, or the user redirects
- * it. Otherwise lowering the bar is just rationalisation with an audit trail.
- */
-final class ValueRevision extends ActiveRecord
+class ValueRevision extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'value_revisions';
     public static $primaryKey = 'id';
 
@@ -56,7 +43,7 @@ final class ValueRevision extends ActiveRecord
     protected string $reason;
 
     #[Column(type: 'enum', values: ['user', 'developer', 'system', 'agent'])]
-    protected string $authority;
+    protected string $authority = 'agent';
 
     #[Column(type: 'integer', notnull: false)]
     protected ?int $event_id = null;

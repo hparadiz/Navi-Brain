@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace NaviBrain\Storage;
 
-use Divergence\IO\Database\Connections;
 use Divergence\IO\Database\Writer\SQLite as SQLiteWriter;
 use NaviBrain\Model\ActionExecution;
 use NaviBrain\Model\ActionTrace;
@@ -34,6 +33,7 @@ use NaviBrain\Model\Procedure;
 use NaviBrain\Model\ProcedureRun;
 use NaviBrain\Model\Rhythm;
 use NaviBrain\Model\SchemaMigration;
+use NaviBrain\Model\SqliteCatalog;
 use NaviBrain\Model\SelfModelFact;
 use NaviBrain\Model\Sense;
 use NaviBrain\Model\SenseEvent;
@@ -47,17 +47,15 @@ use NaviBrain\Model\ValueRevision;
 use NaviBrain\Model\WorkItem;
 use NaviBrain\Model\WorkingMemorySlot;
 use RuntimeException;
-use Throwable;
 
-final class Schema
+class Schema
 {
-    public const VERSION = 25;
+    public const VERSION = 26;
     private const BASELINE_VERSION = 4;
 
     /** @var array<int, array{name: string, statements: list<string>}> */
     private const STATIC_MIGRATIONS = [
-        // Version 23 is already installed. Keep its original statements and
-        // checksum immutable; subsequent additions belong in version 24.
+
         23 => [
             'name' => 'track_decision_integration_ownership',
             'statements' => [
@@ -240,30 +238,19 @@ final class Schema
     /** @return array{version: int, tables: list<string>} */
     public function ensure(): array
     {
-        $tables = array_map(
-            static fn (string $modelClass): string => $modelClass::$tableName,
-            self::MODELS
-        );
+        $tables = array_map(static fn (string $modelClass): string => $modelClass::$tableName, self::MODELS);
         $tables[] = 'schema_migrations';
         $migrations = $this->migrations();
         $installedVersion = $this->installedVersion();
         if ($installedVersion > self::VERSION) {
-            throw new RuntimeException(sprintf(
-                'Database schema version %d is newer than supported version %d.',
-                $installedVersion,
-                self::VERSION
-            ));
+            throw new RuntimeException(sprintf( 'Database schema version %d is newer than supported version %d.', $installedVersion, self::VERSION ));
         }
 
         if ($installedVersion === 0) {
             $this->installBaseline();
             $installedVersion = self::BASELINE_VERSION;
         } elseif ($installedVersion < self::BASELINE_VERSION) {
-            throw new RuntimeException(sprintf(
-                'Database schema version %d predates the explicit migration baseline; restore a version %d backup before upgrading.',
-                $installedVersion,
-                self::BASELINE_VERSION
-            ));
+            throw new RuntimeException(sprintf( 'Database schema version %d predates the explicit migration baseline; restore a version %d backup before upgrading.', $installedVersion, self::BASELINE_VERSION ));
         }
 
         for ($version = $installedVersion + 1; $version <= self::VERSION; $version++) {
@@ -288,47 +275,24 @@ final class Schema
 
     private function installedVersion(): int
     {
-        $connection = Connections::getConnection();
-        $statement = $connection->query('PRAGMA user_version');
-        $version = (int) ($statement?->fetchColumn() ?: 0);
-        $statement?->closeCursor();
-        return $version;
+        return (int) SqliteCatalog::getByQuery('PRAGMA user_version')->user_version;
     }
 
     private function installBaseline(): void
     {
-        $connection = Connections::getConnection();
-        $statement = $connection->query(
-            "SELECT COUNT(*) FROM sqlite_master
+        $catalog = SqliteCatalog::getByQuery(
+            "SELECT COUNT(*) AS total FROM sqlite_master
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         );
-        $existingTables = (int) ($statement?->fetchColumn() ?: 0);
-        $statement?->closeCursor();
-        if ($existingTables !== 0) {
-            throw new RuntimeException(
-                'Refusing to assign a baseline version to a non-empty unversioned database.'
-            );
+        if ((int) $catalog->total !== 0) {
+            throw new RuntimeException('Refusing to assign a baseline version to a non-empty unversioned database.');
         }
-
-        $connection->beginTransaction();
-        try {
-            foreach (self::BASELINE_MODELS as $modelClass) {
-                $sql = SQLiteWriter::getCreateTable($modelClass);
-                foreach (preg_split('/;\s*/', $sql) ?: [] as $sqlStatement) {
-                    $sqlStatement = trim($sqlStatement);
-                    if ($sqlStatement !== '') {
-                        $connection->exec($sqlStatement);
-                    }
-                }
+        foreach (self::BASELINE_MODELS as $modelClass) {
+            foreach ($this->createStatements($modelClass) as $statement) {
+                SqliteCatalog::getAllByQuery($statement);
             }
-            $connection->exec('PRAGMA user_version = ' . self::BASELINE_VERSION);
-            $connection->commit();
-        } catch (Throwable $throwable) {
-            if ($connection->inTransaction()) {
-                $connection->rollBack();
-            }
-            throw $throwable;
         }
+        SqliteCatalog::getAllByQuery('PRAGMA user_version = ' . self::BASELINE_VERSION);
     }
 
     /** @return array<int, array{name: string, statements: list<string>}> */
@@ -337,10 +301,7 @@ final class Schema
         $migrations = self::STATIC_MIGRATIONS;
         $migrations[6] = [
             'name' => 'create_cognitive_threads_and_steps',
-            'statements' => array_merge(
-                $this->createStatements(CognitiveThread::class),
-                $this->createStatements(ThreadStep::class)
-            ),
+            'statements' => array_merge($this->createStatements(CognitiveThread::class), $this->createStatements(ThreadStep::class)),
         ];
         $migrations[7] = [
             'name' => 'create_metric_snapshots',
@@ -348,10 +309,7 @@ final class Schema
         ];
         $migrations[8] = [
             'name' => 'create_context_capsules_and_slots',
-            'statements' => array_merge(
-                $this->createStatements(ContextCapsule::class),
-                $this->createStatements(CapsuleSlot::class)
-            ),
+            'statements' => array_merge($this->createStatements(ContextCapsule::class), $this->createStatements(CapsuleSlot::class)),
         ];
         $migrations[9] = [
             'name' => 'create_sensory_sources_senses_readings_events',
@@ -364,9 +322,7 @@ final class Schema
         ];
         $migrations[10] = [
             'name' => 'create_utterance_outcomes',
-            // Pinned because version 14 adds fields to the live model. Historical
-            // migrations are immutable and their installed checksums must remain
-            // valid while the current record shape moves forward.
+
             'statements' => $this->utteranceOutcomeV10Statements(),
         ];
         $migrations[11] = [
@@ -638,15 +594,64 @@ final class Schema
                  ON decision_async_claims (status,action_id)',
             ],
         ];
+        $migrations[26] = [
+            'name' => 'give_journal_models_integer_record_ids',
+            'statements' => [
+                'CREATE TABLE memory_store_operations_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    requested_at INTEGER NOT NULL,
+    memory_id INTEGER,
+    event_id INTEGER,
+    UNIQUE (operation_key)
+)',
+                'INSERT INTO memory_store_operations_records (operation_key,request_hash,requested_at,memory_id,event_id) SELECT operation_key,request_hash,requested_at,memory_id,event_id FROM memory_store_operations',
+                'DROP TABLE memory_store_operations',
+                'ALTER TABLE memory_store_operations_records RENAME TO memory_store_operations',
+                'CREATE TABLE procedure_compile_guards_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shape_key TEXT NOT NULL,
+    current_generation INTEGER NOT NULL DEFAULT 0,
+    pending_generation INTEGER,
+    pending_hash TEXT,
+    UNIQUE (shape_key)
+)',
+                'INSERT INTO procedure_compile_guards_records (shape_key,current_generation,pending_generation,pending_hash) SELECT shape_key,current_generation,pending_generation,pending_hash FROM procedure_compile_guards',
+                'DROP TABLE procedure_compile_guards',
+                'ALTER TABLE procedure_compile_guards_records RENAME TO procedure_compile_guards',
+                'CREATE INDEX procedure_compile_guards_pending ON procedure_compile_guards (pending_generation,shape_key) WHERE pending_generation IS NOT NULL',
+                'CREATE TABLE procedure_invalidation_claims_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    procedure_id INTEGER NOT NULL,
+    memory_id INTEGER NOT NULL,
+    action_id INTEGER,
+    reason TEXT NOT NULL,
+    UNIQUE (procedure_id,memory_id)
+)',
+                'INSERT INTO procedure_invalidation_claims_records (procedure_id,memory_id,action_id,reason) SELECT procedure_id,memory_id,action_id,reason FROM procedure_invalidation_claims',
+                'DROP TABLE procedure_invalidation_claims',
+                'ALTER TABLE procedure_invalidation_claims_records RENAME TO procedure_invalidation_claims',
+                'CREATE TABLE procedure_replacement_claims_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    procedure_id INTEGER NOT NULL,
+    previous_memory_id INTEGER NOT NULL,
+    shape_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    pending_hash TEXT NOT NULL,
+    next_memory_id INTEGER,
+    UNIQUE (procedure_id,previous_memory_id),
+    UNIQUE (shape_key,generation)
+)',
+                'INSERT INTO procedure_replacement_claims_records (procedure_id,previous_memory_id,shape_key,generation,pending_hash,next_memory_id) SELECT procedure_id,previous_memory_id,shape_key,generation,pending_hash,next_memory_id FROM procedure_replacement_claims',
+                'DROP TABLE procedure_replacement_claims',
+                'ALTER TABLE procedure_replacement_claims_records RENAME TO procedure_replacement_claims',
+            ],
+        ];
         return $migrations;
     }
 
-    /**
-     * Version 13 predates resumable generation snapshots. Keep its executable
-     * checksum immutable while the live ProcedureRun model gains later fields.
-     *
-     * @return list<string>
-     */
+    /** @return list<string> */
     private function procedureRunV13Statements(): array
     {
         return [
@@ -680,13 +685,48 @@ final class Schema
         ];
     }
 
-    /** @param class-string $modelClass
-     *  @return list<string>
+    /**
+     * @param class-string $modelClass
+     * @return list<string>
      */
     private function createStatements(string $modelClass): array
     {
+        $historical = [
+            WorkingMemorySlot::class => 'CREATE TABLE IF NOT EXISTS `working_memory_slots` (
+	`id` INTEGER PRIMARY KEY AUTOINCREMENT
+	,`created_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	,`updated_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	,`scope_key` TEXT NOT NULL
+	,`thread_id` INTEGER NULL DEFAULT NULL
+	,`slot_role` TEXT NOT NULL
+	,`source_capsule_id` INTEGER NULL DEFAULT NULL
+	,`record_type` TEXT NULL DEFAULT NULL
+	,`record_id` INTEGER NULL DEFAULT NULL
+	,`claim` TEXT NULL DEFAULT NULL
+	,`confidence` REAL NOT NULL
+	,`score` REAL NOT NULL
+	,`recorded_at` TEXT NULL DEFAULT NULL
+	,`carryover_depth` INTEGER NOT NULL
+	,`reserved` INTEGER NOT NULL
+	,`status` TEXT NOT NULL
+	,`expires_at` TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS `working_memory_scope_role` ON `working_memory_slots` (`scope_key`,`slot_role`);
+CREATE INDEX IF NOT EXISTS `working_memory_thread` ON `working_memory_slots` (`thread_id`,`updated_at`);
+CREATE INDEX IF NOT EXISTS `working_memory_expiry` ON `working_memory_slots` (`status`,`expires_at`);',
+            Event::class => 'CREATE TABLE IF NOT EXISTS `events` (
+	`id` INTEGER PRIMARY KEY AUTOINCREMENT
+	,`created_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	,`kind` TEXT NOT NULL
+	,`payload` TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `events_kind` ON `events` (`kind`);
+CREATE INDEX IF NOT EXISTS `events_created_at` ON `events` (`created_at`);',
+        ];
         $statements = [];
-        foreach (preg_split('/;\s*/', SQLiteWriter::getCreateTable($modelClass)) ?: [] as $statement) {
+        foreach (preg_split('/;\s*/', $historical[$modelClass] ?? SQLiteWriter::getCreateTable($modelClass)) ?: [] as $statement) {
             $statement = trim($statement);
             if ($statement !== '') {
                 $statements[] = $statement;
@@ -698,28 +738,12 @@ final class Schema
     /** @param array{name: string, statements: list<string>} $migration */
     private function applyMigration(int $version, array $migration): void
     {
-        $connection = Connections::getConnection();
-        $checksum = $this->migrationChecksum($migration);
-        $connection->beginTransaction();
-        try {
-            foreach ($migration['statements'] as $statement) {
-                $connection->exec($statement);
-            }
-            $record = new SchemaMigration([
-                'version' => $version,
-                'name' => $migration['name'],
-                'checksum' => $checksum,
-                'applied_at' => time(),
-            ], true, true);
-            $record->save();
-            $connection->exec('PRAGMA user_version = ' . $version);
-            $connection->commit();
-        } catch (Throwable $throwable) {
-            if ($connection->inTransaction()) {
-                $connection->rollBack();
-            }
-            throw $throwable;
+        foreach ($migration['statements'] as $statement) {
+            SqliteCatalog::getAllByQuery($statement);
         }
+        $record = new SchemaMigration([ 'version' => $version, 'name' => $migration['name'], 'checksum' => $this->migrationChecksum($migration), 'applied_at' => time(), ], true, true);
+        $record->save();
+        SqliteCatalog::getAllByQuery('PRAGMA user_version = ' . $version);
     }
 
     /** @param array{name: string, statements: list<string>} $migration */
@@ -730,10 +754,7 @@ final class Schema
             || $record->name !== $migration['name']
             || $record->checksum !== $this->migrationChecksum($migration)
         ) {
-            throw new RuntimeException(sprintf(
-                'Schema migration %d is missing or does not match the executable.',
-                $version
-            ));
+            throw new RuntimeException(sprintf( 'Schema migration %d is missing or does not match the executable.', $version ));
         }
     }
 

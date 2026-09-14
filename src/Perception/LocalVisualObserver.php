@@ -7,7 +7,7 @@ namespace NaviBrain\Perception;
 use JsonException;
 use RuntimeException;
 
-final class LocalVisualObserver
+class LocalVisualObserver
 {
     private const INFERENCE_TIMEOUT_MS = 25000;
 
@@ -22,32 +22,17 @@ final class LocalVisualObserver
     public function observe(string $imagePath, string $reason): array
     {
         $ocrStartedAt = hrtime(true);
-        $ocr = $this->run([
-            '/usr/bin/tesseract',
-            $imagePath,
-            'stdout',
-            '--psm',
-            '6',
-            '-l',
-            'eng',
-        ], 5000);
+        $ocr = $this->run([ '/usr/bin/tesseract', $imagePath, 'stdout', '--psm', '6', '-l', 'eng', ], 5000);
         $ocrMs = (hrtime(true) - $ocrStartedAt) / 1_000_000;
         $localFlags = $ocr['exit_code'] === 0
             ? $this->sensitiveCategories($ocr['stdout'])
             : ['other'];
 
-        $prompt = trim((string) file_get_contents(
-            $this->projectRoot . '/config/desktop-vision-prompt.txt'
-        )) . "\n\nReason for this observation: " . $this->reasonForLocalModel($reason);
+        $prompt = trim((string) file_get_contents( $this->projectRoot . '/config/desktop-vision-prompt.txt' )) . "\n\nReason for this observation: " . $this->reasonForLocalModel($reason);
 
         [$modelPath, $projectorPath] = $this->visionModelPaths();
         if (!is_file($modelPath) || !is_file($projectorPath)) {
-            return $this->unavailableResult(
-                $localFlags,
-                $ocrMs,
-                0.0,
-                'Local Gemma vision model files are not installed.'
-            );
+            return $this->unavailableResult($localFlags, $ocrMs, 0.0, 'Local Gemma vision model files are not installed.');
         }
 
         $visionStartedAt = hrtime(true);
@@ -95,12 +80,7 @@ final class LocalVisualObserver
             return $this->unavailableResult($localFlags, $ocrMs, $visionMs, $exception->getMessage());
         }
 
-        $withheld = array_values(array_unique(array_merge(
-            $localFlags,
-            is_array($judgement['withheld_categories'] ?? null)
-                ? array_values(array_filter($judgement['withheld_categories'], 'is_string'))
-                : []
-        )));
+        $withheld = array_values(array_unique(array_merge( $localFlags, is_array($judgement['withheld_categories'] ?? null) ? array_values(array_filter($judgement['withheld_categories'], 'is_string')) : [] )));
         $sensitivity = is_string($judgement['sensitivity'] ?? null)
             ? $judgement['sensitivity']
             : 'unknown';
@@ -203,11 +183,7 @@ final class LocalVisualObserver
         if ($start === false || $end === false || $end < $start) {
             throw new RuntimeException('Local vision model did not return JSON.');
         }
-        $decoded = json_decode(
-            substr($output, $start, $end - $start + 1),
-            true,
-            flags: JSON_THROW_ON_ERROR
-        );
+        $decoded = json_decode(substr($output, $start, $end - $start + 1), true, flags: JSON_THROW_ON_ERROR);
         if (!is_array($decoded)) {
             throw new RuntimeException('Local vision model returned an invalid object.');
         }
@@ -248,15 +224,11 @@ final class LocalVisualObserver
         return is_string($values[$key] ?? null) ? $values[$key] : $default;
     }
 
-    /** @param list<string> $localFlags
-     *  @return array<string, mixed>
+    /**
+     * @param list<string> $localFlags
+     * @return array<string, mixed>
      */
-    private function unavailableResult(
-        array $localFlags,
-        float $ocrMs,
-        float $visionMs,
-        string $error
-    ): array {
+    private function unavailableResult(array $localFlags, float $ocrMs, float $visionMs, string $error): array {
         return [
             'available' => false,
             'scene' => 'unknown',
@@ -277,22 +249,14 @@ final class LocalVisualObserver
         ];
     }
 
-    /** @param list<string> $command
-     *  @return array{exit_code: int, stdout: string, stderr: string}
+    /**
+     * @param list<string> $command
+     * @return array{exit_code: int, stdout: string, stderr: string}
      */
     private function run(array $command, int $timeoutMs): array
     {
         $pipes = [];
-        $process = proc_open(
-            $command,
-            [
-                0 => ['file', '/dev/null', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w'],
-            ],
-            $pipes,
-            options: ['bypass_shell' => true]
-        );
+        $process = proc_open($command, [ 0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'], ], $pipes, options: ['bypass_shell' => true]);
         if (!is_resource($process)) {
             throw new RuntimeException('Could not start local visual helper.');
         }

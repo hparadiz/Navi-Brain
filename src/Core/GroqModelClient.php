@@ -7,11 +7,7 @@ namespace NaviBrain\Core;
 use JsonException;
 use RuntimeException;
 
-/**
- * Inactive transport seam for an operator-approved synthetic pilot.
- * No executive work claims, integration, retries, or provider fallback.
- */
-final class GroqModelClient
+class GroqModelClient
 {
     public const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
     public const MODEL = 'openai/gpt-oss-120b';
@@ -20,7 +16,6 @@ final class GroqModelClient
     public const MAX_RESPONSE_BYTES = 65536;
     public const TIMEOUT_SECONDS = 20;
 
-    /** Build a request without reading credentials or opening a connection. */
     public static function requestPayload(string $prompt, string $kind): array
     {
         if ($prompt === '' || preg_match('/\A[a-z][a-z0-9_]{0,95}\z/D', $kind) !== 1) {
@@ -39,9 +34,7 @@ final class GroqModelClient
                 'json_schema' => [
                     'name' => 'navi_proposal',
                     'strict' => true,
-                    'schema' => LocalModelWorker::proposalSchema([
-                        'input_refs' => ['operation' => $kind],
-                    ]),
+                    'schema' => LocalModelWorker::proposalSchema([ 'input_refs' => ['operation' => $kind], ]),
                 ],
             ],
         ];
@@ -51,13 +44,7 @@ final class GroqModelClient
         return $payload;
     }
 
-    /**
-     * Submit one request. The caller must authorize account use and data egress.
-     * The first pilot supports the existing four-field proposal shape only.
-     * Provider errors are codes and numeric metadata, never response bodies.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     public function complete(string $prompt, string $kind): array
     {
         $payload = json_encode(self::requestPayload($prompt, $kind), JSON_THROW_ON_ERROR);

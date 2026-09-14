@@ -4,12 +4,11 @@ declare(strict_types=1);
 
 namespace NaviBrain\Perception;
 
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Model\SenseReading;
 use NaviBrain\Model\UtteranceOutcome;
 
-/** Projects authorized observables into the deliberately small ToM grammar. */
-final class AgentObservationProjector
+class AgentObservationProjector
 {
     /** @var array<string, list<string>> */
     private const DOMAINS = [
@@ -25,7 +24,7 @@ final class AgentObservationProjector
         'interaction_outcome' => ['reply_and_reaction', 'reply', 'reaction', 'no_reply'],
     ];
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
     }
 
@@ -36,58 +35,21 @@ final class AgentObservationProjector
         $payload = is_array($reading->payload) ? $reading->payload : [];
         $at = $this->timestamp($reading->observed_at) ?? time();
         $projection = match ($source) {
-            'desktop_presence' => $this->booleanProjection(
-                'reachability',
-                $payload['using_computer'] ?? null,
-                'present',
-                'away'
-            ),
-            'input_activity' => $this->booleanProjection(
-                'input_state',
-                $payload['active_in_window'] ?? null,
-                'active',
-                'inactive'
-            ),
-            'conversation_activity' => $this->ageProjection(
-                'conversation_activity',
-                $payload['seconds_since_write'] ?? null
-            ),
-            'shell_activity' => $this->ageProjection(
-                'shell_activity',
-                $payload['seconds_since_write'] ?? null
-            ),
-            'terminal_activity' => $this->ageProjection(
-                'terminal_activity',
-                $payload['seconds_since_write'] ?? null
-            ),
-            'process_activity' => $this->ageProjection(
-                'process_activity',
-                $payload['seconds_since_newest'] ?? null
-            ),
-            'audio_playback' => $this->booleanProjection(
-                'audio_state',
-                $payload['playing'] ?? null,
-                'playing',
-                'stopped'
-            ),
-            'session_lock' => $this->booleanProjection(
-                'session_state',
-                ($payload['known'] ?? false) === true ? ($payload['locked'] ?? null) : null,
-                'locked',
-                'unlocked'
-            ),
+            'desktop_presence' => $this->booleanProjection('reachability', $payload['using_computer'] ?? null, 'present', 'away'),
+            'input_activity' => $this->booleanProjection('input_state', $payload['active_in_window'] ?? null, 'active', 'inactive'),
+            'conversation_activity' => $this->ageProjection('conversation_activity', $payload['seconds_since_write'] ?? null),
+            'shell_activity' => $this->ageProjection('shell_activity', $payload['seconds_since_write'] ?? null),
+            'terminal_activity' => $this->ageProjection('terminal_activity', $payload['seconds_since_write'] ?? null),
+            'process_activity' => $this->ageProjection('process_activity', $payload['seconds_since_newest'] ?? null),
+            'audio_playback' => $this->booleanProjection('audio_state', $payload['playing'] ?? null, 'playing', 'stopped'),
+            'session_lock' => $this->booleanProjection('session_state', ($payload['known'] ?? false) === true ? ($payload['locked'] ?? null) : null, 'locked', 'unlocked'),
             'pet_hearing' => $this->hearingProjection($payload),
             default => null,
         };
         if ($projection === null) {
             return null;
         }
-        return array_merge($projection, [
-            'source_key' => $source,
-            'reading_id' => (int) $reading->id,
-            'observed_at' => $at,
-            'evidence' => $this->boundedEvidence($source, $payload),
-        ]);
+        return array_merge($projection, [ 'source_key' => $source, 'reading_id' => (int) $reading->id, 'observed_at' => $at, 'evidence' => $this->boundedEvidence($source, $payload), ]);
     }
 
     /** @return array<string, mixed> */
@@ -128,12 +90,7 @@ final class AgentObservationProjector
     }
 
     /** @return array<string, mixed> */
-    private function booleanProjection(
-        string $feature,
-        mixed $raw,
-        string $trueValue,
-        string $falseValue
-    ): array {
+    private function booleanProjection(string $feature, mixed $raw, string $trueValue, string $falseValue): array {
         $known = is_bool($raw) || $raw === 0 || $raw === 1 || $raw === '0' || $raw === '1';
         return [
             'feature_key' => $feature,
@@ -164,7 +121,7 @@ final class AgentObservationProjector
         ];
     }
 
-    /** @param array<string, mixed> $payload @return array<string, mixed>|null */
+    /** @param array<string, mixed> $payload */
     private function hearingProjection(array $payload): ?array
     {
         if (($payload['self_echo'] ?? false) === true) {
@@ -182,7 +139,7 @@ final class AgentObservationProjector
         ];
     }
 
-    /** @param array<string, mixed> $payload @return array<string, mixed> */
+    /** @param array<string, mixed> $payload */
     private function boundedEvidence(string $source, array $payload): array
     {
         $allowed = match ($source) {

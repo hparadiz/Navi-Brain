@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class ThreadStep extends ActiveRecord
+class ThreadStep extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'thread_steps';
     public static $primaryKey = 'id';
 

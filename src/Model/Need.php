@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class Need extends ActiveRecord
+class Need extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'needs';
     public static $primaryKey = 'id';
 
@@ -39,7 +35,7 @@ final class Need extends ActiveRecord
     protected string $description;
 
     #[Column(type: 'enum', values: ['user', 'developer', 'system', 'agent'])]
-    protected string $authority;
+    protected string $authority = 'agent';
 
     #[Column(type: 'decimal', precision: 4, scale: 3)]
     protected float $pressure = 0.0;
@@ -55,4 +51,28 @@ final class Need extends ActiveRecord
 
     #[Column(type: 'enum', values: ['active', 'paused'])]
     protected string $status = 'active';
+
+    public function validate($deep = true)
+    {
+        parent::validate($deep);
+        foreach (['need_key', 'description'] as $field) {
+            if (trim((string) $this->getValue($field)) === '') {
+                $this->addValidationError($field, str_replace('_', ' ', $field) . ' cannot be empty.');
+            }
+        }
+        foreach (['pressure', 'growth_per_hour', 'trigger_threshold'] as $field) {
+            $value = (float) $this->getValue($field);
+            if (!is_finite($value) || $value < 0.0 || $value > 1.0) {
+                $this->addValidationError($field, str_replace('_', ' ', $field) . ' must be between 0 and 1.');
+            }
+        }
+        if (!in_array($this->status, ['active', 'paused'], true)) {
+            $this->addValidationError('status', 'Need status must be active or paused.');
+        }
+        if (!in_array($this->authority, ['user', 'developer', 'system', 'agent'], true)) {
+            $this->addValidationError('authority', 'Need authority must be user, developer, system or agent.');
+        }
+        return $this->isValid;
+    }
+
 }

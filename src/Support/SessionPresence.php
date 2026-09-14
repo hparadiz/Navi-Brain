@@ -6,26 +6,14 @@ namespace NaviBrain\Support;
 
 use Throwable;
 
-/**
- * A content-free, lock-backed record for one live MCP client connection.
- *
- * The open file lock is the liveness signal. It is released by the kernel even
- * when a TUI or its Navi-Brain child process exits without running cleanup.
- */
-final class SessionPresence
+class SessionPresence
 {
     /** @var resource|null */
     private mixed $handle;
     private ?string $path;
     private bool $closed = false;
 
-    private function __construct(
-        private readonly ActivityBus $activityBus,
-        private readonly string $flow,
-        private readonly string $client,
-        mixed $handle,
-        string $path
-    ) {
+    private function __construct(private readonly ActivityBus $activityBus, private readonly string $flow, private readonly string $client, mixed $handle, string $path) {
         $this->handle = $handle;
         $this->path = $path;
     }
@@ -37,14 +25,8 @@ final class SessionPresence
             $clientInfo = is_array($initializeParams['clientInfo'] ?? null)
                 ? $initializeParams['clientInfo']
                 : [];
-            $client = self::token(
-                is_string($clientInfo['name'] ?? null) ? $clientInfo['name'] : 'tui',
-                'tui'
-            );
-            $version = self::token(
-                is_string($clientInfo['version'] ?? null) ? $clientInfo['version'] : 'unknown',
-                'unknown'
-            );
+            $client = self::token(is_string($clientInfo['name'] ?? null) ? $clientInfo['name'] : 'tui', 'tui');
+            $version = self::token(is_string($clientInfo['version'] ?? null) ? $clientInfo['version'] : 'unknown', 'unknown');
             $pid = getmypid();
             $pid = is_int($pid) ? $pid : 0;
             $nonce = bin2hex(random_bytes(6));
@@ -78,14 +60,14 @@ final class SessionPresence
             fflush($handle);
 
             $presence = new self($activityBus, $flow, $client, $handle, $path);
-            $activityBus->publish(
-                'tui',
-                'started',
-                'session.' . $client,
-                'continuity',
-                outcome: 'connected',
-                flow: $flow
-            );
+            $activity = new \NaviBrain\Support\Activity();
+            $activity->source = 'tui';
+            $activity->phase = 'started';
+            $activity->operation = 'session.' . $client;
+            $activity->domain = 'continuity';
+            $activity->outcome = 'connected';
+            $activity->flow = $flow;
+            $activityBus->publish($activity);
             return $presence;
         } catch (Throwable) {
             return null;
@@ -98,14 +80,14 @@ final class SessionPresence
             return;
         }
         $this->closed = true;
-        $this->activityBus->publish(
-            'tui',
-            'finished',
-            'session.' . $this->client,
-            'continuity',
-            outcome: 'disconnected',
-            flow: $this->flow
-        );
+        $activity = new \NaviBrain\Support\Activity();
+        $activity->source = 'tui';
+        $activity->phase = 'finished';
+        $activity->operation = 'session.' . $this->client;
+        $activity->domain = 'continuity';
+        $activity->outcome = 'disconnected';
+        $activity->flow = $this->flow;
+        $this->activityBus->publish($activity);
         if (is_resource($this->handle)) {
             @flock($this->handle, LOCK_UN);
             fclose($this->handle);

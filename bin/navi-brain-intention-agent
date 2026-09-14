@@ -5,7 +5,6 @@ declare(strict_types=1);
 
 require dirname(__DIR__) . '/bootstrap/app.php';
 
-// Internal Screen child. Use intention:agent:start for validation and locking.
 if (count($argv) !== 2 || !ctype_digit($argv[1]) || (int) $argv[1] < 1) {
     fwrite(STDERR, "Usage: navi-brain-intention-agent <intention-id>\n");
     exit(1);

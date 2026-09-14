@@ -4,19 +4,15 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use NaviBrain\Support\PlainText;
 
-/**
- * Rank live drives and commitments without declaring what Navi should want.
- *
- * Needs, intentions, and interrupts remain separate evidence sources. The
- * compiler is read-only, uncapped, and not connected to action selection.
- */
-final class MotivationCompiler
+class MotivationCompiler
 {
     private const PROTOCOL = 'motivation-evidence-v1';
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
     }
 
@@ -53,27 +49,12 @@ final class MotivationCompiler
             'context' => $context,
             'ranked_motives' => $ranked,
             'affective_state' => $this->core->appraiseNow(time())->toArray(),
-            'authority_constraints' => array_values(array_filter(
-                $this->core->listSelfModelFacts(),
-                static fn (array $fact): bool => str_starts_with(
-                    (string) ($fact['fact_key'] ?? ''),
-                    'continuity.'
-                )
-            )),
+            'authority_constraints' => array_values(array_filter( $this->core->listSelfModelFacts(), static fn (array $fact): bool => str_starts_with( (string) ($fact['fact_key'] ?? ''), 'continuity.' ) )),
             'evidence_health' => [
                 'motive_count' => count($ranked),
-                'active_need_count' => count(array_filter(
-                    $ranked,
-                    static fn (array $motive): bool => ($motive['motive_type'] ?? null) === 'need'
-                )),
-                'open_intention_count' => count(array_filter(
-                    $ranked,
-                    static fn (array $motive): bool => ($motive['motive_type'] ?? null) === 'intention'
-                )),
-                'pending_interrupt_count' => count(array_filter(
-                    $ranked,
-                    static fn (array $motive): bool => ($motive['motive_type'] ?? null) === 'interrupt'
-                )),
+                'active_need_count' => count(array_filter( $ranked, static fn (array $motive): bool => ($motive['motive_type'] ?? null) === 'need' )),
+                'open_intention_count' => count(array_filter( $ranked, static fn (array $motive): bool => ($motive['motive_type'] ?? null) === 'intention' )),
+                'pending_interrupt_count' => count(array_filter( $ranked, static fn (array $motive): bool => ($motive['motive_type'] ?? null) === 'interrupt' )),
             ],
         ];
     }
@@ -114,11 +95,7 @@ final class MotivationCompiler
      * @param array<int, int> $pendingActions
      * @return list<array<string, mixed>>
      */
-    private function intentionCandidates(
-        array $actionCounts,
-        array $pendingActions,
-        int $maxActionCount
-    ): array {
+    private function intentionCandidates(array $actionCounts, array $pendingActions, int $maxActionCount): array {
         $candidates = [];
         foreach ($this->core->listIntentions() as $intention) {
             $status = (string) ($intention['status'] ?? '');
@@ -209,9 +186,7 @@ final class MotivationCompiler
         $ranked = [];
 
         foreach ($candidates as $candidate) {
-            $candidateTokens = $this->tokenSet(
-                (string) $candidate['title'] . ' ' . (string) $candidate['content']
-            );
+            $candidateTokens = $this->tokenSet((string) $candidate['title'] . ' ' . (string) $candidate['content']);
             $matched = array_keys(array_intersect_key($contextTokens, $candidateTokens));
             sort($matched);
             $contextWeight = $contextTokens === []
@@ -249,10 +224,7 @@ final class MotivationCompiler
             ];
         }
 
-        usort($ranked, static fn (array $left, array $right): int =>
-            $right['activation'] <=> $left['activation']
-                ?: strcmp((string) $left['motive_id'], (string) $right['motive_id'])
-        );
+        usort($ranked, static fn (array $left, array $right): int => $right['activation'] <=> $left['activation'] ?: strcmp((string) $left['motive_id'], (string) $right['motive_id']));
         foreach ($ranked as $index => $motive) {
             $ranked[$index]['rank'] = $index + 1;
         }

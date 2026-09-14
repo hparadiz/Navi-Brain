@@ -4,21 +4,16 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Model\WorkItem;
+
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use JsonException;
 use NaviBrain\Support\PlainText;
 use RuntimeException;
 use Throwable;
 
-/**
- * Runs durable, high-consequence background synthesis through Codex Spark.
- *
- * The worker uses the existing ChatGPT-authenticated Codex CLI in an empty,
- * read-only, ephemeral workspace. Codex receives no write or approval path;
- * shell, browser, app, computer, image, multi-agent, plugin, goal, and web
- * tools are disabled. Its final answer is constrained by the same schema the
- * local worker uses before deterministic integration.
- */
-final class CodexSparkWorker
+class CodexSparkWorker
 {
     public const MODEL_ID = 'gpt-5.3-codex-spark';
 
@@ -29,7 +24,7 @@ final class CodexSparkWorker
     private string $runtimeRoot;
     private string $codexBinary;
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
         $this->projectRoot = dirname(__DIR__, 2);
         $this->runtimeRoot = $this->projectRoot . '/var/codex-spark-worker';
@@ -57,7 +52,7 @@ final class CodexSparkWorker
             return ['status' => 'spark_model_unavailable', 'model' => self::MODEL_ID, 'error' => $message];
         }
 
-        $claimed = $this->core->claimWork($owner, self::WORK_LEASE_SECONDS);
+        $claimed = $this->core->claimWork(new WorkClaim($owner, self::WORK_LEASE_SECONDS));
         if ($claimed === null) {
             return ['status' => 'idle'];
         }
@@ -67,28 +62,13 @@ final class CodexSparkWorker
         $started = hrtime(true);
         try {
             $proposal = $this->invokeModel($work, $wall);
-            $finished = $this->finishWorkWithRetry(
-                workId: (int) $work['id'],
-                owner: $owner,
-                fencingToken: (int) $work['fencing_token'],
-                succeeded: true,
-                result: $proposal,
-                model: self::MODEL_ID
-            );
+            $finished = $this->finishWorkWithRetry(WorkCompletion::success(new WorkItem($work), $proposal, self::MODEL_ID));
         } catch (Throwable $throwable) {
             $latency = (int) round((hrtime(true) - $started) / 1_000_000);
             $message = 'Codex Spark invocation failed: ' . $throwable->getMessage();
             $this->recordModelResultBestEffort(false, $latency, $message);
             try {
-                $failed = $this->finishWorkWithRetry(
-                    workId: (int) $work['id'],
-                    owner: $owner,
-                    fencingToken: (int) $work['fencing_token'],
-                    succeeded: false,
-                    result: [],
-                    model: null,
-                    error: $message
-                );
+                $failed = $this->finishWorkWithRetry(WorkCompletion::failure(new WorkItem($work), $message, null));
             } catch (Throwable $finishFailure) {
                 return [
                     'status' => 'lease_lost',
@@ -111,10 +91,7 @@ final class CodexSparkWorker
         try {
             $integration = $this->core->integrateWorkerResult($work, $proposal, self::MODEL_ID);
         } catch (Throwable $throwable) {
-            $integration = $this->core->handleWorkerFailure(
-                $work,
-                'Codex Spark completed, but thread integration failed: ' . $throwable->getMessage()
-            );
+            $integration = $this->core->handleWorkerFailure($work, 'Codex Spark completed, but thread integration failed: ' . $throwable->getMessage());
         }
 
         return [
@@ -126,7 +103,7 @@ final class CodexSparkWorker
         ];
     }
 
-    /** @param array<string, mixed> $work @return array<string, mixed> */
+    /** @param array<string, mixed> $work */
     private function invokeModel(array $work, int $wall): array
     {
         $this->ensureRuntimeDirectories();
@@ -136,10 +113,7 @@ final class CodexSparkWorker
         }
 
         try {
-            $schema = json_encode(
-                $this->proposalSchema($work),
-                JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
-            );
+            $schema = json_encode($this->proposalSchema($work), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
             if (file_put_contents($schemaPath, $schema, LOCK_EX) !== strlen($schema)
                 || !chmod($schemaPath, 0600)
             ) {
@@ -200,11 +174,7 @@ final class CodexSparkWorker
                 '-',
             ], $prompt, $wall + 15);
             if ($result['exit_code'] !== 0) {
-                throw new RuntimeException(sprintf(
-                    'Codex CLI exited %d (diagnostic sha256 %s).',
-                    $result['exit_code'],
-                    hash('sha256', $result['stderr'])
-                ));
+                throw new RuntimeException(sprintf( 'Codex CLI exited %d (diagnostic sha256 %s).', $result['exit_code'], hash('sha256', $result['stderr']) ));
             }
 
             try {
@@ -223,15 +193,12 @@ final class CodexSparkWorker
         }
     }
 
-    /** @param array<string, mixed> $work @return array<string, mixed> */
+    /** @param array<string, mixed> $work */
     private function proposalSchema(array $work): array
     {
         $schema = LocalModelWorker::proposalSchema($work);
-        // The deterministic memory curator already enforces uniqueness and
-        // set equality. Codex Structured Outputs does not accept uniqueItems,
-        // although llama.cpp's grammar does, so omit only that provider-level
-        // duplicate check from Spark's transport schema.
-        if (($work['work_type'] ?? null) === ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE) {
+
+        if (($work['work_type'] ?? null) === Executive::MEMORY_CONSOLIDATION_WORK_TYPE) {
             unset(
                 $schema['properties']['supported_episode_ids']['uniqueItems'],
                 $schema['properties']['rejected_episode_ids']['uniqueItems']
@@ -241,26 +208,11 @@ final class CodexSparkWorker
     }
 
     /** @return array<string, mixed> */
-    private function finishWorkWithRetry(
-        int $workId,
-        string $owner,
-        int $fencingToken,
-        bool $succeeded,
-        array $result,
-        ?string $model,
-        ?string $error = null
-    ): array {
+    private function finishWorkWithRetry(WorkCompletion $completion): array
+    {
         for ($attempt = 0; ; $attempt++) {
             try {
-                return $this->core->finishWork(
-                    workId: $workId,
-                    owner: $owner,
-                    fencingToken: $fencingToken,
-                    succeeded: $succeeded,
-                    result: $result,
-                    model: $model,
-                    error: $error
-                );
+                return $this->core->finishWork($completion);
             } catch (Throwable $throwable) {
                 if ($attempt >= 3
                     || !str_contains(strtolower($throwable->getMessage()), 'database is locked')
@@ -272,15 +224,11 @@ final class CodexSparkWorker
         }
     }
 
-    private function recordModelResultBestEffort(
-        bool $succeeded,
-        int $latencyMs,
-        ?string $error = null
-    ): void {
+    private function recordModelResultBestEffort(bool $succeeded, int $latencyMs, ?string $error = null): void {
         try {
             $this->core->recordModelResult(self::MODEL_ID, $succeeded, $latencyMs, $error);
         } catch (Throwable) {
-            // Telemetry must never strand fenced work after inference returns.
+
         }
     }
 
@@ -296,15 +244,11 @@ final class CodexSparkWorker
         }
     }
 
-    /** @param list<string> $command @return array{exit_code: int, stdout: string, stderr: string} */
+    /** @param list<string> $command */
     private function runProcess(array $command, string $stdin, int $hardLimitSeconds): array
     {
         $pipes = [];
-        $process = proc_open($command, [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ], $pipes, $this->projectRoot);
+        $process = proc_open($command, [ 0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'], ], $pipes, $this->projectRoot);
         if (!is_resource($process)) {
             throw new RuntimeException('Unable to start the Codex Spark worker process.');
         }

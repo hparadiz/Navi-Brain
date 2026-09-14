@@ -3,11 +3,11 @@
 
 declare(strict_types=1);
 
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 
 require dirname(__DIR__) . '/bootstrap/app.php';
 
-$core = new ExecutiveCore();
+$core = new Executive();
 $core->initialize();
 $nodeId = getenv('NAVI_BRAIN_NODE_ID');
 if (!is_string($nodeId) || trim($nodeId) === '') {
@@ -22,15 +22,7 @@ if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
 }
 
 $summarizeHeartbeat = static function (array $heartbeat): array {
-    $summary = array_intersect_key($heartbeat, array_flip([
-        'rhythm',
-        'status',
-        'missed_intervals',
-        'next_due_at',
-        'lease_owner',
-        'lease_expires_at',
-        'error',
-    ]));
+    $summary = array_intersect_key($heartbeat, array_flip([ 'rhythm', 'status', 'missed_intervals', 'next_due_at', 'lease_owner', 'lease_expires_at', 'error', ]));
     if (is_array($heartbeat['run'] ?? null) && isset($heartbeat['run']['id'])) {
         $summary['run_id'] = (int) $heartbeat['run']['id'];
     }
@@ -45,14 +37,7 @@ $summarizeHeartbeat = static function (array $heartbeat): array {
 };
 
 $summarizeThread = static function (array $threadRun): array {
-    $summary = array_intersect_key($threadRun, array_flip([
-        'status',
-        'node_id',
-        'reason',
-        'error',
-        'recovered_thread_step_ids',
-        'indeterminate_dispatches',
-    ]));
+    $summary = array_intersect_key($threadRun, array_flip([ 'status', 'node_id', 'reason', 'error', 'recovered_thread_step_ids', 'indeterminate_dispatches', ]));
     $summary['reconciled_count'] = is_array($threadRun['reconciled'] ?? null)
         ? count($threadRun['reconciled'])
         : 0;
@@ -77,19 +62,14 @@ while ($running) {
         ];
         $record['consolidation'] = $core->maintainConsolidationQueue(2);
         $record['threads'] = $summarizeThread($core->runDueCognitiveThreads($nodeId));
-        // Inference belongs to the dedicated workers. Keeping it out of this
-        // process makes five seconds a real scheduler cadence instead of five
-        // seconds plus however long a model generation happens to take.
+
         $record['ok'] = true;
     } catch (Throwable $throwable) {
         $record['ok'] = false;
         $record['error'] = $throwable->getMessage();
         $record['type'] = $throwable::class;
     }
-    fwrite(STDOUT, json_encode(
-        $record,
-        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-    ) . PHP_EOL);
+    fwrite(STDOUT, json_encode( $record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR ) . PHP_EOL);
     fflush(STDOUT);
 
     for ($seconds = 0; $running && $seconds < 5; $seconds++) {

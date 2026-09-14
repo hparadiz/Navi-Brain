@@ -4,21 +4,19 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use InvalidArgumentException;
 
-/**
- * Local upkeep only. The worker owns cadence; this object neither claims model
- * work nor schedules cognition. Explicit pause still permits durable recovery.
- */
-final class NativeMaintenance
+class NativeMaintenance
 {
-    private readonly ExecutiveCore $core;
+    private readonly Executive $core;
     private readonly int $slotLimit;
     private readonly int $recoveryLimit;
     private int $nextConsolidationAt = 0;
 
     /** @param array<string, mixed> $config */
-    public function __construct(ExecutiveCore $core, array $config = [])
+    public function __construct(Executive $core, array $config = [])
     {
         $this->core = $core;
         $this->slotLimit = $this->limit($config, 'slot_limit', 32);
@@ -39,11 +37,9 @@ final class NativeMaintenance
             $consolidation = $this->core->reuseConsolidationEvidence(true);
             $this->nextConsolidationAt = time() + 5400;
         }
-        $blocked = count(array_filter(array_merge($recovery, $actions),
-            static fn (array $row): bool => ($row['status'] ?? null) === 'recovery_blocked'));
+        $blocked = count(array_filter(array_merge($recovery, $actions), static fn (array $row): bool => ($row['status'] ?? null) === 'recovery_blocked'));
         return [
-            // A visited unchanged row can repair a native projection, so do not
-            // claim an idle/no-mutation pass just from canonical change counts.
+
             'status' => $workspace['errors'] !== [] || $blocked > 0 ? 'failed'
                 : ($workspace['visited'] === 0 && $recovery === [] && $actions === []
                     && ($consolidation['reused'] ?? 0) === 0 ? 'idle' : 'completed'),

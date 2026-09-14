@@ -7,15 +7,7 @@ namespace NaviBrain\Core;
 use JsonException;
 use RuntimeException;
 
-/**
- * Minimal client for the local llama.cpp server.
- *
- * The local model is deny-all by construction: this is a plain HTTP request to
- * a loopback completion endpoint, so there is no tool surface, no filesystem,
- * and no session to leak between wakes. Output is constrained by a JSON schema
- * at decode time, so a malformed envelope cannot reach the curator at all.
- */
-final class LocalModelClient
+class LocalModelClient
 {
     public const DEFAULT_HOST = '127.0.0.1';
     public const DEFAULT_PORT = 5007;
@@ -41,10 +33,6 @@ final class LocalModelClient
         return sprintf('%s:%d', $this->host, $this->port);
     }
 
-    /**
-     * Cheap liveness probe. Never throws: an unreachable local model is an
-     * ordinary degraded state, not an error worth unwinding a heartbeat for.
-     */
     public function isHealthy(): bool
     {
         try {
@@ -56,17 +44,10 @@ final class LocalModelClient
     }
 
     /**
-     * Run one bounded, schema-constrained completion.
-     *
      * @param array<string, mixed> $jsonSchema
      * @return array{proposal: array<string, mixed>, usage: array<string, mixed>}
      */
-    public function complete(
-        string $prompt,
-        array $jsonSchema,
-        int $maxTokens,
-        int $timeoutSeconds
-    ): array {
+    public function complete(string $prompt, array $jsonSchema, int $maxTokens, int $timeoutSeconds): array {
         $payload = json_encode([
             'messages' => [['role' => 'user', 'content' => $prompt]],
             'temperature' => 0.7,
@@ -84,12 +65,7 @@ final class LocalModelClient
             ],
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
 
-        $response = $this->request(
-            'POST',
-            '/v1/chat/completions',
-            $payload,
-            max(5, $timeoutSeconds)
-        );
+        $response = $this->request('POST', '/v1/chat/completions', $payload, max(5, $timeoutSeconds));
         $body = $response['body'];
         $content = $body['choices'][0]['message']['content'] ?? null;
         if (!is_string($content) || trim($content) === '') {
@@ -116,20 +92,9 @@ final class LocalModelClient
     {
         $errorNumber = 0;
         $errorMessage = '';
-        $socket = @stream_socket_client(
-            sprintf('tcp://%s:%d', $this->host, $this->port),
-            $errorNumber,
-            $errorMessage,
-            $timeoutSeconds,
-            STREAM_CLIENT_CONNECT
-        );
+        $socket = @stream_socket_client(sprintf('tcp://%s:%d', $this->host, $this->port), $errorNumber, $errorMessage, $timeoutSeconds, STREAM_CLIENT_CONNECT);
         if (!is_resource($socket)) {
-            throw new RuntimeException(sprintf(
-                'Local model endpoint %s is unavailable: %s (%d).',
-                $this->endpoint(),
-                $errorMessage,
-                $errorNumber
-            ));
+            throw new RuntimeException(sprintf( 'Local model endpoint %s is unavailable: %s (%d).', $this->endpoint(), $errorMessage, $errorNumber ));
         }
 
         stream_set_timeout($socket, $timeoutSeconds);
@@ -157,15 +122,10 @@ final class LocalModelClient
             while (!feof($socket)) {
                 $chunk = fread($socket, 65536);
                 if ($chunk === false) {
-                    // A read timeout arrives here as false. Breaking silently
-                    // left the response empty and reported "empty response",
-                    // which sent every investigation after the wrong cause.
+
                     $meta = stream_get_meta_data($socket);
                     if ($meta['timed_out'] ?? false) {
-                        throw new RuntimeException(sprintf(
-                            'Local model did not answer within %d seconds. This includes time spent waiting for an available server slot.',
-                            $timeoutSeconds
-                        ));
+                        throw new RuntimeException(sprintf( 'Local model did not answer within %d seconds. This includes time spent waiting for an available server slot.', $timeoutSeconds ));
                     }
                     break;
                 }
@@ -194,11 +154,7 @@ final class LocalModelClient
             $responseBody = $this->decodeChunked($responseBody);
         }
         if ($status < 200 || $status >= 300) {
-            throw new RuntimeException(sprintf(
-                'Local model returned HTTP %d: %s',
-                $status,
-                substr(trim($responseBody), 0, 300)
-            ));
+            throw new RuntimeException(sprintf( 'Local model returned HTTP %d: %s', $status, substr(trim($responseBody), 0, 300) ));
         }
 
         try {

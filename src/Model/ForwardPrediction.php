@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** A one-step sensory prediction and its eventual observed error. */
-final class ForwardPrediction extends ActiveRecord
+class ForwardPrediction extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'forward_predictions';
     public static $primaryKey = 'id';
 
@@ -39,7 +34,6 @@ final class ForwardPrediction extends ActiveRecord
     #[Column(type: 'serialized')]
     protected array $predicted = [];
 
-    /** Reliability of this source's recent predictions, not confidence prose. */
     #[Column(type: 'decimal', precision: 5, scale: 4)]
     protected float $precision = 0.1;
 

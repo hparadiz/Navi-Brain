@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** One expiring, depth-one hypothesis whose value is earned by prediction. */
-final class OtherModelHypothesis extends ActiveRecord
+class OtherModelHypothesis extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'other_model_hypotheses';
     public static $primaryKey = 'id';
 

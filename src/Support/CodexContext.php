@@ -7,8 +7,7 @@ namespace NaviBrain\Support;
 use NaviBrain\Core\NarrativeSynthesis;
 use NaviBrain\Model\ThoughtArtifact;
 
-/** Render accepted remembered self-context for Codex SessionStart hooks. */
-final class CodexContext
+class CodexContext
 {
     public static function render(bool $includeBackgroundIntentions = true): string
     {
@@ -39,10 +38,7 @@ final class CodexContext
 
     private static function latestAccepted(string $kind): ?string
     {
-        $artifacts = ThoughtArtifact::getAllByWhere(
-            ['kind' => $kind, 'status' => 'accepted'],
-            ['order' => ['id' => 'DESC'], 'limit' => 1]
-        );
+        $artifacts = ThoughtArtifact::getAllByWhere(['kind' => $kind, 'status' => 'accepted'], ['order' => ['id' => 'DESC'], 'limit' => 1]);
         if ($artifacts === []) {
             return null;
         }

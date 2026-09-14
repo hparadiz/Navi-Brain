@@ -4,27 +4,12 @@ declare(strict_types=1);
 
 namespace NaviBrain\Support;
 
-/**
- * Best-effort local activity broadcast for optional observers such as Navi-Body.
- *
- * Subscribers bind Unix datagram sockets named activity-*.sock inside the
- * private runtime directory. Publishing never creates a service, waits for a
- * listener, or exposes operation arguments and results.
- */
-final class ActivityBus
+class ActivityBus
 {
     private const MAX_OPERATION_LENGTH = 96;
 
-    public function publish(
-        string $source,
-        string $phase,
-        string $operation,
-        ?string $domain = null,
-        int $durationMs = 0,
-        string $outcome = 'ok',
-        array $context = [],
-        ?string $flow = null
-    ): void {
+    public function publish(Activity $activity): void
+    {
         if (!function_exists('socket_create')) {
             return;
         }
@@ -39,19 +24,19 @@ final class ActivityBus
             return;
         }
 
-        $operation = self::token($operation, 'activity');
-        $path = implode('>', self::pathFor($operation, $context));
+        $activity->operation = self::token($activity->operation, 'activity');
+        $path = implode('>', self::pathFor($activity->operation, $activity->context));
         $packet = implode("\n", [
             'version 1',
             'at_ms ' . (string) ((int) floor(microtime(true) * 1000)),
-            'source ' . self::token($source, 'brain'),
-            'flow ' . self::token($flow ?? ($source . '-' . $operation), 'activity'),
-            'phase ' . self::token($phase, 'event'),
-            'operation ' . $operation,
-            'domain ' . self::token($domain ?? self::domainFor($operation), 'brain'),
+            'source ' . self::token($activity->source, 'brain'),
+            'flow ' . self::token($activity->flow ?? ($activity->source . '-' . $activity->operation), 'activity'),
+            'phase ' . self::token($activity->phase, 'event'),
+            'operation ' . $activity->operation,
+            'domain ' . self::token($activity->domain ?? self::domainFor($activity->operation), 'brain'),
             'path ' . $path,
-            'duration_ms ' . (string) max(0, $durationMs),
-            'outcome ' . self::token($outcome, 'ok'),
+            'duration_ms ' . (string) max(0, $activity->durationMs),
+            'outcome ' . self::token($activity->outcome, 'ok'),
             '',
         ]);
 
@@ -60,8 +45,7 @@ final class ActivityBus
             return;
         }
         try {
-            // Advisory observers must never hold up executive publication.
-            // Failure to enable nonblocking sends drops this publication.
+
             if (!@socket_set_nonblock($socket)) {
                 return;
             }
@@ -114,12 +98,6 @@ final class ActivityBus
     }
 
     /**
-     * Content-free route through the implemented cognitive architecture.
-     *
-     * The route names stable subsystems, never the event payload itself. The
-     * visualizer can therefore show real transitions without receiving memory,
-     * prompts, observations, or model output.
-     *
      * @param array<string, mixed> $context
      * @return list<string>
      */

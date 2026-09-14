@@ -5,8 +5,9 @@ declare(strict_types=1);
 namespace NaviBrain\Mcp;
 
 use InvalidArgumentException;
+use NaviBrain\Model\ValueAppraisal;
 use JsonException;
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Perception\DesktopAwareness;
 use NaviBrain\Storage\TokenMemoryDaemon;
 use NaviBrain\Support\ActivityBus;
@@ -14,11 +15,11 @@ use NaviBrain\Support\PlainText;
 use NaviBrain\Support\SessionPresence;
 use Throwable;
 
-final class Server
+class Server
 {
     private const VERSION = '0.5.0';
 
-    private ExecutiveCore $core;
+    private Executive $core;
     private DesktopAwareness $desktop;
     private ActivityBus $activityBus;
     private ?SessionPresence $sessionPresence = null;
@@ -55,13 +56,11 @@ final class Server
         return 0;
     }
 
-    // Recall and the MCP handshake must remain available while executive
-    // migrations are incomplete. Initialize executive state only on demand.
-    private function core(): ExecutiveCore
+    private function core(): Executive
     {
         if (!isset($this->core)) {
             require dirname(__DIR__, 2) . '/bootstrap/app.php';
-            $core = new ExecutiveCore();
+            $core = new Executive();
             $core->initialize();
             $this->core = $core;
         }
@@ -140,14 +139,14 @@ final class Server
         $outcome = 'ok';
         $domain = ActivityBus::domainFor($name);
         $flow = 'mcp-' . dechex($startedAt);
-        $this->activityBus->publish(
-            'mcp',
-            'started',
-            $name,
-            $domain,
-            outcome: 'pending',
-            flow: $flow
-        );
+        $activity = new \NaviBrain\Support\Activity();
+        $activity->source = 'mcp';
+        $activity->phase = 'started';
+        $activity->operation = $name;
+        $activity->domain = $domain;
+        $activity->outcome = 'pending';
+        $activity->flow = $flow;
+        $this->activityBus->publish($activity);
 
         try {
             if (in_array($name, ['desktop_look', 'desktop_presence'], true) && !isset($this->desktop)) {
@@ -157,12 +156,7 @@ final class Server
                 $capture = $this->desktop->look(
                     $this->requiredString($arguments, 'reason'),
                     $this->requiredChoice($arguments, 'purpose', ['user_request', 'task', 'curiosity']),
-                    $this->optionalChoice(
-                        $arguments,
-                        'scope',
-                        ['active_window', 'current_screen', 'desktop'],
-                        'active_window'
-                    )
+                    $this->optionalChoice($arguments, 'scope', ['active_window', 'current_screen', 'desktop'], 'active_window')
                 );
                 if ($capture['image_base64'] !== null) {
                     $this->sendImageToolResult($id, $capture['metadata'], $capture['image_base64'], $debug);
@@ -175,58 +169,33 @@ final class Server
             $result = match ($name) {
                 'desktop_presence' => $this->desktop->presence(),
                 'brain_status' => $debug
-                    ? array_merge(
-                        ['primary_intention' => $this->requiredString($arguments, 'active_intention')],
-                        $this->core()->status()
-                    )
+                    ? array_merge(['primary_intention' => $this->requiredString($arguments, 'active_intention')], $this->core()->status())
                     : TokenMemoryDaemon::activate(
                         $this->requiredString($arguments, 'active_intention'),
-                        $this->optionalInteger(
-                            $arguments,
-                            'token_budget',
-                            TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS,
-                            1,
-                            TokenMemoryDaemon::MAX_CONTEXT_TOKENS
-                        )
+                        $this->optionalInteger($arguments, 'token_budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS, 1, TokenMemoryDaemon::MAX_CONTEXT_TOKENS)
                     ),
-                'remember_navi' => TokenMemoryDaemon::recall(
-                    $this->requiredString($arguments, 'thoughts'),
-                    $this->optionalInteger($arguments, 'limit', 8, 1, 100)
-                ),
+                'remember_navi' => TokenMemoryDaemon::recall($this->requiredString($arguments, 'thoughts'), $this->optionalInteger($arguments, 'limit', 8, 1, 100)),
                 'brain_self_model' => $this->core()->listSelfModelFacts(),
                 'brain_values' => $this->core()->listValues(),
-                'brain_appraise_value' => $this->core()->appraiseValue(
-                    $this->requiredString($arguments, 'value'),
-                    $this->requiredNumber($arguments, 'alignment'),
-                    $this->requiredString($arguments, 'evidence'),
-                    $this->requiredString($arguments, 'source')
-                ),
+                'brain_appraise_value' => $this->core()->appraiseValue($this->requiredString($arguments, 'value'), new ValueAppraisal([
+                    'alignment' => $this->requiredNumber($arguments, 'alignment'),
+                    'evidence' => $this->requiredString($arguments, 'evidence'),
+                    'source' => $this->requiredString($arguments, 'source'),
+                ], true, true)),
                 'brain_review_values' => $this->core()->reviewValuesDue(),
                 'brain_needs' => $this->core()->listNeeds(),
-                'brain_stimulate' => $this->core()->satisfyNeed(
-                    $this->requiredString($arguments, 'need'),
-                    $this->requiredNumber($arguments, 'amount'),
-                    $this->requiredString($arguments, 'source')
-                ),
-                'brain_daydream' => $this->core()->daydream(
-                    $this->requiredString($arguments, 'reason')
-                ),
-                'brain_sleep' => $this->core()->sleep(
-                    $this->requiredString($arguments, 'reason')
-                ),
+                'brain_stimulate' => $this->core()->satisfyNeed($this->requiredString($arguments, 'need'), $this->requiredNumber($arguments, 'amount'), $this->requiredString($arguments, 'source')),
+                'brain_daydream' => $this->core()->daydream($this->requiredString($arguments, 'reason')),
+                'brain_sleep' => $this->core()->sleep($this->requiredString($arguments, 'reason')),
                 'brain_heartbeat_status' => $this->core()->heartbeatStatus(),
-                'brain_thoughts' => $this->core()->listThoughtArtifacts(
-                    $this->optionalString($arguments, 'status')
-                ),
+                'brain_thoughts' => $this->core()->listThoughtArtifacts($this->optionalString($arguments, 'status')),
                 'brain_remember_self' => $this->core()->setSelfModelFact(
                     $this->requiredString($arguments, 'key'),
                     $this->requiredString($arguments, 'value'),
                     $this->requiredNumber($arguments, 'confidence'),
                     $this->requiredString($arguments, 'evidence')
                 ),
-                'brain_checkpoint' => $this->core()->checkpoint(
-                    $this->requiredString($arguments, 'reason')
-                ),
+                'brain_checkpoint' => $this->core()->checkpoint($this->requiredString($arguments, 'reason')),
                 default => throw new InvalidArgumentException('Unknown tool: ' . $name),
             };
 
@@ -239,15 +208,15 @@ final class Server
             $this->sendToolResult($id, ['error' => $throwable->getMessage()], true, $debug, $name);
         } finally {
             $durationMs = (int) max(0, round((hrtime(true) - $startedAt) / 1_000_000));
-            $this->activityBus->publish(
-                'mcp',
-                $outcome === 'ok' ? 'finished' : 'failed',
-                $name,
-                $domain,
-                $durationMs,
-                $outcome,
-                flow: $flow
-            );
+            $activity = new \NaviBrain\Support\Activity();
+            $activity->source = 'mcp';
+            $activity->phase = $outcome === 'ok' ? 'finished' : 'failed';
+            $activity->operation = $name;
+            $activity->domain = $domain;
+            $activity->durationMs = $durationMs;
+            $activity->outcome = $outcome;
+            $activity->flow = $flow;
+            $this->activityBus->publish($activity);
         }
     }
 
@@ -542,24 +511,13 @@ final class Server
     }
 
     /** @param array<string, mixed> $arguments */
-    private function optionalInteger(
-        array $arguments,
-        string $name,
-        int $default,
-        int $minimum,
-        int $maximum
-    ): int {
+    private function optionalInteger(array $arguments, string $name, int $default, int $minimum, int $maximum): int {
         if (!array_key_exists($name, $arguments)) {
             return $default;
         }
         $value = $arguments[$name];
         if (!is_int($value) || $value < $minimum || $value > $maximum) {
-            throw new InvalidArgumentException(sprintf(
-                '%s must be an integer between %d and %d.',
-                $name,
-                $minimum,
-                $maximum
-            ));
+            throw new InvalidArgumentException(sprintf( '%s must be an integer between %d and %d.', $name, $minimum, $maximum ));
         }
         return $value;
     }
@@ -569,22 +527,13 @@ final class Server
     {
         $value = $this->requiredString($arguments, $name);
         if (!in_array($value, $choices, true)) {
-            throw new InvalidArgumentException(sprintf(
-                '%s must be one of: %s.',
-                $name,
-                implode(', ', $choices)
-            ));
+            throw new InvalidArgumentException(sprintf( '%s must be one of: %s.', $name, implode(', ', $choices) ));
         }
         return $value;
     }
 
     /** @param list<string> $choices */
-    private function optionalChoice(
-        array $arguments,
-        string $name,
-        array $choices,
-        string $default
-    ): string {
+    private function optionalChoice(array $arguments, string $name, array $choices, string $default): string {
         if (!array_key_exists($name, $arguments)) {
             return $default;
         }
@@ -592,19 +541,11 @@ final class Server
     }
 
     /** @param array<string, mixed> $metadata */
-    private function sendImageToolResult(
-        mixed $id,
-        array $metadata,
-        string $imageBase64,
-        bool $debug
-    ): void
+    private function sendImageToolResult(mixed $id, array $metadata, string $imageBase64, bool $debug): void
     {
         $payload = ['result' => $metadata];
         $text = $debug
-            ? json_encode(
-                $payload,
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-            )
+            ? json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)
             : PlainText::render($payload, 6000, 8);
         $result = [
             'content' => [
@@ -620,27 +561,14 @@ final class Server
     }
 
     /** @param array<string, mixed> $payload */
-    private function sendToolResult(
-        mixed $id,
-        array $payload,
-        bool $isError = false,
-        bool $debug = false,
-        string $toolName = ''
-    ): void {
+    private function sendToolResult(mixed $id, array $payload, bool $isError = false, bool $debug = false, string $toolName = ''): void {
         $text = match (true) {
-            $debug => json_encode(
-                $payload,
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-            ),
+            $debug => json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
             !$isError && $toolName === 'brain_status' => is_string($payload['result'] ?? null)
                 ? $payload['result']
                 : '',
             !$isError && $toolName === 'brain_checkpoint' => 'saved',
-            default => PlainText::render(
-                $payload,
-                10000,
-                12
-            ),
+            default => PlainText::render($payload, 10000, 12),
         };
         $result = [
             'content' => [['type' => 'text', 'text' => $text]],
@@ -660,20 +588,13 @@ final class Server
 
     private function sendError(mixed $id, int $code, string $message): void
     {
-        $this->send([
-            'jsonrpc' => '2.0',
-            'id' => $id,
-            'error' => ['code' => $code, 'message' => $message],
-        ]);
+        $this->send([ 'jsonrpc' => '2.0', 'id' => $id, 'error' => ['code' => $code, 'message' => $message], ]);
     }
 
     /** @param array<string, mixed> $message */
     private function send(array $message): void
     {
-        fwrite(STDOUT, json_encode(
-            $message,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-        ) . PHP_EOL);
+        fwrite(STDOUT, json_encode( $message, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR ) . PHP_EOL);
         fflush(STDOUT);
     }
 }

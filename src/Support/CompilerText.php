@@ -4,13 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Support;
 
-/**
- * Human-readable views of the complete narrative evidence compiles.
- *
- * Structured arrays remain available through --debug-json. These views keep
- * every ranked candidate while leaving low-level provenance in the debug form.
- */
-final class CompilerText
+class CompilerText
 {
     /** @param array<string, mixed> $result */
     public static function render(string $command, array $result): string
@@ -49,13 +43,7 @@ final class CompilerText
             if ($label === 'none') {
                 $label = self::text($node['node_id'] ?? '');
             }
-            $lines[] = sprintf(
-                '%d. %s [%s] activation %s',
-                (int) ($node['rank'] ?? ($index + 1)),
-                $label,
-                self::text($node['node_type'] ?? ''),
-                self::number($node['activation'] ?? 0.0)
-            );
+            $lines[] = sprintf('%d. %s [%s] activation %s', (int) ($node['rank'] ?? ($index + 1)), $label, self::text($node['node_type'] ?? ''), self::number($node['activation'] ?? 0.0));
             $lines[] = self::indent(self::text($node['content'] ?? ''), 3);
             $lines[] = sprintf(
                 '   weights: confidence %s; fundamental %s; rehearsal %s; recency %s; context %s',
@@ -152,37 +140,18 @@ final class CompilerText
         ];
 
         foreach (self::list($result['open_intentions'] ?? []) as $intention) {
-            $lines[] = sprintf(
-                '%d. %s [%s; %s]',
-                (int) ($intention['id'] ?? 0),
-                self::text($intention['title'] ?? ''),
-                self::text($intention['authority'] ?? ''),
-                self::text($intention['status'] ?? '')
-            );
+            $lines[] = sprintf('%d. %s [%s; %s]', (int) ($intention['id'] ?? 0), self::text($intention['title'] ?? ''), self::text($intention['authority'] ?? ''), self::text($intention['status'] ?? ''));
             $lines[] = '   reason: ' . self::text($intention['reason'] ?? '');
             $lines[] = '   next action: ' . self::text($intention['next_action'] ?? '');
             $lines[] = '   success condition: ' . self::text($intention['success_condition'] ?? '');
             $lines[] = '   release condition: ' . self::text($intention['release_condition'] ?? '');
             $lines[] = '   parent: ' . PlainText::inline($intention['parent'] ?? null, PHP_INT_MAX);
-            $lines[] = '   dependencies: ' . PlainText::inline(
-                $intention['dependencies'] ?? [],
-                PHP_INT_MAX
-            );
+            $lines[] = '   dependencies: ' . PlainText::inline($intention['dependencies'] ?? [], PHP_INT_MAX);
             $lines[] = '   dependency ready: '
                 . (($intention['dependency_ready'] ?? false) ? 'yes' : 'no');
-            $lines[] = '   actions: ' . PlainText::inline(
-                $intention['action_evidence'] ?? [],
-                PHP_INT_MAX
-            );
-            $lines[] = '   decisions: ' . PlainText::inline(
-                $intention['decision_evidence'] ?? [],
-                PHP_INT_MAX
-            );
-            $lines[] = sprintf(
-                '   created: %s; updated: %s',
-                self::text($intention['created_at'] ?? ''),
-                self::text($intention['updated_at'] ?? '')
-            );
+            $lines[] = '   actions: ' . PlainText::inline($intention['action_evidence'] ?? [], PHP_INT_MAX);
+            $lines[] = '   decisions: ' . PlainText::inline($intention['decision_evidence'] ?? [], PHP_INT_MAX);
+            $lines[] = sprintf('   created: %s; updated: %s', self::text($intention['created_at'] ?? ''), self::text($intention['updated_at'] ?? ''));
             $lines[] = '';
         }
 
@@ -220,10 +189,7 @@ final class CompilerText
         if (!is_array($value) || !array_is_list($value)) {
             return [];
         }
-        return array_values(array_map(
-            static fn (mixed $item): string => self::text($item),
-            $value
-        ));
+        return array_values(array_map( static fn (mixed $item): string => self::text($item), $value ));
     }
 
     private static function text(mixed $value): string

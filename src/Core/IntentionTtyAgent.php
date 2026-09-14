@@ -10,8 +10,7 @@ use NaviBrain\Support\CompilerText;
 use RuntimeException;
 use Throwable;
 
-/** Explicitly launched, resumable OpenCode terminals; never an intention scheduler. */
-final class IntentionTtyAgent
+class IntentionTtyAgent
 {
     public const MODEL = 'opencode/muse-spark-1.3-contributor-free';
     private readonly string $root;
@@ -26,11 +25,10 @@ final class IntentionTtyAgent
         $database = getenv('NAVI_BRAIN_DB') ?: dirname(__DIR__, 2) . '/var/navi-brain.sqlite';
         $this->namespace = substr(hash('sha256', realpath($database) ?: $database), 0, 12);
         $this->root = dirname(__DIR__, 2) . '/var/intention-agents/' . $this->namespace;
-        // Keep Unix socket names below sockaddr_un's limit, independent of checkout depth.
+
         $this->socketDirectory = '/tmp/navi-tty-' . posix_geteuid() . '-' . $this->namespace;
     }
 
-    /** Preview the exact remembered context without starting a process or calling a model. */
     public function context(int $id): string
     {
         $this->requireIntention($id);
@@ -93,22 +91,18 @@ final class IntentionTtyAgent
                 'started_at' => time(),
             ];
             $this->saveState($id, $state);
-            // Pass argv directly. Neither titles, workspace names nor remembered text are shell code.
-            $result = $this->screen([
-                '-c', '/dev/null', '-dmS', $this->name($id),
-                PHP_BINARY, dirname(__DIR__, 2) . '/bin/navi-brain-intention-agent', (string) $id,
-            ]);
+
+            $result = $this->screen([ '-c', '/dev/null', '-dmS', $this->name($id), PHP_BINARY, dirname(__DIR__, 2) . '/bin/navi-brain-intention-agent', (string) $id, ]);
             if ($result['code'] !== 0) {
                 $this->saveState($id, array_merge($state, ['status' => 'failed', 'error' => $result['output']]));
                 throw new RuntimeException('Screen could not start the intention terminal: ' . $result['output']);
             }
-            // Screen's successful fork is not evidence that its child started successfully.
+
             for ($attempt = 0; $attempt < 30; ++$attempt) {
                 usleep(100000);
                 $current = $this->status($id);
                 if (!$current['running']) {
-                    throw new RuntimeException('The intention terminal exited during startup. '
-                        . ($current['stop_reason'] ?? 'Screen may be unable to create its socket or PTY.'));
+                    throw new RuntimeException('The intention terminal exited during startup. ' . ($current['stop_reason'] ?? 'Screen may be unable to create its socket or PTY.'));
                 }
                 if ($current['status'] !== 'starting') {
                     return $current;
@@ -172,15 +166,13 @@ final class IntentionTtyAgent
         if ($session === null) {
             throw new RuntimeException('No running terminal for this intention.');
         }
-        $process = proc_open(['/usr/bin/screen', '-r', $session], [STDIN, STDOUT, STDERR], $pipes,
-            null, array_merge(getenv(), ['SCREENDIR' => $this->socketDirectory]));
+        $process = proc_open(['/usr/bin/screen', '-r', $session], [STDIN, STDOUT, STDERR], $pipes, null, array_merge(getenv(), ['SCREENDIR' => $this->socketDirectory]));
         if (!is_resource($process)) {
             throw new RuntimeException('Unable to attach to the intention terminal.');
         }
         return proc_close($process);
     }
 
-    /** Runs inside Screen, inheriting its real controlling terminal. */
     public function run(int $id): int
     {
         $directory = $this->directory($id);
@@ -228,7 +220,7 @@ final class IntentionTtyAgent
             $command = [$state['binary'], $state['workspace'], '--pure', '--model', self::MODEL,
                 '--agent', 'navi-intention',
                 '--prompt', "Continue the assigned intention #{$id} using the current intention context. Take the next supported step, then report progress and blockers."];
-            // A separate database per intention makes --continue unambiguous.
+
             if (is_file($directory . '/opencode.sqlite')) {
                 $command[] = '--continue';
             }
@@ -244,7 +236,7 @@ final class IntentionTtyAgent
                     $state['exit_code'] = $processStatus['exitcode'];
                     break;
                 }
-                // Fail closed if canonical state becomes unavailable, paused or ineligible.
+
                 $this->assertRunnable($id);
                 if ($this->contractHash($id) !== $fingerprint) {
                     $state['stop_reason'] = 'Intention contract changed; start again with fresh context.';
@@ -331,7 +323,7 @@ final class IntentionTtyAgent
         return $matches[1] ?? null;
     }
 
-    /** @param list<string> $arguments @return array{code: int, output: string} */
+    /** @param list<string> $arguments */
     private function screen(array $arguments): array
     {
         $this->makeDirectory($this->socketDirectory);

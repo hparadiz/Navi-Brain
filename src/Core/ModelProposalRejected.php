@@ -6,7 +6,6 @@ namespace NaviBrain\Core;
 
 use RuntimeException;
 
-/** A successful HTTP response contained no usable bounded model proposal. */
-final class ModelProposalRejected extends RuntimeException
+class ModelProposalRejected extends RuntimeException
 {
 }

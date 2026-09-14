@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** One fenced pass through the other-agent inference and prediction loop. */
-final class OtherModelCycle extends ActiveRecord
+class OtherModelCycle extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'other_model_cycles';
     public static $primaryKey = 'id';
 

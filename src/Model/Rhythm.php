@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class Rhythm extends ActiveRecord
+class Rhythm extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'rhythms';
     public static $primaryKey = 'id';
 

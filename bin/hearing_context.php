@@ -3,25 +3,9 @@
 
 declare(strict_types=1);
 
-/**
- * Hearing context snapshot for navi-transcript.
- *
- * Hard rule: nothing in here may be interactive or blocking. The old version
- * called org.kde.KWin.queryWindowInfo, which is KWin's *picker* — it turns the
- * cursor into a crosshair and waits for a click before returning. That made
- * every context snapshot hijack the desktop.
- *
- * There is no non-interactive way to read the focused window on KWin/Wayland
- * without loading a KWin script, so focus is no longer consulted at all. The
- * call hint now comes from PipeWire: an app holding a live (non-corked) mic
- * capture stream is on a call, whether or not its window has focus. That also
- * matches how the skill actually behaves — a call outlives window focus.
- */
-
 const PRESENCE_SCRIPT = '/home/akujin/skills/navi-presence/scripts/presence_snapshot.php';
 const CMD_TIMEOUT_SECONDS = 6;
 
-/** Capture streams that are Navi's own plumbing or ambient tooling, never a call. */
 const CAPTURE_IGNORE = [
     'pet-native',
     'evemon-meter',
@@ -31,7 +15,6 @@ const CAPTURE_IGNORE = [
     'whisper',
 ];
 
-/** Substring => call hint label. Order matters; first match wins. */
 const CALL_APPS = [
     'discord' => 'discord',
     'webcord' => 'discord',
@@ -52,10 +35,6 @@ const CALL_APPS = [
     'chrome' => 'browser',
 ];
 
-/**
- * Run a command with a hard timeout so a wedged helper can never stall the
- * snapshot. Returns stdout lines; stderr is discarded rather than parsed.
- */
 function run(array $cmd): array
 {
     if (!is_executable('/usr/bin/timeout')) {
@@ -89,7 +68,6 @@ function presence(): array
     return $snapshot;
 }
 
-/** Best-effort process name for a pid, read straight from /proc. */
 function commForPid(?int $pid): string
 {
     if ($pid === null || $pid <= 0) {
@@ -101,10 +79,6 @@ function commForPid(?int $pid): string
     return $comm === false ? '' : trim($comm);
 }
 
-/**
- * Live microphone capture streams, one row per stream, with an identity string
- * assembled from every naming hint PipeWire offers.
- */
 function captureStreams(): array
 {
     $result = run(['pactl', '-f', 'json', 'list', 'source-outputs']);
@@ -170,10 +144,6 @@ function callAppLabel(string $identity): ?string
     return null;
 }
 
-/**
- * Decide the call hint from live capture streams only. Corked streams are apps
- * holding the mic open without using it, which is not a call.
- */
 function callState(array $streams): array
 {
     $live = 0;
@@ -201,9 +171,6 @@ function callState(array $streams): array
 $presence = presence();
 $call = callState(captureStreams());
 
-// Focus is deliberately unavailable: reading it non-interactively on
-// KWin/Wayland is not possible without loading a KWin script, and the
-// interactive path is what broke this snapshot in the first place.
 echo "active_window_caption=unavailable\n";
 echo "active_window_class=unavailable\n";
 echo "active_window_name=unavailable\n";

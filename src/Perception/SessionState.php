@@ -4,20 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Perception;
 
-/**
- * Instruments on the desktop session.
- *
- * This reads two things and interprets neither: whether the screen locker
- * reports itself active, and what a media player reports it is doing. What
- * either implies is not decided here.
- *
- * This machine runs OpenRC rather than systemd, so there is no logind session
- * to query and no predictable `/run/user/UID/bus`. The session bus address is
- * therefore recovered from a running desktop process when the environment does
- * not carry it, which is what lets these instruments be read from a supervised
- * daemon that inherits no desktop environment.
- */
-final class SessionState
+class SessionState
 {
     private const PROBE_TIMEOUT_SECONDS = 3;
 
@@ -27,7 +14,6 @@ final class SessionState
     private ?string $busAddress = null;
     private bool $busResolved = false;
 
-    /** Current MPRIS playback status, or null when nothing answers. */
     public function mprisStatus(): ?string
     {
         $address = $this->sessionBusAddress();
@@ -57,7 +43,6 @@ final class SessionState
         return preg_match('/string\\s+"([^"]+)"/', $reply, $status) === 1 ? $status[1] : null;
     }
 
-    /** Null when the interface cannot be reached at all. */
     public function screenLocked(): ?bool
     {
         $address = $this->sessionBusAddress();
@@ -86,11 +71,6 @@ final class SessionState
         return null;
     }
 
-    /**
-     * Find the session bus. A supervised daemon inherits no desktop
-     * environment, so falling back to a live desktop process's environ is what
-     * makes this readable outside an interactive shell.
-     */
     private function sessionBusAddress(): ?string
     {
         if ($this->busResolved) {
@@ -164,13 +144,7 @@ final class SessionState
         $descriptors = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
         $pipes = [];
         $current = getenv();
-        $process = @proc_open(
-            $command,
-            $descriptors,
-            $pipes,
-            null,
-            array_merge(is_array($current) ? $current : [], $environment)
-        );
+        $process = @proc_open($command, $descriptors, $pipes, null, array_merge(is_array($current) ? $current : [], $environment));
         if (!is_resource($process)) {
             return null;
         }

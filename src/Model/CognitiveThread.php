@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class CognitiveThread extends ActiveRecord
+class CognitiveThread extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'cognitive_threads';
     public static $primaryKey = 'id';
 

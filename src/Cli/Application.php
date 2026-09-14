@@ -4,10 +4,25 @@ declare(strict_types=1);
 
 namespace NaviBrain\Cli;
 
+use NaviBrain\Core\WorkClaim;
+
+use NaviBrain\Model\Need;
+
+use NaviBrain\Model\Memory;
+use NaviBrain\Model\Sense;
+use NaviBrain\Model\SensorySource;
+use NaviBrain\Model\ValueRevision;
+use NaviBrain\Model\ValueAppraisal;
+use NaviBrain\Model\HeldValue;
+use NaviBrain\Model\Appraisal;
+use NaviBrain\Model\Intention;
+use NaviBrain\Model\ActionTrace;
+use NaviBrain\Model\ActionExecution;
+
 use InvalidArgumentException;
 use JsonException;
 use NaviBrain\Core\CodexSparkWorker;
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Core\FreeModelWorker;
 use NaviBrain\Core\IntentionCompiler;
 use NaviBrain\Core\IntentionTtyAgent;
@@ -20,9 +35,9 @@ use NaviBrain\Support\CompilerText;
 use NaviBrain\Support\PlainText;
 use Throwable;
 
-final class Application
+class Application
 {
-    private ExecutiveCore $core;
+    private Executive $core;
 
     /** @param list<string> $argv */
     public function run(array $argv): int
@@ -45,7 +60,7 @@ final class Application
             }
             if (!$nativeCommand) {
                 require dirname(__DIR__, 2) . '/bootstrap/app.php';
-                $this->core = new ExecutiveCore();
+                $this->core = new Executive();
                 $schema = $this->core->initialize();
             }
 
@@ -57,38 +72,20 @@ final class Application
                 'intention:add' => $this->addIntention($options),
                 'intention:list' => $this->core->listIntentions($this->optionalString($options, 'status')),
                 'intention:agent:context' => ['context' => (new IntentionTtyAgent())->context($this->integer($options, 'id'))],
-                'intention:agent:start' => (new IntentionTtyAgent())->start(
-                    $this->integer($options, 'id'), $this->string($options, 'workspace')
-                ),
+                'intention:agent:start' => (new IntentionTtyAgent())->start($this->integer($options, 'id'), $this->string($options, 'workspace')),
                 'intention:agent:status' => isset($options['id'])
                     ? (new IntentionTtyAgent())->status($this->integer($options, 'id'))
                     : (new IntentionTtyAgent())->list(),
                 'intention:agent:stop' => (new IntentionTtyAgent())->stop($this->integer($options, 'id')),
                 'intention:agent:attach' => ['exit_code' => (new IntentionTtyAgent())->attach($this->integer($options, 'id'))],
-                'intention:advance' => $this->core->advanceIntention(
-                    $this->integer($options, 'id'),
-                    $this->string($options, 'next-action'),
-                    $this->optionalString($options, 'note')
-                ),
-                'intention:close' => $this->core->closeIntention(
-                    $this->integer($options, 'id'),
-                    $this->string($options, 'status'),
-                    $this->string($options, 'note')
-                ),
-                'action:start' => $this->core->startAction(
-                    $this->integer($options, 'intention'),
-                    $this->string($options, 'description'),
-                    $this->string($options, 'expected'),
-                    $this->optionalString($options, 'kind'),
-                    $this->jsonObject($options, 'arguments', [])
-                ),
-                'action:execute' => $this->core->executeAction(
-                    $this->integer($options, 'intention'),
-                    $this->string($options, 'kind'),
-                    $this->jsonObject($options, 'arguments'),
-                    $this->string($options, 'description'),
-                    $this->string($options, 'expected')
-                ),
+                'intention:advance' => $this->core->advanceIntention($this->integer($options, 'id'), $this->string($options, 'next-action'), $this->optionalString($options, 'note')),
+                'intention:close' => $this->core->closeIntention($this->integer($options, 'id'), $this->string($options, 'status'), $this->string($options, 'note')),
+                'action:start' => $this->startAction($options),
+                'action:execute' => $this->core->executeAction(new ActionTrace([
+                    'intention_id' => $this->integer($options, 'intention'),
+                    'description' => $this->string($options, 'description'),
+                    'expected' => $this->string($options, 'expected'),
+                ], true, true), new ActionExecution([ 'action_kind' => $this->string($options, 'kind'), 'arguments' => $this->jsonObject($options, 'arguments'), ], true, true)),
                 'action:finish' => $this->core->finishAction(
                     $this->integer($options, 'action'),
                     $this->string($options, 'status'),
@@ -99,309 +96,142 @@ final class Application
                 'action:list' => $this->core->listActions($this->optionalString($options, 'status')),
                 'procedure:list' => $this->core->listProcedures($this->optionalString($options, 'status')),
                 'procedure:adapters' => $this->core->proceduralMemory()->adapters(),
-                'procedure:run' => $this->core->runProcedure(
-                    $this->integer($options, 'id'),
-                    $this->integer($options, 'intention'),
-                    $this->jsonObject($options, 'arguments', []),
-                    $this->string($options, 'operation-key')
-                ),
-                'procedure:compose' => $this->core->composeProcedure(
-                    $this->string($options, 'name'),
-                    $this->string($options, 'description'),
-                    $this->integerList($options, 'procedures'),
-                    $this->string($options, 'authority')
-                ),
-                'decision:start' => $this->core->startDecisionCycle(
-                    $this->integer($options, 'intention'),
-                    $this->string($options, 'trigger'),
-                    $this->optionalInteger($options, 'thread'),
-                    $this->optionalString($options, 'model-hint')
-                ),
-                'decision:list' => $this->core->listDecisionCycles(
-                    $this->optionalString($options, 'status'),
-                    $this->integer($options, 'limit', 20)
-                ),
+                'procedure:run' => $this->core->runProcedure($this->integer($options, 'id'), $this->integer($options, 'intention'), $this->jsonObject($options, 'arguments', []), $this->string($options, 'operation-key')),
+                'procedure:compose' => $this->core->composeProcedure($this->string($options, 'name'), $this->string($options, 'description'), $this->integerList($options, 'procedures'), $this->string($options, 'authority')),
+                'decision:start' => $this->core->startDecisionCycle($this->integer($options, 'intention'), $this->string($options, 'trigger'), $this->optionalInteger($options, 'thread'), $this->optionalString($options, 'model-hint')),
+                'decision:list' => $this->core->listDecisionCycles($this->optionalString($options, 'status'), $this->integer($options, 'limit', 20)),
                 'decision:show' => $this->core->showDecisionCycle($this->integer($options, 'id')),
                 'decision:recover' => $this->core->recoverDecisionIntegrations($this->integer($options, 'limit', 16)),
-                'decision:compare' => $this->core->compareDecisionModels(
-                    $this->integer($options, 'limit', 200)
-                ),
+                'decision:compare' => $this->core->compareDecisionModels($this->integer($options, 'limit', 200)),
                 'other:status' => $this->core->otherModel()->status(),
-                'other:frame' => $this->core->otherModel()->listFrameFacts(
-                    $this->optionalString($options, 'status'),
-                    $this->integer($options, 'limit', 100)
-                ),
-                'other:hypotheses' => $this->core->otherModel()->listHypotheses(
-                    $this->optionalString($options, 'status'),
-                    $this->integer($options, 'limit', 100)
-                ),
-                'other:predictions' => $this->core->otherModel()->listPredictions(
-                    $this->optionalString($options, 'status'),
-                    $this->integer($options, 'limit', 100)
-                ),
-                'other:cycles' => $this->core->otherModel()->listCycles(
-                    $this->optionalString($options, 'status'),
-                    $this->integer($options, 'limit', 20)
-                ),
-                'other:correct' => $this->core->otherModel()->correctHypothesis(
-                    $this->integer($options, 'hypothesis'),
-                    $this->string($options, 'correction')
-                ),
-                'other:replay' => $this->core->otherModel()->replay(
-                    $this->integer($options, 'limit', 500)
-                ),
-                'memory:add' => $this->addMemory($options),
-                'recall' => TokenMemoryDaemon::activate(
-                    $this->string($options, 'query'),
-                    $this->integer($options, 'token-budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS)
-                ),
-                'memory:search' => TokenMemoryDaemon::recall(
-                    $this->string($options, 'query'),
-                    $this->integer($options, 'limit', 20)
-                ),
-                'personality:compile' => (new PersonalityCompiler($this->core))->compile(
-                    $this->string($options, 'context')
-                ),
-                'motivation:compile' => (new MotivationCompiler($this->core))->compile(
-                    $this->string($options, 'context')
-                ),
+                'other:frame' => $this->core->otherModel()->listFrameFacts($this->optionalString($options, 'status'), $this->integer($options, 'limit', 100)),
+                'other:hypotheses' => $this->core->otherModel()->listHypotheses($this->optionalString($options, 'status'), $this->integer($options, 'limit', 100)),
+                'other:predictions' => $this->core->otherModel()->listPredictions($this->optionalString($options, 'status'), $this->integer($options, 'limit', 100)),
+                'other:cycles' => $this->core->otherModel()->listCycles($this->optionalString($options, 'status'), $this->integer($options, 'limit', 20)),
+                'other:correct' => $this->core->otherModel()->correctHypothesis($this->integer($options, 'hypothesis'), $this->string($options, 'correction')),
+                'other:replay' => $this->core->otherModel()->replay($this->integer($options, 'limit', 500)),
+                'memory:add' => $this->saveMemory($options),
+                'recall' => TokenMemoryDaemon::activate($this->string($options, 'query'), $this->integer($options, 'token-budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS)),
+                'memory:search' => TokenMemoryDaemon::recall($this->string($options, 'query'), $this->integer($options, 'limit', 20)),
+                'personality:compile' => (new PersonalityCompiler($this->core))->compile($this->string($options, 'context')),
+                'motivation:compile' => (new MotivationCompiler($this->core))->compile($this->string($options, 'context')),
                 'intention:compile' => (new IntentionCompiler())->compile(),
-                'narrative:queue' => $this->core->queueNarrativeSynthesis(
-                    $this->string($options, 'reason')
-                ),
-                'memory:consolidate' => $this->core->consolidateMemory(
-                    $this->integer($options, 'episode'),
-                    $this->string($options, 'content'),
-                    $this->number($options, 'confidence')
-                ),
+                'narrative:queue' => $this->core->queueNarrativeSynthesis($this->string($options, 'reason')),
+                'memory:consolidate' => $this->core->consolidateMemory($this->integer($options, 'episode'), $this->string($options, 'content'), $this->number($options, 'confidence')),
                 'memory:consolidation:status' => $this->core->consolidationStatus(),
-                'memory:consolidation:reuse' => $this->core->reuseConsolidationEvidence(
-                    $this->flag($options, 'apply')
-                ),
-                'memory:consolidation:pump' => $this->core->maintainConsolidationQueue(
-                    $this->integer($options, 'depth', 2)
-                ),
-                'memory:consolidation:repair' => $this->core->repairConsolidationHistory(
-                    $this->string($options, 'reason')
-                ),
+                'memory:consolidation:reuse' => $this->core->reuseConsolidationEvidence($this->flag($options, 'apply')),
+                'memory:consolidation:pump' => $this->core->maintainConsolidationQueue($this->integer($options, 'depth', 2)),
+                'memory:consolidation:repair' => $this->core->repairConsolidationHistory($this->string($options, 'reason')),
                 'need:list' => $this->core->listNeeds(),
-                'need:set' => $this->core->setNeed(
-                    $this->string($options, 'key'),
-                    $this->string($options, 'description'),
-                    $this->number($options, 'pressure'),
-                    $this->number($options, 'growth-per-hour'),
-                    $this->number($options, 'trigger-threshold'),
-                    $this->string($options, 'status'),
-                    $this->string($options, 'rationale'),
-                    $this->optionalString($options, 'authority') ?? 'agent'
-                ),
-                'need:satisfy' => $this->core->satisfyNeed(
-                    $this->string($options, 'key'),
-                    $this->number($options, 'amount'),
-                    $this->string($options, 'source')
-                ),
+                'need:set' => $this->core->setNeed(new Need([
+                    'need_key' => $this->string($options, 'key'),
+                    'description' => $this->string($options, 'description'),
+                    'pressure' => $this->number($options, 'pressure'),
+                    'growth_per_hour' => $this->number($options, 'growth-per-hour'),
+                    'trigger_threshold' => $this->number($options, 'trigger-threshold'),
+                    'status' => $this->string($options, 'status'),
+                    'authority' => $this->optionalString($options, 'authority') ?? 'agent'
+                ], true, true), $this->string($options, 'rationale')),
+                'need:satisfy' => $this->core->satisfyNeed($this->string($options, 'key'), $this->number($options, 'amount'), $this->string($options, 'source')),
                 'mind:tick' => $this->core->tickMind(),
                 'mind:daydream' => $this->core->daydream($this->string($options, 'reason')),
                 'mind:sleep' => $this->core->sleep($this->string($options, 'reason')),
                 'heartbeat:status' => $this->core->heartbeatStatus(),
                 'heartbeat:due' => $this->core->runDueHeartbeats($this->string($options, 'node')),
-                'heartbeat:tick' => $this->core->runHeartbeat(
-                    $this->string($options, 'rhythm'),
-                    $this->string($options, 'node')
-                ),
-                'thread:self-presence' => $this->core->createSelfPresenceThread(
-                    $this->integer($options, 'intention')
-                ),
-                'thread:stream' => $this->core->createMindStreamThread(
-                    $this->integer($options, 'intention')
-                ),
-                'stream:recent' => $this->core->listInnerMonologue(
-                    $this->integer($options, 'limit', 12)
-                ),
-                'thread:epistemic' => $this->core->createEpistemicAdvanceThread(
-                    $this->integer($options, 'intention')
-                ),
-                'thread:list' => $this->core->listCognitiveThreads(
-                    $this->optionalString($options, 'status')
-                ),
-                'thread:step:list' => $this->core->listThreadSteps(
-                    $this->optionalInteger($options, 'thread')
-                ),
-                'thread:release' => $this->core->releaseCognitiveThreadByKey(
-                    $this->string($options, 'key'),
-                    $this->string($options, 'reason')
-                ),
-                'thread:due' => $this->core->runDueCognitiveThreads(
-                    $this->string($options, 'node')
-                ),
+                'heartbeat:tick' => $this->core->runHeartbeat($this->string($options, 'rhythm'), $this->string($options, 'node')),
+                'thread:self-presence' => $this->core->createSelfPresenceThread($this->integer($options, 'intention')),
+                'thread:stream' => $this->core->createMindStreamThread($this->integer($options, 'intention')),
+                'stream:recent' => $this->core->listInnerMonologue($this->integer($options, 'limit', 12)),
+                'thread:epistemic' => $this->core->createEpistemicAdvanceThread($this->integer($options, 'intention')),
+                'thread:list' => $this->core->listCognitiveThreads($this->optionalString($options, 'status')),
+                'thread:step:list' => $this->core->listThreadSteps($this->optionalInteger($options, 'thread')),
+                'thread:release' => $this->core->releaseCognitiveThreadByKey($this->string($options, 'key'), $this->string($options, 'reason')),
+                'thread:due' => $this->core->runDueCognitiveThreads($this->string($options, 'node')),
                 'sense:status' => $this->core->sensoryCortex()->status(),
-                'sense:events' => $this->core->sensoryCortex()->pendingEvents(
-                    $this->integer($options, 'limit', 10),
-                    $this->optionalString($options, 'min-significance') === null
-                        ? 0.0 : $this->number($options, 'min-significance')
-                ),
-                'sense:define' => $this->core->sensoryCortex()->defineSense(
-                    $this->string($options, 'key'),
-                    $this->string($options, 'source'),
-                    $this->string($options, 'notices'),
-                    $this->string($options, 'detector'),
-                    json_decode($this->optionalString($options, 'config') ?? '{}', true) ?: [],
-                    $this->integer($options, 'refractory', 60),
-                    $this->optionalString($options, 'author') ?? 'agent'
-                ),
+                'sense:events' => $this->core->sensoryCortex()->pendingEvents($this->integer($options, 'limit', 10), $this->optionalString($options, 'min-significance') === null ? 0.0 : $this->number($options, 'min-significance')),
+                'sense:define' => $this->core->sensoryCortex()->defineSense(new Sense([
+                    'sense_key' => $this->string($options, 'key'), 'source_key' => $this->string($options, 'source'),
+                    'notices' => $this->string($options, 'notices'), 'detector' => $this->string($options, 'detector'),
+                    'config' => json_decode($this->optionalString($options, 'config') ?? '{}', true) ?: [],
+                    'refractory_seconds' => $this->integer($options, 'refractory', 60),
+                    'author' => $this->optionalString($options, 'author') ?? 'agent',
+                ], true, true)),
                 'sense:tune' => $this->core->sensoryCortex()->tune(),
                 'social:capital' => $this->core->socialFeedback()->descriptorStats(),
-                'percept:compact' => (new \NaviBrain\Perception\PerceptCodec($this->core))->compact(
-                    $this->integer($options, 'older-than', 900)
-                ),
+                'percept:compact' => (new \NaviBrain\Perception\PerceptCodec($this->core))->compact($this->integer($options, 'older-than', 900)),
                 'percept:decode' => $this->decodePerceptFrame($options),
                 'social:close' => $this->core->socialFeedback()->closeWindows(),
                 'sense:decay' => $this->core->sensoryCortex()->decay(),
-                'source:authorize' => $this->core->sensoryCortex()->authorizeSource(
-                    $this->string($options, 'key'),
-                    $this->string($options, 'description'),
-                    $this->string($options, 'reveals'),
-                    $this->optionalString($options, 'acquisition') ?? 'continuous',
-                    $this->integer($options, 'interval', 60),
-                    $this->integer($options, 'ttl', 3600)
-                ),
-                'source:status' => $this->core->sensoryCortex()->setSourceStatus(
-                    $this->string($options, 'key'),
-                    $this->string($options, 'status')
-                ),
-                'capsule:list' => $this->core->listContextCapsules(
-                    $this->optionalInteger($options, 'thread'),
-                    $this->integer($options, 'limit', 10)
-                ),
-                'capsule:show' => $this->core->showContextCapsule(
-                    $this->optionalInteger($options, 'id')
-                ),
-                'metrics:snapshot' => $this->core->recordMetricSnapshot(
-                    $this->string($options, 'node'),
-                    $this->optionalString($options, 'scope')
-                ),
-                'metrics:report' => $this->core->metricsReport(
-                    $this->integer($options, 'limit', 10),
-                    $this->optionalString($options, 'scope')
-                ),
+                'source:authorize' => $this->core->sensoryCortex()->authorizeSource(new SensorySource([
+                    'source_key' => $this->string($options, 'key'), 'description' => $this->string($options, 'description'),
+                    'reveals' => $this->string($options, 'reveals'),
+                    'acquisition' => $this->optionalString($options, 'acquisition') ?? 'continuous',
+                    'sample_interval_seconds' => $this->integer($options, 'interval', 60),
+                    'reading_ttl_seconds' => $this->integer($options, 'ttl', 3600), 'authority' => 'user',
+                ], true, true)),
+                'source:status' => $this->core->sensoryCortex()->setSourceStatus($this->string($options, 'key'), $this->string($options, 'status')),
+                'capsule:list' => $this->core->listContextCapsules($this->optionalInteger($options, 'thread'), $this->integer($options, 'limit', 10)),
+                'capsule:show' => $this->core->showContextCapsule($this->optionalInteger($options, 'id')),
+                'metrics:snapshot' => $this->core->recordMetricSnapshot($this->string($options, 'node'), $this->optionalString($options, 'scope')),
+                'metrics:report' => $this->core->metricsReport($this->integer($options, 'limit', 10), $this->optionalString($options, 'scope')),
                 'control:status' => $this->core->cognitionControl(),
                 'control:pause' => $this->core->pauseCognition($this->string($options, 'reason')),
                 'control:resume' => $this->core->resumeCognition($this->integer($options, 'pause-event')),
-                'interrupt:raise' => $this->core->raiseInterrupt(
-                    $this->string($options, 'reason'),
-                    $this->optionalString($options, 'severity') ?? 'high',
-                    $this->optionalString($options, 'source') ?? 'external'
-                ),
+                'interrupt:raise' => $this->core->raiseInterrupt($this->string($options, 'reason'), $this->optionalString($options, 'severity') ?? 'high', $this->optionalString($options, 'source') ?? 'external'),
                 'interrupt:list' => $this->core->listInterrupts($this->optionalString($options, 'status')),
                 'interrupt:check' => $this->core->checkExecutiveInterrupts($this->string($options, 'node')),
-                'interrupt:resolve' => $this->core->resolveInterrupt(
-                    $this->integer($options, 'id'),
-                    $this->string($options, 'node'),
-                    $this->optionalInteger($options, 'run')
-                ),
+                'interrupt:resolve' => $this->core->resolveInterrupt($this->integer($options, 'id'), $this->string($options, 'node'), $this->optionalInteger($options, 'run')),
                 'safety:check' => $this->core->runSafetyCheck(),
                 'work:list' => $this->core->listWorkItems($this->optionalString($options, 'status')),
-                'work:claim' => $this->core->claimWork(
-                    $this->string($options, 'owner'),
-                    $this->integer($options, 'lease', 180)
-                ),
-                'thought:list' => $this->core->listThoughtArtifacts(
-                    $this->optionalString($options, 'status')
-                ),
+                'work:claim' => $this->core->claimWork(new WorkClaim($this->string($options, 'owner'), $this->integer($options, 'lease', 180))),
+                'thought:list' => $this->core->listThoughtArtifacts($this->optionalString($options, 'status')),
                 'models:list' => $this->core->listModelEndpoints(),
-                'models:sync' => $this->core->syncFreeModels(
-                    $this->commaSeparated($options, 'ids')
-                ),
+                'models:sync' => $this->core->syncFreeModels($this->commaSeparated($options, 'ids')),
                 'models:discover' => (new FreeModelWorker($this->core))->discoverModels(),
-                'spark:once' => (new CodexSparkWorker($this->core))->runOnce(
-                    $this->string($options, 'owner')
-                ),
-                'worker:once' => (new CodexSparkWorker($this->core))->runOnce(
-                    $this->string($options, 'owner')
-                ),
-                'opencode:once' => (new FreeModelWorker($this->core))->runOnce(
-                    $this->string($options, 'owner')
-                ),
+                'spark:once' => (new CodexSparkWorker($this->core))->runOnce($this->string($options, 'owner')),
+                'worker:once' => (new CodexSparkWorker($this->core))->runOnce($this->string($options, 'owner')),
+                'opencode:once' => (new FreeModelWorker($this->core))->runOnce($this->string($options, 'owner')),
                 'reflection:once' => (new \NaviBrain\Core\PublicReflection($this->core))->runOnce($this->string($options, 'owner')),
                 'reflection:status' => (new \NaviBrain\Core\PublicReflection($this->core))->status(),
-                'reflection:review' => (new \NaviBrain\Core\PublicReflection($this->core))->review(
-                    $this->integer($options, 'work'), $this->string($options, 'verdict'), $this->string($options, 'note')
-                ),
+                'reflection:review' => (new \NaviBrain\Core\PublicReflection($this->core))->review($this->integer($options, 'work'), $this->string($options, 'verdict'), $this->string($options, 'note')),
                 'local:status' => $this->localModelStatus(),
-                'local:reset' => $this->core->resetLocalModelBackoff(
-                    LocalModelWorker::MODEL_ID,
-                    $this->string($options, 'reason')
-                ),
-                'local:once' => (new LocalModelWorker($this->core))->runOnce(
-                    $this->string($options, 'owner')
-                ),
+                'local:reset' => $this->core->resetLocalModelBackoff(LocalModelWorker::MODEL_ID, $this->string($options, 'reason')),
+                'local:once' => (new LocalModelWorker($this->core))->runOnce($this->string($options, 'owner')),
                 'backup:create' => $this->core->backupDatabase($this->string($options, 'reason')),
-                'self:set' => $this->core->setSelfModelFact(
-                    $this->string($options, 'key'),
-                    $this->string($options, 'value'),
-                    $this->number($options, 'confidence'),
-                    $this->string($options, 'evidence')
-                ),
+                'self:set' => $this->core->setSelfModelFact($this->string($options, 'key'), $this->string($options, 'value'), $this->number($options, 'confidence'), $this->string($options, 'evidence')),
                 'self:list' => $this->core->listSelfModelFacts(),
                 'value:list' => $this->core->listValues(),
-                'value:set' => $this->core->setValue(
-                    $this->string($options, 'key'),
-                    $this->string($options, 'statement'),
-                    $this->string($options, 'rationale'),
-                    $this->number($options, 'weight'),
-                    $this->optionalString($options, 'status') ?? 'active',
-                    $this->integer($options, 'review-interval-hours', 168),
-                    $this->optionalString($options, 'authority') ?? 'agent'
-                ),
-                'value:appraise' => $this->core->appraiseValue(
-                    $this->string($options, 'key'),
-                    $this->number($options, 'alignment'),
-                    $this->string($options, 'evidence'),
-                    $this->string($options, 'source'),
-                    $this->optionalInteger($options, 'event'),
-                    $this->optionalInteger($options, 'intention')
-                ),
+                'value:set' => $this->core->setValue(new HeldValue([
+                    'value_key' => $this->string($options, 'key'), 'statement' => $this->string($options, 'statement'),
+                    'rationale' => $this->string($options, 'rationale'), 'weight' => $this->number($options, 'weight'),
+                    'status' => $this->optionalString($options, 'status') ?? 'active',
+                    'review_interval_hours' => $this->integer($options, 'review-interval-hours', 168),
+                    'authority' => $this->optionalString($options, 'authority') ?? 'agent',
+                ], true, true)),
+                'value:appraise' => $this->core->appraiseValue($this->string($options, 'key'), new ValueAppraisal([
+                    'alignment' => $this->number($options, 'alignment'), 'evidence' => $this->string($options, 'evidence'),
+                    'source' => $this->string($options, 'source'), 'event_id' => $this->optionalInteger($options, 'event'),
+                    'intention_id' => $this->optionalInteger($options, 'intention'),
+                ], true, true)),
                 'value:review' => $this->core->reviewValuesDue(),
                 'value:reviewed' => $this->core->markValueReviewed($this->string($options, 'key')),
-                'value:revise' => $this->core->reviseValue(
-                    $this->string($options, 'key'),
-                    $this->string($options, 'statement'),
-                    $this->number($options, 'weight'),
-                    $this->string($options, 'basis'),
-                    $this->string($options, 'reason'),
-                    $this->optionalString($options, 'authority') ?? 'agent'
-                ),
+                'value:revise' => $this->core->reviseValue($this->string($options, 'key'), new ValueRevision([
+                    'new_statement' => $this->string($options, 'statement'), 'new_weight' => $this->number($options, 'weight'),
+                    'basis' => $this->string($options, 'basis'), 'reason' => $this->string($options, 'reason'),
+                    'authority' => $this->optionalString($options, 'authority') ?? 'agent',
+                ], true, true)),
                 'appraise' => $this->appraise($options),
                 'checkpoint' => $this->core->checkpoint($this->string($options, 'reason')),
                 'status' => $debugJson
-                    ? array_merge(
-                        ['primary_intention' => $this->optionalString($options, 'active-intention')],
-                        $this->core->status()
-                    )
-                    : TokenMemoryDaemon::activate(
-                        $this->string($options, 'active-intention'),
-                        $this->integer(
-                            $options,
-                            'token-budget',
-                            TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS
-                        )
-                    ),
+                    ? array_merge(['primary_intention' => $this->optionalString($options, 'active-intention')], $this->core->status())
+                    : TokenMemoryDaemon::activate($this->string($options, 'active-intention'), $this->integer( $options, 'token-budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS )),
                 default => throw new InvalidArgumentException(sprintf('Unknown command: %s', $command)),
             };
 
-            $this->writeOutput(
-                ['ok' => true, 'command' => $command, 'result' => $result],
-                STDOUT,
-                $debugJson
-            );
+            $this->writeOutput(['ok' => true, 'command' => $command, 'result' => $result], STDOUT, $debugJson);
             return 0;
         } catch (Throwable $throwable) {
-            $this->writeOutput([
-                'ok' => false,
-                'command' => $command,
-                'error' => $throwable->getMessage(),
-                'type' => $throwable::class,
-            ], STDERR, $debugJson);
+            $this->writeOutput([ 'ok' => false, 'command' => $command, 'error' => $throwable->getMessage(), 'type' => $throwable::class, ], STDERR, $debugJson);
             return 1;
         }
     }
@@ -421,51 +251,61 @@ final class Application
             }
         }
 
-        return $this->core->createIntention(
-            title: $this->string($options, 'title'),
-            reason: $this->string($options, 'reason'),
-            authority: $this->string($options, 'authority'),
-            nextAction: $this->string($options, 'next-action'),
-            successCondition: $this->string($options, 'success'),
-            releaseCondition: $this->string($options, 'release'),
-            dependencies: $dependencies,
-            parentId: $this->optionalInteger($options, 'parent')
-        );
+        return $this->core->createIntention(new Intention([
+            'title' => $this->string($options, 'title'), 'reason' => $this->string($options, 'reason'),
+            'authority' => $this->string($options, 'authority'), 'next_action' => $this->string($options, 'next-action'),
+            'success_condition' => $this->string($options, 'success'), 'release_condition' => $this->string($options, 'release'),
+            'dependencies' => $dependencies, 'parent_id' => $this->optionalInteger($options, 'parent'),
+        ], true, true));
     }
 
     /** @param array<string, string|bool> $options */
-    private function addMemory(array $options): array
+    private function startAction(array $options): array
     {
-        return $this->core->addMemory(
-            tier: $this->string($options, 'tier'),
-            content: $this->string($options, 'content'),
-            confidence: $this->number($options, 'confidence'),
-            idempotencyKey: $this->string($options, 'idempotency-key'),
-            sourceEventId: $this->optionalInteger($options, 'source-event'),
-            sourceMemoryId: $this->optionalInteger($options, 'source-memory'),
-            supersedesId: $this->optionalInteger($options, 'supersedes'),
-            expiresAt: $this->optionalString($options, 'expires'),
-            allowProceduralWrite: $this->flag($options, 'allow-procedural-write'),
-            sourceEventKind: $this->optionalString($options, 'source-event-kind') ?? 'event'
-        );
+        $action = new ActionTrace([
+            'intention_id' => $this->integer($options, 'intention'),
+            'description' => $this->string($options, 'description'),
+            'expected' => $this->string($options, 'expected'),
+        ], true, true);
+        $kind = $this->optionalString($options, 'kind');
+        $execution = $kind === null ? null : new ActionExecution([ 'action_kind' => $kind, 'arguments' => $this->jsonObject($options, 'arguments', []), ], true, true);
+        return $this->core->startAction($action, $execution);
+    }
+
+    private function saveMemory(array $options): array
+    {
+        $tier = $this->string($options, 'tier');
+        if ($tier === 'procedural' && !$this->flag($options, 'allow-procedural-write')) {
+            throw new \RuntimeException('Procedural memory writes require --allow-procedural-write.');
+        }
+        $memory = new Memory([
+            'tier' => $tier, 'content' => $this->string($options, 'content'),
+            'confidence' => $this->number($options, 'confidence'),
+            'operation_key' => TokenMemoryDaemon::operationKey('memory-add', $this->string($options, 'idempotency-key')),
+            'source_event_id' => $this->optionalInteger($options, 'source-event'),
+            'source_memory_id' => $this->optionalInteger($options, 'source-memory'),
+            'supersedes_id' => $this->optionalInteger($options, 'supersedes'),
+            'expires_at' => $this->optionalString($options, 'expires'),
+            'source_event_kind' => $this->optionalString($options, 'source-event-kind') ?? 'event',
+        ], true, true);
+        $memory->save();
+        return ['memory' => $memory->getData(), 'event' => $memory->storedEvent->getData()];
     }
 
     /** @param array<string, string|bool> $options */
     private function appraise(array $options): array
     {
-        return $this->core->appraise(
-            eventId: $this->optionalInteger($options, 'event'),
-            intentionId: $this->optionalInteger($options, 'intention'),
-            relevance: $this->number($options, 'relevance'),
-            urgency: $this->number($options, 'urgency'),
-            controllability: $this->number($options, 'controllability'),
-            uncertainty: $this->number($options, 'uncertainty'),
-            commitmentImpact: $this->number($options, 'commitment-impact')
-        );
+        return $this->core->appraise(new Appraisal([
+            'event_id' => $this->optionalInteger($options, 'event'), 'intention_id' => $this->optionalInteger($options, 'intention'),
+            'relevance' => $this->number($options, 'relevance'), 'urgency' => $this->number($options, 'urgency'),
+            'controllability' => $this->number($options, 'controllability'), 'uncertainty' => $this->number($options, 'uncertainty'),
+            'commitment_impact' => $this->number($options, 'commitment-impact'),
+        ], true, true));
     }
 
-    /** @param list<string> $arguments
-     *  @return array<string, string|bool>
+    /**
+     * @param list<string> $arguments
+     * @return array<string, string|bool>
      */
     private function parseOptions(array $arguments): array
     {
@@ -610,8 +450,9 @@ final class Application
         return ($options[$name] ?? false) === true;
     }
 
-    /** @param array<string, string|bool> $options
-     *  @return array<string, mixed>
+    /**
+     * @param array<string, string|bool> $options
+     * @return array<string, mixed>
      */
     private function jsonObject(array $options, string $name, ?array $default = null): array
     {
@@ -630,8 +471,9 @@ final class Application
         return get_object_vars($decoded);
     }
 
-    /** @param array<string, string|bool> $options
-     *  @return list<int>
+    /**
+     * @param array<string, string|bool> $options
+     * @return list<int>
      */
     private function integerList(array $options, string $name): array
     {
@@ -645,15 +487,13 @@ final class Application
         return $values;
     }
 
-    /** @param array<string, string|bool> $options
-     *  @return list<string>
+    /**
+     * @param array<string, string|bool> $options
+     * @return list<string>
      */
     private function commaSeparated(array $options, string $name): array
     {
-        return array_values(array_filter(array_map(
-            'trim',
-            explode(',', $this->string($options, $name))
-        ), static fn (string $value): bool => $value !== ''));
+        return array_values(array_filter(array_map( 'trim', explode(',', $this->string($options, $name)) ), static fn (string $value): bool => $value !== ''));
     }
 
     /** @return array<string, mixed> */
@@ -777,9 +617,7 @@ final class Application
         ];
     }
 
-    /** @param resource $stream
-     *  @throws JsonException
-     */
+    /** @param resource $stream */
     private function writeOutput(array $payload, $stream, bool $debugJson): void
     {
         if (!$debugJson) {
@@ -789,17 +627,10 @@ final class Application
                 return;
             }
             if (($payload['ok'] ?? false) === true
-                && in_array(
-                    $command,
-                    ['personality:compile', 'motivation:compile', 'intention:compile'],
-                    true
-                )
+                && in_array($command, ['personality:compile', 'motivation:compile', 'intention:compile'], true)
             ) {
                 $result = $payload['result'] ?? [];
-                fwrite(
-                    $stream,
-                    CompilerText::render($command, is_array($result) ? $result : []) . PHP_EOL
-                );
+                fwrite($stream, CompilerText::render($command, is_array($result) ? $result : []) . PHP_EOL);
                 return;
             }
             if (($payload['ok'] ?? false) === true && in_array($command, ['status', 'recall'], true)) {
@@ -816,9 +647,6 @@ final class Application
             fwrite($stream, PlainText::render($payload, $maxCharacters, $listLimit) . PHP_EOL);
             return;
         }
-        fwrite($stream, json_encode(
-            $payload,
-            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-        ) . PHP_EOL);
+        fwrite($stream, json_encode( $payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR ) . PHP_EOL);
     }
 }

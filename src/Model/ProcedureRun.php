@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** One resumable execution of a single or composed procedure. */
-final class ProcedureRun extends ActiveRecord
+class ProcedureRun extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'procedure_runs';
     public static $primaryKey = 'id';
 
@@ -37,11 +32,9 @@ final class ProcedureRun extends ActiveRecord
     #[Column(type: 'integer', unsigned: true)]
     protected int $procedure_id;
 
-    /** Immutable token-memory generation that authorized this run. */
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $procedure_memory_id = null;
 
-    /** Caller-stable invocation identity; null only for pre-v20 runs. */
     #[Column(type: 'string', length: 64, notnull: false)]
     protected ?string $operation_key = null;
 

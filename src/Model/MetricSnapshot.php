@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class MetricSnapshot extends ActiveRecord
+class MetricSnapshot extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'metric_snapshots';
     public static $primaryKey = 'id';
 

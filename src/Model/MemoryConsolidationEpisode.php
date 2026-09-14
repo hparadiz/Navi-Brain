@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class MemoryConsolidationEpisode extends ActiveRecord
+class MemoryConsolidationEpisode extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'memory_consolidation_episodes';
     public static $primaryKey = 'id';
 

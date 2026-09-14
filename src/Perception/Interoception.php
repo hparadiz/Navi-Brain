@@ -5,35 +5,19 @@ declare(strict_types=1);
 namespace NaviBrain\Perception;
 
 use NaviBrain\Core\CodexSparkWorker;
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Model\CognitiveThread;
 use NaviBrain\Model\SenseEvent;
 use NaviBrain\Model\ThreadStep;
 use NaviBrain\Model\WorkItem;
 
-/**
- * The two senses Navi has of herself rather than of the room.
- *
- * Interoception reports the state of Navi own substrate — whether Navi's heartbeat
- * is beating, whether Navi's model answers, whether Navi's store is growing faster
- * than it should. Chronoception reports elapsed time as something felt rather
- * than read off a clock: how long since the user spoke, how long since Navi did, how
- * long since Navi last had a thought.
- *
- * Neither reveals anything about the user that other sources do not already
- * carry, so both are cheap to grant and safe to sample continuously.
- */
-final class Interoception
+class Interoception
 {
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
     }
 
-    /**
-     * Health telemetry on herself.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     public function health(): array
     {
         $now = time();
@@ -66,7 +50,6 @@ final class Interoception
         $dbPath = getenv('NAVI_BRAIN_DB') ?: $root . '/var/navi-brain.sqlite';
         $dbBytes = is_readable($dbPath) ? (int) filesize($dbPath) : 0;
 
-        // Recent worker health, as a felt reliability rather than a log scan.
         $recentFailures = 0;
         $recentTotal = 0;
         foreach (WorkItem::getAll(['order' => ['id' => 'DESC'], 'limit' => 20]) as $work) {
@@ -89,10 +72,7 @@ final class Interoception
             }
         }
 
-        $pendingEdges = count(SenseEvent::getAllByWhere(
-            ['outcome' => 'pending'],
-            ['order' => ['id' => 'DESC'], 'limit' => 200]
-        ));
+        $pendingEdges = count(SenseEvent::getAllByWhere( ['outcome' => 'pending'], ['order' => ['id' => 'DESC'], 'limit' => 200] ));
 
         return [
             'heartbeat_silent_seconds' => $supervisorAge,
@@ -109,22 +89,12 @@ final class Interoception
         ];
     }
 
-    /**
-     * Elapsed time as a sensed quantity.
-     *
-     * A clock is not a sense of time. What makes duration perceptible is
-     * knowing how long it has been since things that matter, and noticing when
-     * that interval is unlike the usual one.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     public function time(): array
     {
         $now = time();
         $local = new \DateTimeImmutable('@' . $now, new \DateTimeZone('UTC'));
-        $local = $local->setTimezone(new \DateTimeZone(
-            (string) (getenv('NAVI_BRAIN_TZ') ?: 'America/Los_Angeles')
-        ));
+        $local = $local->setTimezone(new \DateTimeZone( (string) (getenv('NAVI_BRAIN_TZ') ?: 'America/Los_Angeles') ));
 
         return [
             'hour' => (int) $local->format('G'),
@@ -139,10 +109,7 @@ final class Interoception
 
     private function secondsSinceEdge(string $senseKey, int $now): ?int
     {
-        foreach (SenseEvent::getAllByWhere(
-            ['sense_key' => $senseKey],
-            ['order' => ['id' => 'DESC'], 'limit' => 1]
-        ) as $event) {
+        foreach (SenseEvent::getAllByWhere(['sense_key' => $senseKey], ['order' => ['id' => 'DESC'], 'limit' => 1]) as $event) {
             $at = $this->timestamp($event->observed_at);
             return $at === null ? null : max(0, $now - $at);
         }
@@ -160,10 +127,7 @@ final class Interoception
 
     private function secondsSinceSpoke(int $now): ?int
     {
-        foreach (ThreadStep::getAllByWhere(
-            ['status' => 'succeeded'],
-            ['order' => ['id' => 'DESC'], 'limit' => 150]
-        ) as $step) {
+        foreach (ThreadStep::getAllByWhere(['status' => 'succeeded'], ['order' => ['id' => 'DESC'], 'limit' => 150]) as $step) {
             $observed = is_array($step->observed_result) ? $step->observed_result : [];
             if (($observed['spoken'] ?? false) === true) {
                 $at = $this->timestamp($step->completed_at);
@@ -175,10 +139,7 @@ final class Interoception
 
     private function secondsSinceThought(int $now): ?int
     {
-        foreach (ThreadStep::getAllByWhere(
-            ['curator_verdict' => 'accepted'],
-            ['order' => ['id' => 'DESC'], 'limit' => 1]
-        ) as $step) {
+        foreach (ThreadStep::getAllByWhere(['curator_verdict' => 'accepted'], ['order' => ['id' => 'DESC'], 'limit' => 1]) as $step) {
             $at = $this->timestamp($step->completed_at);
             return $at === null ? null : max(0, $now - $at);
         }

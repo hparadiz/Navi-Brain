@@ -9,14 +9,7 @@ use NaviBrain\Model\ActionTrace;
 use NaviBrain\Model\DecisionCycle;
 use NaviBrain\Model\Intention;
 
-/**
- * Compile every open canonical intention and only intention-related evidence.
- *
- * This compiler is read-only and uncapped, or scoped to one requested ID.
- * It deliberately excludes needs, affect, sensory state, working memory, and conversational context so the
- * resulting narrative cannot mistake background pressure for an intention.
- */
-final class IntentionCompiler
+class IntentionCompiler
 {
     private const PROTOCOL = 'intention-evidence-v1';
 
@@ -144,10 +137,7 @@ final class IntentionCompiler
     /** @return array<string, mixed> */
     private function actionEvidence(int $intentionId): array
     {
-        $records = ActionTrace::getAllByWhere(
-            ['intention_id' => $intentionId],
-            ['order' => ['id' => 'ASC']]
-        );
+        $records = ActionTrace::getAllByWhere(['intention_id' => $intentionId], ['order' => ['id' => 'ASC']]);
         $statuses = [];
         $matches = [];
         foreach ($records as $record) {
@@ -179,10 +169,7 @@ final class IntentionCompiler
     /** @return array<string, mixed> */
     private function decisionEvidence(int $intentionId): array
     {
-        $records = DecisionCycle::getAllByWhere(
-            ['intention_id' => $intentionId],
-            ['order' => ['id' => 'ASC']]
-        );
+        $records = DecisionCycle::getAllByWhere(['intention_id' => $intentionId], ['order' => ['id' => 'ASC']]);
         $statuses = [];
         foreach ($records as $record) {
             $status = (string) $record->status;

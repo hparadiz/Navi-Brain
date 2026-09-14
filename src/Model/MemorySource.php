@@ -4,8 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-/** Resolve only explicitly typed lineage; a coincident numeric ID is not evidence. */
-final class MemorySource
+class MemorySource
 {
     /**
      * @param array<string, mixed> $memory

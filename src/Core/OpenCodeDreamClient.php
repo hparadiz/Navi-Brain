@@ -4,10 +4,11 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use RuntimeException;
 
-/** The free Muse offer requires an actual OpenCode session, provided by its CLI. */
-final class OpenCodeDreamClient
+class OpenCodeDreamClient
 {
     public const MODEL = 'muse-spark-1.3-contributor-free';
     public const MAX_PROMPT_BYTES = 16384;
@@ -15,7 +16,7 @@ final class OpenCodeDreamClient
     private readonly FreeModelWorker $worker;
     private int $preparedAt = 0;
 
-    public function __construct(ExecutiveCore $core, string $modelId = self::MODEL)
+    public function __construct(Executive $core, string $modelId = self::MODEL)
     {
         $model = str_starts_with($modelId, 'opencode/') ? substr($modelId, 9) : $modelId;
         if ($model !== self::MODEL) {
@@ -24,7 +25,6 @@ final class OpenCodeDreamClient
         $this->worker = new FreeModelWorker($core);
     }
 
-    /** Discovery sends no memory. The caller holds the shared provider lock. */
     public function preflight(): void
     {
         $this->preparedAt = 0;
@@ -34,7 +34,6 @@ final class OpenCodeDreamClient
         $this->preparedAt = time();
     }
 
-    /** One reserved CLI invocation, with no caller retry or model fallback. */
     public function complete(string $prompt, int $tokenBudget = 512): array
     {
         if ($this->preparedAt === 0 || time() < $this->preparedAt || time() - $this->preparedAt >= 3600) {

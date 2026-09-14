@@ -6,7 +6,7 @@ namespace NaviBrain\Core;
 
 use RuntimeException;
 
-final class ModelRateLimit extends RuntimeException
+class ModelRateLimit extends RuntimeException
 {
     public readonly int $retryAt;
 

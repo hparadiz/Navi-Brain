@@ -4,44 +4,23 @@ declare(strict_types=1);
 
 namespace NaviBrain\Perception;
 
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Model\SenseEvent;
 use NaviBrain\Model\SenseReading;
-use NaviBrain\Model\ThreadStep;
 use NaviBrain\Model\UtteranceOutcome;
 use NaviBrain\Model\WorkItem;
 
-/**
- * The closed loop around speaking.
- *
- * Speaking is the only thing Navi does that other people can react to, so it is
- * the only place Navi can learn what lands. The loop is: Navi speaks, Navi's hearing
- * observes the window that follows, a reflective pass names what it thinks
- * happened in its own words, and the association between those names and
- * observed engagement accumulates.
- *
- * Nothing here declares which descriptors are good. There is no table of
- * funny/dumb/shameful, and there is no sentiment list. The only anchor is
- * whether interaction followed, because that is the least interpretive thing
- * available. Valence is therefore discovered from co-occurrence rather than
- * asserted up front, which is the difference between a learned social sense and
- * a hand-written one.
- */
-final class SocialFeedback
+class SocialFeedback
 {
     public const WORK_TYPE = 'social_feedback_reflection';
     private const DEFAULT_WINDOW_SECONDS = 120;
     private const MIN_DESCRIPTOR_SAMPLE = 3;
     private const MAX_REFLECTION_ATTEMPTS = 3;
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
     }
 
-    /**
-     * Register an utterance the moment it is spoken, before anything is known
-     * about how it landed.
-     */
     public function registerUtterance(int $threadStepId, string $utterance, int $spokenAt): array
     {
         $existing = UtteranceOutcome::getByField('thread_step_id', $threadStepId);
@@ -51,7 +30,7 @@ final class SocialFeedback
         $presence = $this->presenceAt($spokenAt);
         $presenceState = $presence === null ? 'unknown' : ((bool) $presence ? 'present' : 'away');
         /** @var UtteranceOutcome $outcome */
-        $outcome = $this->core->insertRecord(UtteranceOutcome::class, [
+        $outcome = new UtteranceOutcome([
             'thread_step_id' => $threadStepId,
             'spoken_at' => $spokenAt,
             'utterance' => $utterance,
@@ -65,24 +44,18 @@ final class SocialFeedback
             'observability_basis' => null,
             'descriptor_confidence' => 0.0,
             'status' => 'awaiting_window',
-        ]);
+        ], true, true);
+        $outcome->save();
         return $outcome->getData();
     }
 
-    /**
-     * Close every response window that has elapsed, recording only observables.
-     *
-     * @return list<array<string, mixed>>
-     */
+    /** @return list<array<string, mixed>> */
     public function closeWindows(?int $now = null): array
     {
         $now ??= time();
         $closed = [];
 
-        foreach (UtteranceOutcome::getAllByWhere(
-            ['status' => 'awaiting_window'],
-            ['order' => ['id' => 'ASC'], 'limit' => 50]
-        ) as $outcome) {
+        foreach (UtteranceOutcome::getAllByWhere(['status' => 'awaiting_window'], ['order' => ['id' => 'ASC'], 'limit' => 50]) as $outcome) {
             $spokenAt = $this->timestamp($outcome->spoken_at) ?? $now;
             $window = (int) $outcome->window_seconds;
             if (($now - $spokenAt) < $window) {
@@ -91,10 +64,7 @@ final class SocialFeedback
 
             $responses = [];
             $reactions = 0;
-            foreach (SenseReading::getAllByWhere(
-                ['source_key' => 'pet_hearing'],
-                ['order' => ['id' => 'DESC'], 'limit' => 400]
-            ) as $reading) {
+            foreach (SenseReading::getAllByWhere(['source_key' => 'pet_hearing'], ['order' => ['id' => 'DESC'], 'limit' => 400]) as $reading) {
                 $at = $this->timestamp($reading->observed_at);
                 if ($at === null || $at < $spokenAt || $at > ($spokenAt + $window)) {
                     continue;
@@ -108,10 +78,7 @@ final class SocialFeedback
             }
             usort($responses, static fn (array $a, array $b): int => $a['at'] <=> $b['at']);
 
-            foreach (SenseEvent::getAllByWhere(
-                ['sense_key' => 'heard_reaction'],
-                ['order' => ['id' => 'DESC'], 'limit' => 100]
-            ) as $event) {
+            foreach (SenseEvent::getAllByWhere(['sense_key' => 'heard_reaction'], ['order' => ['id' => 'DESC'], 'limit' => 100]) as $event) {
                 $at = $this->timestamp($event->observed_at);
                 if ($at !== null && $at >= $spokenAt && $at <= ($spokenAt + $window)) {
                     $reactions++;
@@ -121,8 +88,6 @@ final class SocialFeedback
             $first = $responses[0] ?? null;
             $latency = $first === null ? null : max(0, $first['at'] - $spokenAt);
 
-            // Engagement is a measure of interaction, not of quality. It is the
-            // only thing asserted here, and it asserts nothing about meaning.
             $engagement = 0.0;
             if ($first !== null) {
                 $engagement += 0.5;
@@ -135,28 +100,16 @@ final class SocialFeedback
             }
             $engagement = round(min(1.0, $engagement), 4);
 
-            $observability = $this->core->otherModel()->utteranceObservability(
-                $outcome,
-                count($responses),
-                $reactions
-            );
+            $observability = $this->core->otherModel()->utteranceObservability($outcome, count($responses), $reactions);
             $observabilityWeight = (float) $observability['weight'];
 
-            // Silence only means something if someone was there to break it.
-            // A line spoken to an empty room, or while the microphone was down,
-            // scores zero for reasons that have nothing to do with the line, and
-            // scoring it anyway teaches Navi that whatever was said failed.
-            // Those observations are marked inconclusive instead: absence of
-            // evidence, kept out of the evidence.
             $couldHaveLanded = $observabilityWeight >= 0.25 || $responses !== [] || $reactions > 0;
             if (!$couldHaveLanded) {
                 $outcome->setFields([
                     'response_latency_seconds' => null,
                     'responses_in_window' => 0,
                     'reactions_in_window' => $reactions,
-                    // Raw engagement remains non-null and uninterpreted. The
-                    // zero observability weight is what keeps this absence out
-                    // of learned evidence.
+
                     'engagement' => 0.0,
                     'observability_weight' => $observabilityWeight,
                     'observability_basis' => (string) $observability['basis'],
@@ -178,10 +131,7 @@ final class SocialFeedback
                 'responses_in_window' => count($responses),
                 'response_text' => $first === null
                     ? null
-                    : mb_substr(implode(' / ', array_map(
-                        static fn (array $r): string => $r['text'],
-                        array_slice($responses, 0, 4)
-                    )), 0, 600),
+                    : mb_substr(implode(' / ', array_map( static fn (array $r): string => $r['text'], array_slice($responses, 0, 4) )), 0, 600),
                 'reactions_in_window' => $reactions,
                 'engagement' => $engagement,
                 'observability_weight' => $observabilityWeight,
@@ -204,21 +154,13 @@ final class SocialFeedback
         return $closed;
     }
 
-    /**
-     * Queue descriptor work without ever putting an LLM call in the sensory
-     * process. One failed outcome cannot starve the rest of the backlog.
-     *
-     * @return list<array<string, mixed>>
-     */
+    /** @return list<array<string, mixed>> */
     public function queueReflections(int $limit = 2): array
     {
         $limit = max(1, min(8, $limit));
         $attempts = [];
         $inFlight = [];
-        foreach (WorkItem::getAllByWhere(
-            ['work_type' => self::WORK_TYPE],
-            ['order' => ['id' => 'DESC'], 'limit' => 1000]
-        ) as $work) {
+        foreach (WorkItem::getAllByWhere(['work_type' => self::WORK_TYPE], ['order' => ['id' => 'DESC'], 'limit' => 1000]) as $work) {
             $refs = is_array($work->input_refs) ? $work->input_refs : [];
             $outcomeId = (int) ($refs['utterance_outcome_id'] ?? 0);
             if ($outcomeId < 1) {
@@ -231,10 +173,7 @@ final class SocialFeedback
         }
 
         $queued = [];
-        foreach (UtteranceOutcome::getAllByWhere(
-            ['status' => 'observed'],
-            ['order' => ['id' => 'ASC'], 'limit' => 200]
-        ) as $outcome) {
+        foreach (UtteranceOutcome::getAllByWhere(['status' => 'observed'], ['order' => ['id' => 'ASC'], 'limit' => 200]) as $outcome) {
             $outcomeId = (int) $outcome->id;
             $attempt = (int) ($attempts[$outcomeId] ?? 0) + 1;
             if (isset($inFlight[$outcomeId]) || $attempt > self::MAX_REFLECTION_ATTEMPTS) {
@@ -255,23 +194,23 @@ final class SocialFeedback
                     'observability_weight' => (float) $outcome->observability_weight,
                 ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
             ]);
-            $queued[] = $this->core->enqueueWork(
-                parentRunId: null,
-                parentIntentionId: null,
-                workType: self::WORK_TYPE,
-                prompt: $prompt,
-                inputRefs: [
+            $queued[] = $this->core->enqueueWork(new WorkItem([
+                'parent_run_id' => null,
+                'parent_intention_id' => null,
+                'work_type' => self::WORK_TYPE,
+                'prompt' => $prompt,
+                'input_refs' => [
                     'utterance_outcome_id' => $outcomeId,
                     'operation' => self::WORK_TYPE,
                     'context_scope' => 'no_workspace',
                     'attempt' => $attempt,
                 ],
-                tokenBudget: 96,
-                wallBudgetSeconds: 180,
-                idempotencyKey: sprintf('utterance_reflection:%d:attempt:%d', $outcomeId, $attempt),
-                depth: 0,
-                maxDepth: 0
-            );
+                'token_budget' => 96,
+                'wall_budget_seconds' => 180,
+                'idempotency_key' => sprintf('utterance_reflection:%d:attempt:%d', $outcomeId, $attempt),
+                'depth' => 0,
+                'max_depth' => 0
+            ], true, true));
             if (count($queued) >= $limit) {
                 break;
             }
@@ -279,7 +218,7 @@ final class SocialFeedback
         return $queued;
     }
 
-    /** @param array<string, mixed> $work @param array<string, mixed> $proposal */
+    /** @param array<string, mixed> $work */
     public function integrateReflection(array $work, array $proposal): array
     {
         $refs = is_array($work['input_refs'] ?? null) ? $work['input_refs'] : [];
@@ -296,12 +235,7 @@ final class SocialFeedback
         ) {
             return ['status' => 'stale_or_invalid'];
         }
-        return $this->recordDescriptor(
-            $outcomeId,
-            (string) ($proposal['content'] ?? ''),
-            (float) ($proposal['confidence'] ?? 0.0),
-            (string) ($proposal['challenged_assumption'] ?? '')
-        );
+        return $this->recordDescriptor($outcomeId, (string) ($proposal['content'] ?? ''), (float) ($proposal['confidence'] ?? 0.0), (string) ($proposal['challenged_assumption'] ?? ''));
     }
 
     /** @param array<string, mixed> $work */
@@ -309,24 +243,11 @@ final class SocialFeedback
     {
         $refs = is_array($work['input_refs'] ?? null) ? $work['input_refs'] : [];
         $outcomeId = (int) ($refs['utterance_outcome_id'] ?? 0);
-        $this->core->emitEvent('utterance.reflection_failed', [
-            'utterance_outcome_id' => $outcomeId,
-            'attempt' => (int) ($refs['attempt'] ?? 0),
-            'error' => mb_substr($error, 0, 1000),
-        ]);
+        $this->core->emitEvent('utterance.reflection_failed', [ 'utterance_outcome_id' => $outcomeId, 'attempt' => (int) ($refs['attempt'] ?? 0), 'error' => mb_substr($error, 0, 1000), ]);
         return ['status' => 'reflection_failed', 'utterance_outcome_id' => $outcomeId];
     }
 
-    /**
-     * Record the descriptor a reflective pass chose. The vocabulary is the
-     * model's own; nothing validates it against a list, only against shape.
-     */
-    public function recordDescriptor(
-        int $outcomeId,
-        string $descriptor,
-        float $confidence,
-        string $reason
-    ): array {
+    public function recordDescriptor(int $outcomeId, string $descriptor, float $confidence, string $reason): array {
         $outcome = UtteranceOutcome::getByID($outcomeId);
         if (!$outcome instanceof UtteranceOutcome) {
             return ['status' => 'missing'];
@@ -345,29 +266,15 @@ final class SocialFeedback
             'status' => 'reflected',
         ]);
         $outcome->save();
-        $this->core->emitEvent('utterance.reflected', [
-            'utterance_outcome_id' => $outcomeId,
-            'descriptor' => $outcome->descriptor,
-            'engagement' => (float) $outcome->engagement,
-        ]);
+        $this->core->emitEvent('utterance.reflected', [ 'utterance_outcome_id' => $outcomeId, 'descriptor' => $outcome->descriptor, 'engagement' => (float) $outcome->engagement, ]);
         return ['status' => 'recorded', 'outcome' => $outcome->getData()];
     }
 
-    /**
-     * Social capital: which of Navi own descriptors have actually gone well.
-     *
-     * This is the learned part. A descriptor means something only because
-     * utterances Navi labelled that way did or did not produce interaction.
-     *
-     * @return list<array<string, mixed>>
-     */
+    /** @return list<array<string, mixed>> */
     public function descriptorStats(int $minSample = self::MIN_DESCRIPTOR_SAMPLE): array
     {
         $byDescriptor = [];
-        foreach (UtteranceOutcome::getAllByWhere(
-            ['status' => 'reflected'],
-            ['order' => ['id' => 'DESC'], 'limit' => 500]
-        ) as $outcome) {
+        foreach (UtteranceOutcome::getAllByWhere(['status' => 'reflected'], ['order' => ['id' => 'DESC'], 'limit' => 500]) as $outcome) {
             $key = (string) $outcome->descriptor;
             if ($key === '') {
                 continue;
@@ -396,24 +303,11 @@ final class SocialFeedback
                 'established' => $effective >= $minSample,
             ];
         }
-        usort($stats, static fn (array $a, array $b): int =>
-            ($b['mean_engagement'] ?? -1.0) <=> ($a['mean_engagement'] ?? -1.0)
-        );
+        usort($stats, static fn (array $a, array $b): int => ($b['mean_engagement'] ?? -1.0) <=> ($a['mean_engagement'] ?? -1.0));
         return $stats;
     }
 
-    /**
-     * Defer to the hearing sense rather than keeping a second, divergent copy of
-     * its judgement.
-     *
-     * This is deliberate coupling: as that sense learns what its source gets
-     * wrong, the social measurement inherits the improvement. It also settles
-     * two ways this loop can lie to itself. Ambient music is not a reply, and
-     * neither is a stranger on a call saying something forty seconds after Navi
-     * spoke into a room that was never listening to Navi.
-     *
-     * @param array<string, mixed> $payload
-     */
+    /** @param array<string, mixed> $payload */
     private function countsAsReply(array $payload): bool
     {
         return $this->core->sensoryCortex()->senseAccepts('heard_speech', $payload);
@@ -421,10 +315,7 @@ final class SocialFeedback
 
     private function presenceAt(int $at): ?int
     {
-        foreach (SenseReading::getAllByWhere(
-            ['source_key' => 'desktop_presence'],
-            ['order' => ['id' => 'DESC'], 'limit' => 20]
-        ) as $reading) {
+        foreach (SenseReading::getAllByWhere(['source_key' => 'desktop_presence'], ['order' => ['id' => 'DESC'], 'limit' => 20]) as $reading) {
             $observed = $this->timestamp($reading->observed_at);
             if ($observed !== null && $observed <= $at) {
                 $payload = is_array($reading->payload) ? $reading->payload : [];

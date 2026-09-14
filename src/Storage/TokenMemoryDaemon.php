@@ -6,7 +6,7 @@ namespace NaviBrain\Storage;
 
 use RuntimeException;
 
-final class TokenMemoryDaemon
+class TokenMemoryDaemon
 {
     public const DEFAULT_CONTEXT_TOKENS = 1024;
     public const MAX_CONTEXT_TOKENS = 67_108_864;
@@ -19,28 +19,16 @@ final class TokenMemoryDaemon
 
     private static bool $ready = false;
 
-    /**
-     * Let the resident token graph select and decode the traces activated by
-     * the current intention. The daemon, not PHP, owns ranking and packing.
-     */
-    public static function activate(
-        string $cue,
-        int $tokenBudget = self::DEFAULT_CONTEXT_TOKENS
-    ): string {
+    public static function activate(string $cue, int $tokenBudget = self::DEFAULT_CONTEXT_TOKENS): string {
         if (trim($cue) === '' || strlen($cue) > self::MAX_RESPONSE_BYTES) {
             throw new RuntimeException('Token-memory activation cue is out of range.');
         }
         if ($tokenBudget < 1 || $tokenBudget > self::MAX_CONTEXT_TOKENS) {
             throw new RuntimeException('Token-memory activation budget is out of range.');
         }
-        return self::request(sprintf(
-            "ACTIVATE %d %d\n",
-            $tokenBudget,
-            strlen($cue)
-        ), $cue);
+        return self::request(sprintf( "ACTIVATE %d %d\n", $tokenBudget, strlen($cue) ), $cue);
     }
 
-    /** Persist every learned token, association, and memory-access mutation. */
     public static function flush(): void
     {
         if (self::request("FLUSH\n") !== '') {
@@ -78,8 +66,9 @@ final class TokenMemoryDaemon
         return hash('sha256', $scope . "\0" . $identity);
     }
 
-    /** @param array<string, mixed> $record
-     *  @return array<string, mixed>
+    /**
+     * @param array<string, mixed> $record
+     * @return array<string, mixed>
      */
     public static function create(array $record, string $operationKey): array
     {
@@ -87,12 +76,7 @@ final class TokenMemoryDaemon
         $metadata = self::encodeMetadata($record);
         $content = (string) ($record['content'] ?? '');
         self::validateOperationKey($operationKey);
-        $payload = self::receiptRequest(sprintf(
-            "CREATE %s %d %d\n",
-            $operationKey,
-            strlen($metadata),
-            strlen($content)
-        ), $metadata . $content);
+        $payload = self::receiptRequest(sprintf( "CREATE %s %d %d\n", $operationKey, strlen($metadata), strlen($content) ), $metadata . $content);
         $records = self::decodeRecords($payload);
         if (count($records) !== 1) {
             throw new RuntimeException('Token-memory daemon returned an invalid create receipt.');
@@ -100,20 +84,16 @@ final class TokenMemoryDaemon
         return $records[0];
     }
 
-    /** @param array<string, mixed> $record
-     *  @return array<string, mixed>
+    /**
+     * @param array<string, mixed> $record
+     * @return array<string, mixed>
      */
     public static function update(array $record, string $operationKey): array
     {
         $metadata = self::encodeMetadata($record);
         $content = (string) ($record['content'] ?? '');
         self::validateOperationKey($operationKey);
-        $payload = self::receiptRequest(sprintf(
-            "UPDATE %s %d %d\n",
-            $operationKey,
-            strlen($metadata),
-            strlen($content)
-        ), $metadata . $content);
+        $payload = self::receiptRequest(sprintf( "UPDATE %s %d %d\n", $operationKey, strlen($metadata), strlen($content) ), $metadata . $content);
         $records = self::decodeRecords($payload);
         if (count($records) !== 1 ||
             (int) $records[0]['id'] !== (int) ($record['id'] ?? 0)) {
@@ -122,27 +102,18 @@ final class TokenMemoryDaemon
         return $records[0];
     }
 
-    /** @param array<string, mixed> $newRecord
-     *  @param array<string, mixed> $oldRecord
-     *  @return array{new: array<string, mixed>, old: array<string, mixed>}
+    /**
+     * @param array<string, mixed> $newRecord
+     * @param array<string, mixed> $oldRecord
+     * @return array{new: array<string, mixed>, old: array<string, mixed>}
      */
-    public static function replace(
-        array $newRecord,
-        array $oldRecord,
-        string $operationKey
-    ): array {
+    public static function replace(array $newRecord, array $oldRecord, string $operationKey): array {
         $newRecord['id'] = 0;
         $newMetadata = self::encodeMetadata($newRecord);
         $oldMetadata = self::encodeMetadata($oldRecord);
         $content = (string) ($newRecord['content'] ?? '');
         self::validateOperationKey($operationKey);
-        $payload = self::receiptRequest(sprintf(
-            "REPLACE %s %d %d %d\n",
-            $operationKey,
-            strlen($newMetadata),
-            strlen($content),
-            strlen($oldMetadata)
-        ), $newMetadata . $content . $oldMetadata);
+        $payload = self::receiptRequest(sprintf( "REPLACE %s %d %d %d\n", $operationKey, strlen($newMetadata), strlen($content), strlen($oldMetadata) ), $newMetadata . $content . $oldMetadata);
         $records = self::decodeRecords($payload);
         if (count($records) !== 2 ||
             (int) $records[1]['id'] !== (int) ($oldRecord['id'] ?? 0)) {
@@ -177,17 +148,11 @@ final class TokenMemoryDaemon
      * @param array<string, mixed> $options
      * @return list<array<string, mixed>>
      */
-    public static function list(
-        array $where = [],
-        array $options = [],
-        bool $counted = true
-    ): array
+    public static function list(array $where = [], array $options = [], bool $counted = true): array
     {
         $unsupported = array_diff(array_keys($where), ['tier', 'status']);
         if ($unsupported !== []) {
-            throw new RuntimeException(
-                'Unsupported token-memory filter(s): ' . implode(', ', $unsupported)
-            );
+            throw new RuntimeException('Unsupported token-memory filter(s): ' . implode(', ', $unsupported));
         }
         $tier = isset($where['tier']) ? self::protocolWord((string) $where['tier']) : '-';
         $status = isset($where['status']) ? self::protocolWord((string) $where['status']) : '-';
@@ -207,56 +172,27 @@ final class TokenMemoryDaemon
             throw new RuntimeException('Token-memory list limit is out of range.');
         }
         $mode = $counted ? 'COUNTED' : 'NEUTRAL';
-        return self::decodeRecords(self::request(
-            sprintf("LIST %s %s %s %s %s %d\n", $mode, $tier, $status, $field, $direction, $limit)
-        ));
+        return self::decodeRecords(self::request( sprintf("LIST %s %s %s %s %s %d\n", $mode, $tier, $status, $field, $direction, $limit) ));
     }
 
-    /**
-     * Bounded ID-ascending traversal for synchronization and migration work.
-     *
-     * @return list<array<string, mixed>>
-     */
-    public static function page(
-        int $afterId,
-        int $limit,
-        ?string $tier = null,
-        ?string $status = null,
-        bool $counted = false
-    ): array {
+    /** @return list<array<string, mixed>> */
+    public static function page(int $afterId, int $limit, ?string $tier = null, ?string $status = null, bool $counted = false): array {
         if ($afterId < 0 || $limit < 1 || $limit > 1000) {
             throw new RuntimeException('Token-memory page bounds are out of range.');
         }
         $tierWord = $tier === null ? '-' : self::protocolWord($tier);
         $statusWord = $status === null ? '-' : self::protocolWord($status);
         $mode = $counted ? 'COUNTED' : 'NEUTRAL';
-        return self::decodeRecords(self::request(sprintf(
-            "PAGE %s %s %s %d %d\n",
-            $mode,
-            $tierWord,
-            $statusWord,
-            $afterId,
-            $limit
-        )));
+        return self::decodeRecords(self::request(sprintf( "PAGE %s %s %s %d %d\n", $mode, $tierWord, $statusWord, $afterId, $limit )));
     }
 
-    /** Counter-neutral resident count, optionally after an exclusive ID cursor. */
-    public static function countRecords(
-        ?string $tier = null,
-        ?string $status = null,
-        int $afterId = 0
-    ): int {
+    public static function countRecords(?string $tier = null, ?string $status = null, int $afterId = 0): int {
         if ($afterId < 0) {
             throw new RuntimeException('Token-memory count cursor is out of range.');
         }
         $tierWord = $tier === null ? '-' : self::protocolWord($tier);
         $statusWord = $status === null ? '-' : self::protocolWord($status);
-        $payload = self::request(sprintf(
-            "COUNT %s %s %d\n",
-            $tierWord,
-            $statusWord,
-            $afterId
-        ));
+        $payload = self::request(sprintf( "COUNT %s %s %d\n", $tierWord, $statusWord, $afterId ));
         if (preg_match('/\A(0|[1-9][0-9]*)\n\z/', $payload, $matches) !== 1) {
             throw new RuntimeException('Token-memory daemon returned an invalid count.');
         }
@@ -268,29 +204,16 @@ final class TokenMemoryDaemon
     }
 
     /** @return array<string, mixed>|null */
-    public static function provenance(
-        string $kind,
-        int $sourceId,
-        ?string $tier = null,
-        ?string $status = null
-    ): ?array {
+    public static function provenance(string $kind, int $sourceId, ?string $tier = null, ?string $status = null): ?array {
         $kind = strtoupper($kind);
         if (!in_array($kind, ['MEMORY', 'EVENT', 'SENSE_EVENT'], true) || $sourceId < 1) {
             throw new RuntimeException('Token-memory provenance bounds are invalid.');
         }
         $tierWord = $tier === null ? '-' : self::protocolWord($tier);
         $statusWord = $status === null ? '-' : self::protocolWord($status);
-        // Event namespaces require the explicit extension command. An older
-        // daemon must reject it instead of silently applying untyped matching.
+
         $command = $kind === 'MEMORY' ? 'PROVENANCE' : 'PROVENANCE_TYPED';
-        $payload = self::request(sprintf(
-            "%s %s %d %s %s\n",
-            $command,
-            $kind,
-            $sourceId,
-            $tierWord,
-            $statusWord
-        ));
+        $payload = self::request(sprintf( "%s %s %d %s %s\n", $command, $kind, $sourceId, $tierWord, $statusWord ));
         $records = self::decodeRecords($payload);
         if ($records === []) {
             return null;
@@ -310,8 +233,9 @@ final class TokenMemoryDaemon
         return $records[0];
     }
 
-    /** @param list<int> $ids
-     *  @return list<array<string, mixed>>
+    /**
+     * @param list<int> $ids
+     * @return list<array<string, mixed>>
      */
     public static function batch(array $ids, bool $counted): array
     {
@@ -320,12 +244,7 @@ final class TokenMemoryDaemon
             return [];
         }
         $mode = $counted ? 'COUNTED' : 'NEUTRAL';
-        return self::decodeRecords(self::request(sprintf(
-            "BATCH %s %d %d\n",
-            $mode,
-            count($ids),
-            strlen($body)
-        ), $body));
+        return self::decodeRecords(self::request(sprintf( "BATCH %s %d %d\n", $mode, count($ids), strlen($body) ), $body));
     }
 
     /** @param list<int> $ids */
@@ -335,11 +254,7 @@ final class TokenMemoryDaemon
         if ($body === '') {
             return;
         }
-        $payload = self::request(sprintf(
-            "OBSERVE %d %d\n",
-            count($ids),
-            strlen($body)
-        ), $body);
+        $payload = self::request(sprintf( "OBSERVE %d %d\n", count($ids), strlen($body) ), $body);
         if ($payload !== count($ids) . "\n") {
             throw new RuntimeException('Token-memory daemon returned an invalid observe receipt.');
         }
@@ -351,18 +266,11 @@ final class TokenMemoryDaemon
         if ($limit < 1 || $limit > 1000) {
             throw new RuntimeException('Token-memory recall limit is out of range.');
         }
-        $records = self::decodeRecords(self::request(sprintf(
-            "RECALL_RECORDS %d %d\n",
-            $limit,
-            strlen($cue)
-        ), $cue));
+        $records = self::decodeRecords(self::request(sprintf( "RECALL_RECORDS %d %d\n", $limit, strlen($cue) ), $cue));
         return self::sortRecallByKeywordCoverage($records, $cue);
     }
 
     /**
-     * Prefer memories covering more distinct cue keywords. The daemon's
-     * learned rank remains the deterministic tie-breaker.
-     *
      * @param list<array<string, mixed>> $records
      * @return list<array<string, mixed>>
      */
@@ -374,22 +282,14 @@ final class TokenMemoryDaemon
             return $records;
         }
 
-        usort($keywords, static fn (string $left, string $right): int =>
-            mb_strlen($right) <=> mb_strlen($left)
-        );
-        $pattern = '~(?<![\p{L}\p{N}])(' . implode('|', array_map(
-            static fn (string $keyword): string => preg_quote($keyword, '~'),
-            $keywords
-        )) . ')(?![\p{L}\p{N}])~iu';
+        usort($keywords, static fn (string $left, string $right): int => mb_strlen($right) <=> mb_strlen($left));
+        $pattern = '~(?<![\p{L}\p{N}])(' . implode('|', array_map( static fn (string $keyword): string => preg_quote($keyword, '~'), $keywords )) . ')(?![\p{L}\p{N}])~iu';
 
         $ranked = [];
         foreach ($records as $index => $record) {
             $hits = [];
             preg_match_all($pattern, (string) ($record['content'] ?? ''), $hits);
-            $matched = array_values(array_unique(array_map(
-                static fn (string $keyword): string => mb_strtolower($keyword),
-                $hits[1] ?? []
-            )));
+            $matched = array_values(array_unique(array_map( static fn (string $keyword): string => mb_strtolower($keyword), $hits[1] ?? [] )));
             $ranked[] = [
                 'record' => $record,
                 'coverage' => count($matched),
@@ -406,30 +306,14 @@ final class TokenMemoryDaemon
         return array_column($ranked, 'record');
     }
 
-    /**
-     * Rank a bounded candidate set without counting candidate reads. The daemon
-     * still learns cue usage; callers explicitly observe only accepted records.
-     *
-     * @return list<array<string, mixed>>
-     */
-    public static function rank(
-        string $cue,
-        int $limit,
-        ?string $tier = null,
-        ?string $status = null
-    ): array {
+    /** @return list<array<string, mixed>> */
+    public static function rank(string $cue, int $limit, ?string $tier = null, ?string $status = null): array {
         if ($limit < 1 || $limit > 100) {
             throw new RuntimeException('Token-memory rank limit is out of range.');
         }
         $tierWord = $tier === null ? '-' : self::protocolWord($tier);
         $statusWord = $status === null ? '-' : self::protocolWord($status);
-        return self::decodeRecords(self::request(sprintf(
-            "RANK_RECORDS %s %s %d %d\n",
-            $tierWord,
-            $statusWord,
-            $limit,
-            strlen($cue)
-        ), $cue));
+        return self::decodeRecords(self::request(sprintf( "RANK_RECORDS %s %s %d %d\n", $tierWord, $statusWord, $limit, strlen($cue) ), $cue));
     }
 
     private static function storePath(string $projectRoot): string
@@ -478,9 +362,7 @@ final class TokenMemoryDaemon
                         return;
                     }
                     if (microtime(true) >= $deadline) {
-                        throw new RuntimeException(
-                            'The token-memory store is locked but its daemon is not responding.'
-                        );
+                        throw new RuntimeException('The token-memory store is locked but its daemon is not responding.');
                     }
                     usleep(50_000);
                 }
@@ -494,9 +376,7 @@ final class TokenMemoryDaemon
             self::spawn($projectRoot, $binaryPath, $storePath, $socketPath);
             while (!self::probe($socketPath)) {
                 if (microtime(true) >= $deadline) {
-                    throw new RuntimeException(
-                        'Token-memory daemon did not become ready; inspect var/token-memory-daemon.log.'
-                    );
+                    throw new RuntimeException('Token-memory daemon did not become ready; inspect var/token-memory-daemon.log.');
                 }
                 usleep(50_000);
             }
@@ -534,12 +414,7 @@ final class TokenMemoryDaemon
         }
     }
 
-    private static function spawn(
-        string $projectRoot,
-        string $binaryPath,
-        string $storePath,
-        string $socketPath
-    ): void {
+    private static function spawn(string $projectRoot, string $binaryPath, string $storePath, string $socketPath): void {
         $logPath = $projectRoot . '/var/token-memory-daemon.log';
         $process = @proc_open(
             ['/usr/bin/setsid', '--fork', $binaryPath, 'daemon', $storePath, $socketPath],
@@ -606,9 +481,7 @@ final class TokenMemoryDaemon
             try {
                 [$ok, $payload] = self::exchange($header, $body);
                 if (!$ok) {
-                    throw new RuntimeException(
-                        'Token-memory daemon rejected receipt request: ' . trim($payload)
-                    );
+                    throw new RuntimeException('Token-memory daemon rejected receipt request: ' . trim($payload));
                 }
                 return $payload;
             } catch (RuntimeException $exception) {
@@ -658,21 +531,10 @@ final class TokenMemoryDaemon
     }
 
     /** @return resource|false */
-    private static function connect(
-        string $socketPath,
-        ?string &$errorMessage,
-        float $timeout = self::IO_TIMEOUT_SECONDS
-    )
+    private static function connect(string $socketPath, ?string &$errorMessage, float $timeout = self::IO_TIMEOUT_SECONDS)
     {
-        $socket = @stream_socket_client(
-            'unix://' . $socketPath,
-            $errorNumber,
-            $errorMessage,
-            $timeout,
-            STREAM_CLIENT_CONNECT
-        );
-        // EPERM/EACCES describe this caller's access, not daemon liveness.
-        // Never wait on the store lock or try spawning a replacement for them.
+        $socket = @stream_socket_client('unix://' . $socketPath, $errorNumber, $errorMessage, $timeout, STREAM_CLIENT_CONNECT);
+
         if (!is_resource($socket) && in_array($errorNumber, [1, 13], true)) {
             throw new RuntimeException(
                 'Token-memory socket access denied: ' . $errorMessage
@@ -738,7 +600,7 @@ final class TokenMemoryDaemon
             }
             $lines[] = $sourceKind;
         }
-        // Unannotated records retain their original bytes and operation digests.
+
         return implode("\n", $lines) . "\n";
     }
 

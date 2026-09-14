@@ -6,7 +6,7 @@ namespace NaviBrain\Storage;
 
 use RuntimeException;
 
-final class StatePermissions
+class StatePermissions
 {
     public static function prepareDatabaseDirectory(string $databasePath, string $projectRoot): void
     {
@@ -14,36 +14,24 @@ final class StatePermissions
         $created = false;
         if (!is_dir($directory)) {
             if (!mkdir($directory, 0700, true) && !is_dir($directory)) {
-                throw new RuntimeException(sprintf(
-                    'Unable to create database directory: %s',
-                    $directory
-                ));
+                throw new RuntimeException(sprintf( 'Unable to create database directory: %s', $directory ));
             }
             $created = true;
         }
 
         $permissions = fileperms($directory);
         if ($permissions === false) {
-            throw new RuntimeException(sprintf(
-                'Unable to inspect database directory permissions: %s',
-                $directory
-            ));
+            throw new RuntimeException(sprintf( 'Unable to inspect database directory permissions: %s', $directory ));
         }
         if (($permissions & 0077) === 0) {
             return;
         }
 
         if (!$created && !self::mayHardenExistingDirectory($directory, $projectRoot)) {
-            throw new RuntimeException(sprintf(
-                'Database directory must be private (0700): %s',
-                $directory
-            ));
+            throw new RuntimeException(sprintf( 'Database directory must be private (0700): %s', $directory ));
         }
         if (!chmod($directory, 0700)) {
-            throw new RuntimeException(sprintf(
-                'Unable to harden database directory permissions: %s',
-                $directory
-            ));
+            throw new RuntimeException(sprintf( 'Unable to harden database directory permissions: %s', $directory ));
         }
     }
 
@@ -51,10 +39,7 @@ final class StatePermissions
     {
         foreach ([$databasePath, $databasePath . '-wal', $databasePath . '-shm'] as $path) {
             if (is_file($path) && !chmod($path, 0600)) {
-                throw new RuntimeException(sprintf(
-                    'Unable to harden database file permissions: %s',
-                    $path
-                ));
+                throw new RuntimeException(sprintf( 'Unable to harden database file permissions: %s', $path ));
             }
         }
     }

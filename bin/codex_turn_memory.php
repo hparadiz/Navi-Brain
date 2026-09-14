@@ -58,10 +58,7 @@ function captureTurn(array $payload): void
     if (!is_array($messages)) {
         $messages = [$messages];
     }
-    $userText = implode("\n\n", array_values(array_filter(array_map(
-        static fn (mixed $message): string => is_scalar($message) ? trim((string) $message) : '',
-        $messages
-    ), static fn (string $message): bool => $message !== '')));
+    $userText = implode("\n\n", array_values(array_filter(array_map( static fn (mixed $message): string => is_scalar($message) ? trim((string) $message) : '', $messages ), static fn (string $message): bool => $message !== '')));
     $assistantText = is_scalar($payload['last-assistant-message'] ?? null)
         ? trim((string) $payload['last-assistant-message'])
         : '';
@@ -69,10 +66,7 @@ function captureTurn(array $payload): void
     $path = statePath($sessionId);
     withStateLock($path, function () use ($path, $sessionId, $turnId, $cwd, $userText, $assistantText): void {
         $state = loadState($path) ?? newState($sessionId, $cwd);
-        $seen = array_values(array_filter(
-            is_array($state['seen_turn_ids'] ?? null) ? $state['seen_turn_ids'] : [],
-            'is_string'
-        ));
+        $seen = array_values(array_filter( is_array($state['seen_turn_ids'] ?? null) ? $state['seen_turn_ids'] : [], 'is_string' ));
         $known = in_array($turnId, $seen, true);
 
         if (!$known) {
@@ -177,27 +171,25 @@ function printHelp(): void
 function storeEpisode(array $state, bool $final): int
 {
     $previous = is_int($state['memory_id'] ?? null) ? $state['memory_id'] : null;
-    $result = brain()->addMemory(
-        tier: 'episodic',
-        content: episodeFromState($state, $final),
-        confidence: 0.97,
-        supersedesId: $previous
-    );
-    $id = $result['memory']['id'] ?? null;
-    if (!is_int($id)) {
-        throw new RuntimeException('Navi-Brain did not return an episodic memory id.');
-    }
+    brain();
+    $content = episodeFromState($state, $final);
+    $memory = new NaviBrain\Model\Memory([
+        'tier' => 'episodic', 'content' => $content, 'confidence' => 0.97, 'supersedes_id' => $previous,
+        'operation_key' => NaviBrain\Storage\TokenMemoryDaemon::operationKey('codex-session-episode', hash('sha256', $content) . ':' . ($previous ?? 0)),
+    ], true, true);
+    $memory->save();
+    $id = (int) $memory->id;
     return $id;
 }
 
-function brain(): NaviBrain\Core\ExecutiveCore
+function brain(): NaviBrain\Core\ExecutiveCore\Executive
 {
     static $core = null;
-    if ($core instanceof NaviBrain\Core\ExecutiveCore) {
+    if ($core instanceof NaviBrain\Core\ExecutiveCore\Executive) {
         return $core;
     }
     require dirname(__DIR__) . '/bootstrap/app.php';
-    $core = new NaviBrain\Core\ExecutiveCore();
+    $core = new NaviBrain\Core\ExecutiveCore\Executive();
     $core->initialize();
     return $core;
 }
@@ -321,10 +313,7 @@ function saveState(string $path, array $state): void
 {
     ensureStateDir();
     $temporary = $path . '.tmp.' . getmypid();
-    $json = json_encode(
-        $state,
-        JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-    ) . PHP_EOL;
+    $json = json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . PHP_EOL;
     if (file_put_contents($temporary, $json, LOCK_EX) === false) {
         throw new RuntimeException('Unable to write session-memory state.');
     }
@@ -401,21 +390,9 @@ function normalizedCwd(string $cwd): string
 
 function sanitizeText(string $text, int $limit): string
 {
-    $text = preg_replace(
-        '/-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----/is',
-        '[REDACTED PRIVATE KEY]',
-        $text
-    ) ?? $text;
-    $text = preg_replace(
-        '/\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16})\b/',
-        '[REDACTED TOKEN]',
-        $text
-    ) ?? $text;
-    $text = preg_replace(
-        '/\b(password|passwd|api[_ -]?key|access[_ -]?token|token|secret)(\s*[:=]\s*)([^\s,;]+)/i',
-        '$1$2[REDACTED]',
-        $text
-    ) ?? $text;
+    $text = preg_replace('/-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----/is', '[REDACTED PRIVATE KEY]', $text) ?? $text;
+    $text = preg_replace('/\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16})\b/', '[REDACTED TOKEN]', $text) ?? $text;
+    $text = preg_replace('/\b(password|passwd|api[_ -]?key|access[_ -]?token|token|secret)(\s*[:=]\s*)([^\s,;]+)/i', '$1$2[REDACTED]', $text) ?? $text;
     $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', ' ', $text) ?? $text;
     $text = preg_replace('/[ \t]+/u', ' ', trim($text)) ?? trim($text);
     $text = preg_replace('/ *\R */u', "\n", $text) ?? $text;
@@ -450,6 +427,6 @@ function recordError(string $message): void
         file_put_contents($path, gmdate('c') . ' ' . sanitizeText($message, 2000) . PHP_EOL, FILE_APPEND | LOCK_EX);
         chmod($path, 0600);
     } catch (Throwable) {
-        // The original error is already sent to stderr.
+
     }
 }

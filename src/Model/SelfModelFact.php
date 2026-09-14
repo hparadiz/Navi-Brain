@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class SelfModelFact extends ActiveRecord
+class SelfModelFact extends ActiveRecord
 {
-    use Getters;
-
     private const MODEL_CONTEXT_PRIVATE_PREFIXES = [
         'appearance.',
     ];

@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class ModelEndpoint extends ActiveRecord
+class ModelEndpoint extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'model_endpoints';
     public static $primaryKey = 'id';
 

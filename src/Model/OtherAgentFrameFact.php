@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** A durable, corrigible proposition about the one authorized other agent. */
-final class OtherAgentFrameFact extends ActiveRecord
+class OtherAgentFrameFact extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'other_agent_frame_facts';
     public static $primaryKey = 'id';
 

@@ -7,20 +7,12 @@ namespace NaviBrain\Core;
 use NaviBrain\Model\Event;
 use RuntimeException;
 
-/**
- * Read the explicit operator pause independently of informational interrupts.
- * Admission callers read this inside their SQLite claim transaction; a status
- * read alone does not cancel work or stop an already admitted external effect.
- */
-final class ExecutiveControl
+class ExecutiveControl
 {
     /** @return array{paused: bool, event_id: int, reason: string, pause_event_id: ?int} */
     public static function status(): array
     {
-        $event = Event::getByWhere(
-            ["kind IN ('executive.control.paused', 'executive.control.resumed')"],
-            ['order' => ['id' => 'DESC']]
-        );
+        $event = Event::getByWhere(["kind IN ('executive.control.paused', 'executive.control.resumed')"], ['order' => ['id' => 'DESC']]);
         if (!$event instanceof Event) {
             return ['paused' => false, 'event_id' => 0, 'reason' => '', 'pause_event_id' => null];
         }

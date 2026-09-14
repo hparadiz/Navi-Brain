@@ -4,18 +4,21 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Model\WorkItem;
+
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use JsonException;
 use NaviBrain\Perception\SocialFeedback;
 use NaviBrain\Support\PlainText;
 use RuntimeException;
 
-final class FreeModelWorker
+class FreeModelWorker
 {
     private const MAX_OUTPUT_BYTES = 1048576;
     private const MODEL_REFRESH_SECONDS = 3600;
     private const MAX_MODELS_PER_WORK = 1;
-    // Keep the fence alive through the largest existing work budget instead
-    // of requeueing it underneath the still-running legacy CLI worker.
+
     private const WORK_LEASE_SECONDS = 1200;
 
     private string $projectRoot;
@@ -23,7 +26,7 @@ final class FreeModelWorker
     private string $opencodeBinary;
     private int $lastDiscoveryAttemptAt = 0;
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
         $this->projectRoot = dirname(__DIR__, 2);
         $this->runtimeRoot = $this->projectRoot . '/var/opencode-worker';
@@ -34,11 +37,7 @@ final class FreeModelWorker
     }
 
     /** @return array<string, mixed> */
-    public function runOnce(
-        string $owner,
-        array $includedWorkTypes = [],
-        array $allowedModels = []
-    ): array
+    public function runOnce(string $owner, array $includedWorkTypes = [], array $allowedModels = []): array
     {
         foreach ($allowedModels as $model) {
             if (!is_string($model) || preg_match('~\Aopencode/[a-z0-9][a-z0-9._-]*-free\z~', $model) !== 1) {
@@ -64,12 +63,7 @@ final class FreeModelWorker
         }
     }
 
-    private function runAvailable(
-        string $owner,
-        array $includedWorkTypes,
-        array $allowedModels,
-        OpenCodeQuota $quota
-    ): array {
+    private function runAvailable(string $owner, array $includedWorkTypes, array $allowedModels, OpenCodeQuota $quota): array {
         try {
             $this->refreshModelsWhenDue();
         } catch (\Throwable $throwable) {
@@ -83,12 +77,9 @@ final class FreeModelWorker
         if ($models === []) {
             return ['status' => 'model_pool_unavailable'];
         }
-        $claimed = $this->core->claimWork(
-            $owner,
-            self::WORK_LEASE_SECONDS,
-            [],
-            $includedWorkTypes
-        );
+        $claim = new WorkClaim($owner, self::WORK_LEASE_SECONDS);
+        $claim->includedWorkTypes = $includedWorkTypes;
+        $claimed = $this->core->claimWork($claim);
         if ($claimed === null) {
             return ['status' => 'idle'];
         }
@@ -108,32 +99,17 @@ final class FreeModelWorker
             try {
                 $invocation = $this->invokeModel($work, $modelId, $attemptWall);
                 $latency = (int) round((hrtime(true) - $started) / 1_000_000);
-                $finished = $this->finishWorkWithRetry(
-                    workId: (int) $work['id'],
-                    owner: $owner,
-                    fencingToken: (int) $work['fencing_token'],
-                    succeeded: true,
-                    result: $invocation['proposal'],
-                    model: $modelId
-                );
+                $finished = $this->finishWorkWithRetry(WorkCompletion::success(new WorkItem($work), $invocation['proposal'], $modelId));
                 $this->recordModelResultBestEffort($modelId, true, $latency);
                 try {
                     $quota->succeeded();
                 } catch (\Throwable) {
-                    // Failure to clear an expired brake is conservative; it
-                    // must not replay or fail already-committed work.
+
                 }
                 try {
-                    $integration = $this->core->integrateWorkerResult(
-                        $work,
-                        $invocation['proposal'],
-                        $modelId
-                    );
+                    $integration = $this->core->integrateWorkerResult($work, $invocation['proposal'], $modelId);
                 } catch (\Throwable $throwable) {
-                    $integration = $this->core->handleWorkerFailure(
-                        $work,
-                        'Worker completed, but thread integration failed: ' . $throwable->getMessage()
-                    );
+                    $integration = $this->core->handleWorkerFailure($work, 'Worker completed, but thread integration failed: ' . $throwable->getMessage());
                 }
                 if (isset($invocation['session_id'])) {
                     $this->deleteSession((string) $invocation['session_id']);
@@ -146,35 +122,21 @@ final class FreeModelWorker
                     'integration' => $integration,
                 ];
             } catch (ModelRateLimit $limited) {
-                // All local OpenCode lanes share this brake. Do not try a
-                // second model or reject the source evidence because of 429.
+
                 $retryAt = $quota->rateLimited($limited->retryAt);
                 $this->core->deferWork((int) $work['id'], $owner, (int) $work['fencing_token'], $retryAt);
                 return ['status' => 'provider_cooling_down', 'retry_at' => $retryAt, 'work_id' => $work['id']];
             } catch (\Throwable $throwable) {
                 $latency = (int) round((hrtime(true) - $started) / 1_000_000);
                 $errors[$modelId] = $throwable->getMessage();
-                $this->recordModelResultBestEffort(
-                    $modelId,
-                    false,
-                    $latency,
-                    $throwable->getMessage()
-                );
+                $this->recordModelResultBestEffort($modelId, false, $latency, $throwable->getMessage());
             }
         }
 
         $message = $errors === []
             ? 'No discovered free model was outside its circuit-breaker cooldown.'
             : 'Every selectable free model failed: ' . PlainText::inline($errors, 3000);
-        $failed = $this->finishWorkWithRetry(
-            workId: (int) $work['id'],
-            owner: $owner,
-            fencingToken: (int) $work['fencing_token'],
-            succeeded: false,
-            result: [],
-            model: null,
-            error: $message
-        );
+        $failed = $this->finishWorkWithRetry(WorkCompletion::failure(new WorkItem($work), $message, null));
         $integration = $this->core->handleWorkerFailure($work, $message);
         return [
             'status' => 'failed',
@@ -185,26 +147,11 @@ final class FreeModelWorker
     }
 
     /** @return array<string, mixed> */
-    private function finishWorkWithRetry(
-        int $workId,
-        string $owner,
-        int $fencingToken,
-        bool $succeeded,
-        array $result,
-        ?string $model,
-        ?string $error = null
-    ): array {
+    private function finishWorkWithRetry(WorkCompletion $completion): array
+    {
         for ($attempt = 0; ; $attempt++) {
             try {
-                return $this->core->finishWork(
-                    workId: $workId,
-                    owner: $owner,
-                    fencingToken: $fencingToken,
-                    succeeded: $succeeded,
-                    result: $result,
-                    model: $model,
-                    error: $error
-                );
+                return $this->core->finishWork($completion);
             } catch (\Throwable $throwable) {
                 if ($attempt >= 3
                     || !str_contains(strtolower($throwable->getMessage()), 'database is locked')
@@ -216,16 +163,11 @@ final class FreeModelWorker
         }
     }
 
-    private function recordModelResultBestEffort(
-        string $modelId,
-        bool $succeeded,
-        int $latencyMs,
-        ?string $error = null
-    ): void {
+    private function recordModelResultBestEffort(string $modelId, bool $succeeded, int $latencyMs, ?string $error = null): void {
         try {
             $this->core->recordModelResult($modelId, $succeeded, $latencyMs, $error);
         } catch (\Throwable) {
-            // Telemetry must never strand fenced work after inference returns.
+
         }
     }
 
@@ -233,18 +175,11 @@ final class FreeModelWorker
     public function discoverModels(): array
     {
         $this->ensureRuntimeDirectories();
-        $result = $this->runProcess(
-            ['/usr/bin/timeout', '--signal=TERM', '--kill-after=5s', '60s', $this->opencodeBinary, 'models', 'opencode', '--refresh'],
-            '',
-            70
-        );
+        $result = $this->runProcess(['/usr/bin/timeout', '--signal=TERM', '--kill-after=5s', '60s', $this->opencodeBinary, 'models', 'opencode', '--refresh'], '', 70);
         if ($result['exit_code'] !== 0) {
             throw new RuntimeException('OpenCode model discovery failed: ' . trim($result['output']));
         }
-        $models = array_values(array_filter(array_map(
-            'trim',
-            preg_split('/\R/u', $result['output']) ?: []
-        ), static fn (string $model): bool => preg_match('~\Aopencode/[a-z0-9][a-z0-9._-]*-free\z~', $model) === 1));
+        $models = array_values(array_filter(array_map( 'trim', preg_split('/\R/u', $result['output']) ?: [] ), static fn (string $model): bool => preg_match('~\Aopencode/[a-z0-9][a-z0-9._-]*-free\z~', $model) === 1));
         $this->core->syncFreeModels($models);
         return $models;
     }
@@ -272,10 +207,10 @@ final class FreeModelWorker
         }
     }
 
-    /** @param array<string, mixed> $work
-     *  @return array{proposal: array<string, mixed>, session_id?: string}
+    /**
+     * @return array{proposal: array<string, mixed>, session_id?: string}
      */
-    /** Caller owns the dream lease and quota. Source bytes are passed unchanged. */
+
     public function completeDreamPrompt(string $prompt, int $tokenBudget): array
     {
         if (trim($prompt) === '' || strlen($prompt) > OpenCodeDreamClient::MAX_PROMPT_BYTES
@@ -331,7 +266,7 @@ final class FreeModelWorker
             throw new ModelProposalRejected('Dream invocation exceeded the requested output budget.');
         }
         try {
-            $invocation = $this->parseWorkerStream($result['output'], ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE);
+            $invocation = $this->parseWorkerStream($result['output'], Executive::MEMORY_CONSOLIDATION_WORK_TYPE);
         } catch (RuntimeException) {
             throw new ModelProposalRejected('Dream invocation did not return a stopped JSON proposal.');
         }
@@ -372,15 +307,10 @@ final class FreeModelWorker
             '--title',
             $title,
         ], $prompt, $wall + 15);
-        // Error events can be emitted with either exit status. Inspect them
-        // before a generic exit-code error discards status and Retry-After.
+
         $this->checkStreamErrors($result['output']);
         if ($result['exit_code'] !== 0) {
-            throw new RuntimeException(sprintf(
-                'OpenCode worker exited %d: %s',
-                $result['exit_code'],
-                trim($result['output'])
-            ));
+            throw new RuntimeException(sprintf( 'OpenCode worker exited %d: %s', $result['exit_code'], trim($result['output']) ));
         }
         return $this->parseWorkerStream($result['output'], (string) $work['work_type']);
     }
@@ -428,7 +358,7 @@ final class FreeModelWorker
                 'challenged_assumption' => 'the assumption in the current belief this step questions',
             ];
         }
-        if ($workType === ExecutiveCore::SELF_PRESENCE_ANSWER_WORK_TYPE) {
+        if ($workType === Executive::SELF_PRESENCE_ANSWER_WORK_TYPE) {
             return [
                 'kind' => 'self_presence_utterance',
                 'content' => '3 to 36 spoken words that directly answer the addressed speech in the prompt',
@@ -436,7 +366,7 @@ final class FreeModelWorker
                 'challenged_assumption' => 'the assumption the answer most depends on',
             ];
         }
-        if ($workType === ExecutiveCore::SELF_PRESENCE_SPEECH_WORK_TYPE) {
+        if ($workType === Executive::SELF_PRESENCE_SPEECH_WORK_TYPE) {
             return [
                 'kind' => 'one of: self_presence_utterance, remain_silent',
                 'content' => '3 to 35 spoken words for an utterance, or a short reason for silence',
@@ -444,7 +374,7 @@ final class FreeModelWorker
                 'challenged_assumption' => 'whether speaking or silence is better at this wake',
             ];
         }
-        if ($workType === ExecutiveCore::MEMORY_CONSOLIDATION_WORK_TYPE) {
+        if ($workType === Executive::MEMORY_CONSOLIDATION_WORK_TYPE) {
             return [
                 'kind' => 'memory_consolidation',
                 'content' => 'the grounded durable claim itself, or an empty string when rejecting the whole batch',
@@ -489,7 +419,7 @@ final class FreeModelWorker
             if (($data['statusCode'] ?? null) === 429) {
                 throw new ModelRateLimit(is_array($data['responseHeaders'] ?? null) ? $data['responseHeaders'] : []);
             }
-            // Do not copy response bodies/headers, which can contain credentials.
+
             throw new RuntimeException(sprintf('OpenCode %s (HTTP %s): %s',
                 (string) ($event['error']['name'] ?? 'error'),
                 (string) ($data['statusCode'] ?? 'unknown'),
@@ -561,9 +491,6 @@ final class FreeModelWorker
             }
         }
 
-        // Narrative models commonly wrap an otherwise valid transport object
-        // in a code fence or one sentence of chatter. Unwrap that only for
-        // this derived-output lane; every action-bearing worker stays exact.
         $candidates = [];
         if (preg_match('/```(?:json)?\s*(\{.*\})\s*```/isu', $trimmed, $match) === 1) {
             $candidates[] = $match[1];
@@ -634,12 +561,9 @@ final class FreeModelWorker
     private function deleteSession(string $sessionId): void
     {
         try {
-            $this->runProcess([
-                '/usr/bin/timeout', '--signal=TERM', '--kill-after=2s', '15s',
-                $this->opencodeBinary, 'session', 'delete', $sessionId,
-            ], '', 20);
+            $this->runProcess([ '/usr/bin/timeout', '--signal=TERM', '--kill-after=2s', '15s', $this->opencodeBinary, 'session', 'delete', $sessionId, ], '', 20);
         } catch (\Throwable) {
-            // Session cleanup is best-effort; the durable work result is already committed.
+
         }
     }
 
@@ -655,8 +579,9 @@ final class FreeModelWorker
         }
     }
 
-    /** @param list<string> $command
-     *  @return array{exit_code: int, output: string}
+    /**
+     * @param list<string> $command
+     * @return array{exit_code: int, output: string}
      */
     private function runProcess(array $command, string $stdin, int $hardLimitSeconds, array $environmentOverrides = []): array
     {
@@ -672,11 +597,7 @@ final class FreeModelWorker
             'NO_COLOR' => '1',
         ], $environmentOverrides);
         $pipes = [];
-        $process = proc_open($command, [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ], $pipes, $this->projectRoot, $environment);
+        $process = proc_open($command, [ 0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'], ], $pipes, $this->projectRoot, $environment);
         if (!is_resource($process)) {
             throw new RuntimeException('Unable to start OpenCode worker process.');
         }

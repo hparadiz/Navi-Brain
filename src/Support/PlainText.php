@@ -4,13 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Support;
 
-/**
- * Deterministic, delimiter-free text for prompts and normal command output.
- *
- * Arrays remain the internal source of truth. This renderer is the boundary
- * that prevents their wire/storage notation from leaking into model context.
- */
-final class PlainText
+class PlainText
 {
     /** @var array<string, int> */
     private const KEY_PRIORITY = [
@@ -46,11 +40,7 @@ final class PlainText
         'id' => 290,
     ];
 
-    public static function render(
-        mixed $value,
-        int $maxCharacters = 12000,
-        int $listLimit = 8
-    ): string {
+    public static function render(mixed $value, int $maxCharacters = 12000, int $listLimit = 8): string {
         $lines = [];
         self::append($value, $lines, 0, null, max(1, $listLimit));
         $text = trim(self::sanitize(implode("\n", $lines)));
@@ -71,11 +61,7 @@ final class PlainText
 
     public static function inline(mixed $value, int $maxCharacters = 2400): string
     {
-        return trim((string) preg_replace(
-            '/\s*\R\s*/u',
-            '; ',
-            self::render($value, $maxCharacters, 16)
-        ));
+        return trim((string) preg_replace( '/\s*\R\s*/u', '; ', self::render($value, $maxCharacters, 16) ));
     }
 
     public static function sanitize(string $text): string
@@ -88,13 +74,7 @@ final class PlainText
     }
 
     /** @param list<string> $lines */
-    private static function append(
-        mixed $value,
-        array &$lines,
-        int $depth,
-        ?string $label,
-        int $listLimit
-    ): void {
+    private static function append(mixed $value, array &$lines, int $depth, ?string $label, int $listLimit): void {
         $indent = str_repeat('  ', min($depth, 8));
         $label = $label === null ? null : self::label($label);
 
@@ -147,17 +127,14 @@ final class PlainText
         }
     }
 
-    /** @param array<string|int, mixed> $value
-     *  @return array<string|int, mixed>
+    /**
+     * @param array<string|int, mixed> $value
+     * @return array<string|int, mixed>
      */
     private static function ordered(array $value): array
     {
-        // PHP 8 preserves insertion order for equal comparisons. Sorting this
-        // local copy avoids a decorated array per field and a second map.
-        uksort($value, static fn (int|string $left, int|string $right): int =>
-            (self::KEY_PRIORITY[(string) $left] ?? 1000)
-                <=> (self::KEY_PRIORITY[(string) $right] ?? 1000)
-        );
+
+        uksort($value, static fn (int|string $left, int|string $right): int => (self::KEY_PRIORITY[(string) $left] ?? 1000) <=> (self::KEY_PRIORITY[(string) $right] ?? 1000));
         return $value;
     }
 

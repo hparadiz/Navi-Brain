@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** One fully traced pass through the cognitive state machine. */
-final class DecisionCycle extends ActiveRecord
+class DecisionCycle extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'decision_cycles';
     public static $primaryKey = 'id';
 
@@ -65,7 +60,6 @@ final class DecisionCycle extends ActiveRecord
     #[Column(type: 'serialized')]
     protected array $retrieval = [];
 
-    /** Internal reasoning state parsed back into the workspace. */
     #[Column(type: 'serialized')]
     protected array $reasoning = [];
 
@@ -84,7 +78,6 @@ final class DecisionCycle extends ActiveRecord
     #[Column(type: 'serialized')]
     protected array $adaptation = [];
 
-    /** Milliseconds by stage, plus total_ms at completion. */
     #[Column(type: 'serialized')]
     protected array $stage_timings = [];
 

@@ -95,6 +95,12 @@ CATALOG_AUXILIARY_SCHEMA = {
         None,
     ),
 }
+CATALOG_OPERATION_RECEIPT_INDEX = (
+    "index",
+    "operation_receipt_memory_id",
+    "operation_receipt",
+    "CREATE INDEX operation_receipt_memory_id ON operation_receipt(memory_id)",
+)
 SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
@@ -766,6 +772,8 @@ def validate_catalog(path: Path) -> str:
     expected_schema = {
         ("table", name, name, CATALOG_TABLE_SQL[name]) for name in expected_tables
     } | CATALOG_AUXILIARY_SCHEMA
+    if catalog_kind == "current7" and CATALOG_OPERATION_RECEIPT_INDEX in schema:
+        expected_schema.add(CATALOG_OPERATION_RECEIPT_INDEX)
     if schema != expected_schema:
         unexpected = sorted(
             f"{item[0]}:{item[1]}" for item in schema - expected_schema

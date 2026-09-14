@@ -67,12 +67,7 @@ if ($mode === '--recent') {
     $state = loadState();
     $recent = is_array($state['recent'] ?? null) ? $state['recent'] : [];
     foreach ($recent as $entry) {
-        $line = sprintf(
-            "seq=%d addressee=%s at=%s",
-            (int) $entry['seq'],
-            (string) ($entry['addressee'] ?? '?'),
-            (string) ($entry['at'] ?? '')
-        );
+        $line = sprintf("seq=%d addressee=%s at=%s", (int) $entry['seq'], (string) ($entry['addressee'] ?? '?'), (string) ($entry['at'] ?? ''));
         if (!empty($entry['hint'])) {
             $line .= ' hint=' . (string) $entry['hint'];
         }
@@ -117,11 +112,6 @@ if ($mode === '--cursors') {
 fwrite(STDERR, "usage: mic_transcript_cursor.php [--get|--set N|--tag --seq N --addressee KIND [--hint TEXT] [--text TEXT]|--recent|--cursors|--rewind-if-stale] [--client NAME]\n");
 exit(1);
 
-/**
- * Each consuming agent keeps its own cursor so two clients reading the same
- * bounded feed do not consume each other's unread utterances. The legacy
- * scalar `cursor` key remains the opencode cursor.
- */
 function cursorFor(array $state, string $client): int
 {
     $cursors = is_array($state['cursors'] ?? null) ? $state['cursors'] : [];
@@ -129,8 +119,6 @@ function cursorFor(array $state, string $client): int
         return (int) $cursors[$client];
     }
 
-    // An unseen client joins where the feed already is rather than at zero, so
-    // it does not replay the whole bounded backlog on its first read.
     return (int) ($state['cursor'] ?? 0);
 }
 
@@ -153,7 +141,6 @@ function withCursor(array $state, string $client, int $value): array
     return $state;
 }
 
-/** Live latest sequence from pet-native, or null when the bridge is down. */
 function liveLatestSequence(): ?int
 {
     $context = stream_context_create(['http' => ['timeout' => 3, 'ignore_errors' => true]]);
@@ -207,10 +194,6 @@ function readOption(string $name): ?string
     return null;
 }
 
-/**
- * Reads the first bare numeric argument, so `--set 12 --client x` and
- * `--set --client x 12` both work.
- */
 function readPositionalDigits(): ?string
 {
     global $argv;

@@ -4,21 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/**
- * The live, mutable workspace state read by the next decision cycle.
- *
- * ContextCapsule and CapsuleSlot are immutable audit snapshots. This table is
- * the bounded hub between those snapshots: one current occupant per scope and
- * role, updated in place and expired rather than accumulated as a transcript.
- */
-final class WorkingMemorySlot extends ActiveRecord
+class WorkingMemorySlot extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'working_memory_slots';
     public static $primaryKey = 'id';
 
@@ -38,7 +27,7 @@ final class WorkingMemorySlot extends ActiveRecord
     protected $updated_at;
 
     #[Column(type: 'string', length: 96)]
-    protected string $scope_key;
+    protected string $scope_key = 'shared';
 
     #[Column(type: 'integer', notnull: false, unsigned: true)]
     protected ?int $thread_id = null;
@@ -78,4 +67,48 @@ final class WorkingMemorySlot extends ActiveRecord
 
     #[Column(type: 'timestamp')]
     protected $expires_at;
+
+    #[Column(type: 'integer', notnull: false)]
+    protected ?int $projection_memory_id = null;
+
+    #[Column(type: 'clob', notnull: false)]
+    protected ?string $projection_pending = null;
+
+    public function __construct($record = [], $isDirty = false, $isPhantom = null)
+    {
+        if ($isPhantom ?? $record === []) {
+            $now = time();
+            $record += [
+                'recorded_at' => $now,
+                'expires_at' => $now + 900,
+                'score' => max(0.0, min(1.0, (float) ($record['confidence'] ?? 0.0))),
+            ];
+            $expiresAt = $record['expires_at'];
+            if (is_string($expiresAt) && !is_numeric($expiresAt)) {
+                $expiresAt = strtotime($expiresAt);
+            }
+            $record['expires_at'] = $now + max(30, min(86400, (int) $expiresAt - $now));
+        }
+        parent::__construct($record, $isDirty, $isPhantom);
+    }
+
+    public function validate($deep = true)
+    {
+        $this->setFields([
+            'claim' => mb_substr(trim((string) $this->claim), 0, 800),
+            'confidence' => max(0.0, min(1.0, (float) $this->confidence)),
+            'record_type' => trim((string) $this->record_type) ?: null,
+        ]);
+        parent::validate($deep);
+        if (preg_match('/^[a-z][a-z0-9_]{0,63}$/', (string) $this->slot_role) !== 1) {
+            $this->addValidationError('slot_role', 'Working-memory role must be a lowercase identifier.');
+        }
+        if ($this->scope_key !== 'shared' && preg_match('/^thread:\d+$/', (string) $this->scope_key) !== 1) {
+            $this->addValidationError('scope_key', 'Working-memory scope must be shared or thread:<id>.');
+        }
+        if (trim((string) $this->claim) === '') {
+            $this->addValidationError('claim', 'Working-memory claim cannot be empty.');
+        }
+        return $this->isValid;
+    }
 }

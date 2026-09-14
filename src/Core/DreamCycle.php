@@ -4,20 +4,21 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use InvalidArgumentException;
 
-/** Local upkeep plus a bounded, opt-in consolidation window. */
-final class DreamCycle
+class DreamCycle
 {
-    private readonly ExecutiveCore $core;
+    private readonly Executive $core;
     private readonly NativeMaintenance $native;
     private readonly DreamModelWorker $dream;
     private readonly int $maxPrompts;
     private readonly int $intervalSeconds;
     private int $nextCheckAt = 0;
 
-    /** @param array<string, mixed> $dreamConfig @param array<string, mixed> $nativeConfig */
-    public function __construct(ExecutiveCore $core, array $dreamConfig = [], array $nativeConfig = [])
+    /** @param array<string, mixed> $dreamConfig */
+    public function __construct(Executive $core, array $dreamConfig = [], array $nativeConfig = [])
     {
         $this->core = $core;
         $maximum = $dreamConfig['max_prompts_per_cycle'] ?? 1;
@@ -39,12 +40,9 @@ final class DreamCycle
     {
         $native = $this->native->runOnce($owner);
         $attempts = [];
-        // Reported row failures must not starve unrelated episodic evidence.
-        // A thrown maintenance failure still aborts above; dream admission
-        // independently checks its own SQL/source state and provider budget.
+
         if (time() >= $this->nextCheckAt) {
-            // Local polling relief only. The worker's persistent reservation is
-            // authoritative; process restarts cannot recover spent entitlement.
+
             $this->nextCheckAt = time() + 60;
             $first = $this->dream->runOnce($owner);
             $attempts[] = $first;
@@ -55,9 +53,7 @@ final class DreamCycle
                 && ($first['integration']['accepted_batch'] ?? false) === true
                 && is_string($first['window_id'] ?? null) && $first['window_id'] !== ''
                 && ($this->core->cognitionControl()['paused'] ?? false) !== true) {
-                // Continuation exists only on this live stack after a grounded
-                // batch was first accepted. Existing-claim reuse is permitted;
-                // it is not represented as a newly created native assertion.
+
                 $attempts[] = $this->dream->runOnce($owner, $first['window_id']);
                 $this->nextCheckAt = time() + $this->intervalSeconds;
             }
@@ -65,13 +61,12 @@ final class DreamCycle
         $failed = ($native['status'] ?? null) === 'failed';
         $completed = ($native['status'] ?? null) === 'completed';
         foreach ($attempts as $attempt) {
-            $failed = $failed || in_array($attempt['status'] ?? null,
-                ['failed', 'error', 'integration_pending'], true);
+            $failed = $failed || in_array($attempt['status'] ?? null, ['failed', 'error', 'integration_pending'], true);
             $completed = $completed || ($attempt['status'] ?? null) === 'completed';
         }
         return ['status' => $failed ? 'failed' : ($completed ? 'completed' : 'idle'),
             'native' => $native,
-            // Entries include quiet/held preparations and are not HTTP counts.
+
             'dream_attempts' => $attempts,
             'next_check_at' => $this->nextCheckAt];
     }

@@ -6,7 +6,7 @@ namespace NaviBrain\Perception;
 
 use RuntimeException;
 
-final class DesktopAwareness
+class DesktopAwareness
 {
     private const ACTIVE_WITHIN_SECONDS = 120;
     private const CAPTURE_TIMEOUT_MS = 3000;
@@ -100,19 +100,11 @@ final class DesktopAwareness
                 && $now - $this->lastCuriosityCaptureAt < self::CURIOSITY_COOLDOWN_SECONDS
             ) {
                 $remaining = self::CURIOSITY_COOLDOWN_SECONDS - ($now - $this->lastCuriosityCaptureAt);
-                throw new RuntimeException(sprintf(
-                    'Curiosity capture skipped; the performance cooldown has %d seconds remaining.',
-                    $remaining
-                ));
+                throw new RuntimeException(sprintf( 'Curiosity capture skipped; the performance cooldown has %d seconds remaining.', $remaining ));
             }
         }
 
-        $path = sprintf(
-            '%s/navi-brain-look-%d-%s.png',
-            rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR),
-            getmypid(),
-            bin2hex(random_bytes(6))
-        );
+        $path = sprintf('%s/navi-brain-look-%d-%s.png', rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR), getmypid(), bin2hex(random_bytes(6)));
         $scopeFlag = match ($scope) {
             'active_window' => '--activewindow',
             'current_screen' => '--current',
@@ -124,14 +116,7 @@ final class DesktopAwareness
         try {
             $previousUmask = umask(0077);
             try {
-                $result = $this->run([
-                    '/usr/bin/spectacle',
-                    $scopeFlag,
-                    '--background',
-                    '--nonotify',
-                    '--output',
-                    $path,
-                ], self::CAPTURE_TIMEOUT_MS);
+                $result = $this->run([ '/usr/bin/spectacle', $scopeFlag, '--background', '--nonotify', '--output', $path, ], self::CAPTURE_TIMEOUT_MS);
             } finally {
                 umask($previousUmask);
             }
@@ -236,22 +221,14 @@ final class DesktopAwareness
         $this->startPresenceMonitor();
     }
 
-    /** @param list<string> $command
-     *  @return array{exit_code: int, stdout: string, stderr: string}
+    /**
+     * @param list<string> $command
+     * @return array{exit_code: int, stdout: string, stderr: string}
      */
     private function run(array $command, int $timeoutMs): array
     {
         $pipes = [];
-        $process = proc_open(
-            $command,
-            [
-                0 => ['file', '/dev/null', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w'],
-            ],
-            $pipes,
-            options: ['bypass_shell' => true]
-        );
+        $process = proc_open($command, [ 0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'], ], $pipes, options: ['bypass_shell' => true]);
         if (!is_resource($process)) {
             throw new RuntimeException('Could not start desktop awareness helper.');
         }

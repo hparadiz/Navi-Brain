@@ -4,15 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-/** A sealed categorical forecast over one authorized observable feature. */
-final class OtherModelPrediction extends ActiveRecord
+class OtherModelPrediction extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'other_model_predictions';
     public static $primaryKey = 'id';
 

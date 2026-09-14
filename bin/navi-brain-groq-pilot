@@ -5,7 +5,6 @@ declare(strict_types=1);
 
 use NaviBrain\Core\GroqModelClient;
 
-// Autoload only: bootstrap/app.php opens the live state database.
 require dirname(__DIR__) . '/vendor/autoload.php';
 
 $args = array_slice($argv, 1);
@@ -59,7 +58,7 @@ try {
     fwrite(STDOUT, json_encode($output, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL);
     exit(($output['status'] === 'rejected' || ($output['expected_content_match'] ?? true) === false) ? 1 : 0);
 } catch (Throwable) {
-    // Do not expose an exception stack, environment, provider body, or credential.
+
     fwrite(STDERR, "Synthetic pilot failed before producing a result. Check ext-curl, async DNS, GROQ_API_KEY, and the documented limits.\n");
     exit(1);
 }

@@ -5,47 +5,26 @@ declare(strict_types=1);
 namespace NaviBrain\Perception;
 
 use InvalidArgumentException;
-use NaviBrain\Core\ExecutiveCore;
+use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Model\PerceptFrame;
 use NaviBrain\Model\SenseReading;
 use RuntimeException;
 
-/**
- * Bit-level encoding for aged perception.
- *
- * The layer contract is narrow on purpose. A sampler speaks readings to the
- * cortex. The cortex speaks frames to storage. Attention speaks edges. No layer
- * needs to parse anything but the one directly beneath it, so the encoding here
- * is private to the storage seam rather than a format the whole system must
- * agree on.
- *
- * The layout is derived from what a source actually emits rather than declared
- * up front, so as Navi defines new senses over new shapes the encoding grows
- * with them. It is Navi's own protocol in that sense: nobody designed the field
- * table, it fell out of what Navi turned out to perceive.
- *
- * It is still fully decodable. A stream nobody can audit would make every
- * safety property in this system unverifiable, which is a far worse trade than
- * the bytes are worth.
- */
-final class PerceptCodec
+class PerceptCodec
 {
     public const VERSION = 1;
 
-    /** Widths chosen so a whole sample usually fits in a handful of bytes. */
     private const T_BOOL = 'b1';
     private const T_U8 = 'u8';
     private const T_U16 = 'u16';
     private const T_Q8 = 'q8';
     private const T_TEXT = 't';
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
     }
 
     /**
-     * Infer a field layout from a set of samples.
-     *
      * @param list<array<string, mixed>> $samples
      * @return list<array{name: string, type: string}>
      */
@@ -59,7 +38,7 @@ final class PerceptCodec
                 }
                 $type = $this->typeOf($value);
                 $existing = $fields[$name] ?? null;
-                // Widen rather than narrow: a field seen as both must hold both.
+
                 $fields[$name] = $existing === null ? $type : $this->widen($existing, $type);
             }
         }
@@ -73,8 +52,6 @@ final class PerceptCodec
     }
 
     /**
-     * Pack a window of readings into one frame.
-     *
      * @param list<array{observed_at: int, payload: array<string, mixed>}> $readings
      * @return array{frame: PerceptFrame, ratio: float}
      */
@@ -83,20 +60,13 @@ final class PerceptCodec
         if ($readings === []) {
             throw new InvalidArgumentException('Cannot pack an empty window.');
         }
-        $layout = $this->inferLayout(array_map(
-            static fn (array $r): array => $r['payload'],
-            $readings
-        ));
+        $layout = $this->inferLayout(array_map( static fn (array $r): array => $r['payload'], $readings ));
 
         $writer = new BitWriter();
         $sourceBytes = 0;
         foreach ($readings as $reading) {
-            $sourceBytes += strlen(json_encode(
-                $reading['payload'],
-                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
-            ) ?: '');
+            $sourceBytes += strlen(json_encode( $reading['payload'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ) ?: '');
 
-            // Time is stored as an offset into the window, not an absolute.
             $offset = max(0, min(65535, $reading['observed_at'] - $windowStart));
             $writer->write($offset, 16);
 
@@ -111,7 +81,7 @@ final class PerceptCodec
         $checksum = hash('sha256', self::VERSION . '|' . $sourceKey . '|' . $packed);
 
         /** @var PerceptFrame $frame */
-        $frame = $this->core->insertRecord(PerceptFrame::class, [
+        $frame = new PerceptFrame([
             'source_key' => $sourceKey,
             'codec_version' => self::VERSION,
             'window_start' => $windowStart,
@@ -122,7 +92,8 @@ final class PerceptCodec
             'packed_bytes' => strlen($packed),
             'source_bytes' => $sourceBytes,
             'checksum' => $checksum,
-        ]);
+        ], true, true);
+        $frame->save();
 
         return [
             'frame' => $frame,
@@ -130,12 +101,7 @@ final class PerceptCodec
         ];
     }
 
-    /**
-     * Decode a frame back into samples. This is what keeps the stream
-     * inspectable rather than merely small.
-     *
-     * @return list<array<string, mixed>>
-     */
+    /** @return list<array<string, mixed>> */
     public function unpack(PerceptFrame $frame): array
     {
         $packed = base64_decode((string) $frame->payload, true);
@@ -163,11 +129,7 @@ final class PerceptCodec
         return $samples;
     }
 
-    /**
-     * Compact every source: aged readings become frames and their rows go away.
-     *
-     * @return list<array<string, mixed>>
-     */
+    /** @return list<array<string, mixed>> */
     public function compact(int $olderThanSeconds = 900, ?int $now = null): array
     {
         $now ??= time();
@@ -265,9 +227,7 @@ final class PerceptCodec
                 $writer->write((int) round(max(0.0, min(1.0, (float) $value)) * 255), 8);
                 return;
             case self::T_TEXT:
-                // Content does not survive compaction. What is kept is that
-                // something was said, roughly how much, and a digest that can
-                // still detect repetition — never the words themselves.
+
                 $text = is_string($value) ? $value : '';
                 $writer->write(min(4095, mb_strlen($text)), 12);
                 $writer->write($text === '' ? 0 : (crc32($text) & 0xFFFF), 16);
@@ -302,8 +262,7 @@ final class PerceptCodec
     }
 }
 
-/** Writes arbitrary-width unsigned integers into a byte string, MSB first. */
-final class BitWriter
+class BitWriter
 {
     private string $bytes = '';
     private int $current = 0;
@@ -331,8 +290,7 @@ final class BitWriter
     }
 }
 
-/** Reads back what BitWriter produced. */
-final class BitReader
+class BitReader
 {
     private int $position = 0;
 

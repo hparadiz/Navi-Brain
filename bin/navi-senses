@@ -3,15 +3,6 @@
 
 declare(strict_types=1);
 
-/**
- * Fixed-file machine observation service, installed as a standalone executable.
- *
- * Socket clients select a named observation. They cannot supply paths, command
- * arguments or shell programs. Read-only behavior follows from these bounded
- * built-in reads, not from assuming an unprivileged account cannot write.
- * Runtime socket/log maintenance remains a fixed service responsibility.
- */
-
 const SOCKET_PATH = '/run/navi-senses/navi-senses.sock';
 const OBSERVATION_PROTOCOL = 'navi-observation-v1';
 const MAX_OUTPUT_BYTES = 16384;
@@ -27,14 +18,10 @@ if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
 function logLine(array $record): void
 {
     $record['at'] = time();
-    fwrite(STDOUT, json_encode(
-        $record,
-        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-    ) . PHP_EOL);
+    fwrite(STDOUT, json_encode( $record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR ) . PHP_EOL);
     fflush(STDOUT);
 }
 
-// Refuse an unverifiable or incorrectly privileged service identity.
 if (!function_exists('posix_geteuid') || !function_exists('posix_getpwuid')) {
     fwrite(STDERR, "navi-senses requires POSIX account identity checks\n");
     exit(1);
@@ -52,28 +39,19 @@ if (file_exists(SOCKET_PATH)) {
 
 $errorNumber = 0;
 $errorMessage = '';
-$server = @stream_socket_server(
-    'unix://' . SOCKET_PATH,
-    $errorNumber,
-    $errorMessage
-);
+$server = @stream_socket_server('unix://' . SOCKET_PATH, $errorNumber, $errorMessage);
 if (!is_resource($server)) {
     fwrite(STDERR, sprintf("cannot listen on %s: %s (%d)\n", SOCKET_PATH, $errorMessage, $errorNumber));
     exit(1);
 }
-// The service file sets the primary group to users. All members of that group
-// can request this same fixed observation catalog; socket access grants no shell.
+
 @chmod(SOCKET_PATH, 0660);
-logLine([
-    'listening' => SOCKET_PATH,
-    'user' => $self,
-    'readable_by' => 'group users',
-]);
+logLine([ 'listening' => SOCKET_PATH, 'user' => $self, 'readable_by' => 'group users', ]);
 
 /** @return array<string, list<string>> */
 function observationFiles(): array
 {
-    // Kept local because packaging installs this service without the PHP app.
+
     return [
         'system.summary' => ['/proc/uptime', '/proc/loadavg', '/proc/meminfo', '/proc/version'],
         'system.uptime' => ['/proc/uptime'],
@@ -125,7 +103,7 @@ function look(mixed $request): array
             $result['truncated'] = true;
             break;
         }
-        // Every path is a code-owned kernel information file, never user input.
+
         $content = @file_get_contents($path, false, null, 0, $remaining + 1);
         if ($content === false) {
             $result['refused_because'] = 'Required kernel observation file is unavailable: ' . $path;
@@ -163,10 +141,7 @@ while ($running) {
         'bytes' => $result['output_bytes'] ?? 0,
     ]);
 
-    @fwrite($client, json_encode(
-        $result,
-        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE
-    ) . "\n");
+    @fwrite($client, json_encode( $result, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE ) . "\n");
     @fclose($client);
 }
 

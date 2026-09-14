@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace NaviBrain\Model;
 
-use Divergence\Models\ActiveRecord;
-use Divergence\Models\Getters;
 use Divergence\Models\Mapping\Column;
 
-final class ExecutiveInterrupt extends ActiveRecord
+class ExecutiveInterrupt extends ActiveRecord
 {
-    use Getters;
-
     public static $tableName = 'executive_interrupts';
     public static $primaryKey = 'id';
 

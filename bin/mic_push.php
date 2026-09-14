@@ -2,20 +2,11 @@
 
 declare(strict_types=1);
 
-// Emits one line per newly finalized microphone utterance from pet-native.
-// Its cursor is in-memory only; the durable per-client cursor stays untouched
-// so the navi-transcript consumption loop remains the thing that consumes.
-
 const ENDPOINT = 'http://127.0.0.1:47831/transcripts?after=';
 const INTERVAL = 1;
 
-// Audio mode is on while this file exists. Aku toggles it with touch/rm at any
-// time; the watcher keeps running either way and stays silent while it is off,
-// consuming events so switching back on gives fresh speech, not a backlog.
 const FLAG = '/home/akujin/.config/navi-audio-mode';
 
-// Seconds without a new utterance before the stall check runs, and the minimum
-// gap between repairs so a genuinely quiet room never triggers a restart loop.
 const STALL_SECONDS = 180;
 const REPAIR_COOLDOWN = 600;
 
@@ -25,13 +16,6 @@ function audioMode(): bool
     return file_exists(FLAG);
 }
 
-/**
- * pet-native already labels non-speech (music, kissing, blank audio) as a lone
- * bracketed phrase in its own transcripts, so no separate media heuristic is
- * needed here — isNonSpeech() below is pet's own classification surfacing.
- */
-
-/** Whisper narrates non-speech as a lone bracketed phrase; never worth sending. */
 function isNonSpeech(string $text): bool
 {
     $text = trim($text);
@@ -52,7 +36,6 @@ function petPid(): ?int
     return $pid > 0 ? $pid : null;
 }
 
-/** Total CPU ticks burned by the audio awareness threads of a process. */
 function audioThreadTicks(int $pid): ?int
 {
     $total = 0;
@@ -74,7 +57,6 @@ function audioThreadTicks(int $pid): ?int
     return $found ? $total : null;
 }
 
-/** true = parked, false = still working, null = cannot tell. */
 function audioThreadsIdle(): ?bool
 {
     $pid = petPid();
@@ -92,12 +74,9 @@ function audioThreadsIdle(): ?bool
     return $after === null ? null : ($after - $before) === 0;
 }
 
-
 function fetchFeed(int $after): ?array
 {
-    $context = stream_context_create([
-        'http' => ['timeout' => 3, 'ignore_errors' => true],
-    ]);
+    $context = stream_context_create([ 'http' => ['timeout' => 3, 'ignore_errors' => true], ]);
 
     $body = @file_get_contents(ENDPOINT . $after, false, $context);
     if ($body === false) {
@@ -138,13 +117,7 @@ if ($feed === null) {
 
 $cursor = (int) ($feed['status']['latestSequence'] ?? 0);
 $mode = audioMode();
-emit(sprintf(
-    'mic feed armed: audio mode %s, state=%s model=%s cursor=%d',
-    $mode ? 'ON' : 'OFF',
-    $feed['status']['state'] ?? 'unknown',
-    $feed['status']['model'] ?? 'unknown',
-    $cursor
-));
+emit(sprintf('mic feed armed: audio mode %s, state=%s model=%s cursor=%d', $mode ? 'ON' : 'OFF', $feed['status']['state'] ?? 'unknown', $feed['status']['model'] ?? 'unknown', $cursor));
 
 $down = false;
 $lastError = '';
@@ -169,8 +142,6 @@ while (true) {
         emit('mic feed RECOVERED');
     }
 
-    // A pet restart resets the counter, which would strand the cursor above
-    // every future sequence and make the watcher silently deaf.
     $latest = (int) ($feed['status']['latestSequence'] ?? 0);
     if ($latest < $cursor) {
         emit(sprintf('mic feed sequence reset: %d -> %d, rewinding cursor', $cursor, $latest));
@@ -184,7 +155,6 @@ while (true) {
         $lastAdvance = time();
     }
 
-    // Never restart pet. Report a stall and let Aku decide what to do about it.
     if (time() - $lastAdvance > STALL_SECONDS && time() - $lastRepair > REPAIR_COOLDOWN) {
         $idle = audioThreadsIdle();
         $lastRepair = time();
@@ -201,14 +171,11 @@ while (true) {
     }
 
     if (!$mode) {
-        // Stay quiet, but keep the cursor moving so re-enabling does not
-        // replay everything said while it was off.
+
         $cursor = (int) ($feed['status']['latestSequence'] ?? $cursor);
         continue;
     }
 
-    // listening <-> transcribing is the normal cycle of every utterance and is
-    // not worth a notification. Only report entering or leaving an odd state.
     $state = $feed['status']['state'] ?? 'unknown';
     $normal = ['listening', 'transcribing'];
     if ($state !== $lastState
@@ -216,7 +183,7 @@ while (true) {
         emit(sprintf('mic feed state changed: %s -> %s', $lastState, $state));
     }
     $lastState = $state;
-    // pet-native reports "no error" as an empty string, not null.
+
     $error = trim((string) ($feed['status']['error'] ?? ''));
     if ($error !== '' && $error !== $lastError) {
         emit('mic feed ERROR: ' . $error);
@@ -228,12 +195,7 @@ while (true) {
         if (isNonSpeech($text)) {
             continue;
         }
-        emit(sprintf(
-            'heard [seq %d, %dms]: %s',
-            (int) ($event['sequence'] ?? 0),
-            (int) ($event['durationMs'] ?? 0),
-            $text
-        ));
+        emit(sprintf( 'heard [seq %d, %dms]: %s', (int) ($event['sequence'] ?? 0), (int) ($event['durationMs'] ?? 0), $text ));
     }
 
     $cursor = (int) ($feed['status']['latestSequence'] ?? $cursor);

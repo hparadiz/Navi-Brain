@@ -4,21 +4,17 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Model\WorkItem;
+
+use NaviBrain\Core\ExecutiveCore\Executive;
+
 use InvalidArgumentException;
 use NaviBrain\Support\CompilerText;
 use NaviBrain\Support\PlainText;
 use RuntimeException;
 use Throwable;
 
-/**
- * Queue experimental language-model synthesis over the complete ranked
- * personality, motivation, and intention evidence sets.
- *
- * Generated narratives remain derived artifacts. They are kept in worker and
- * thought history for comparison, while only the latest accepted copy is
- * mirrored to /tmp. Nothing generated here becomes source evidence by itself.
- */
-final class NarrativeSynthesis
+class NarrativeSynthesis
 {
     public const PERSONALITY_WORK_TYPE = 'personality_narrative_compile';
     public const MOTIVATION_WORK_TYPE = 'motivation_narrative_compile';
@@ -30,7 +26,7 @@ final class NarrativeSynthesis
     public const MOTIVATION_PATH = '/tmp/navi-motivation-narrative.txt';
     public const INTENTION_PATH = '/tmp/navi-intentions-narrative.txt';
 
-    public function __construct(private readonly ExecutiveCore $core)
+    public function __construct(private readonly Executive $core)
     {
     }
 
@@ -52,20 +48,8 @@ final class NarrativeSynthesis
             'experimental' => true,
             'reason' => $reason,
             'sleep_event_id' => $sleepEventId,
-            'personality' => $this->enqueueOne(
-                self::PERSONALITY_WORK_TYPE,
-                'personality:compile',
-                $personality,
-                $reason,
-                $batchKey
-            ),
-            'motivation' => $this->enqueueOne(
-                self::MOTIVATION_WORK_TYPE,
-                'motivation:compile',
-                $motivation,
-                $reason,
-                $batchKey
-            ),
+            'personality' => $this->enqueueOne(self::PERSONALITY_WORK_TYPE, $personality, $reason, $batchKey),
+            'motivation' => $this->enqueueOne(self::MOTIVATION_WORK_TYPE, $motivation, $reason, $batchKey),
             'latest_paths' => [
                 'personality' => self::PERSONALITY_PATH,
                 'motivation' => self::MOTIVATION_PATH,
@@ -85,23 +69,12 @@ final class NarrativeSynthesis
         }
 
         $compile = (new IntentionCompiler())->compile();
-        return $this->enqueueOne(
-            self::INTENTION_WORK_TYPE,
-            'intention:compile',
-            $compile,
-            $reason,
-            'rhythm:' . $rhythmRunId,
-            ['rhythm_run_id' => $rhythmRunId]
-        );
+        return $this->enqueueOne(self::INTENTION_WORK_TYPE, $compile, $reason, 'rhythm:' . $rhythmRunId, ['rhythm_run_id' => $rhythmRunId]);
     }
 
     public static function isWorkType(string $workType): bool
     {
-        return in_array($workType, [
-            self::PERSONALITY_WORK_TYPE,
-            self::MOTIVATION_WORK_TYPE,
-            self::INTENTION_WORK_TYPE,
-        ], true);
+        return in_array($workType, [ self::PERSONALITY_WORK_TYPE, self::MOTIVATION_WORK_TYPE, self::INTENTION_WORK_TYPE, ], true);
     }
 
     public static function expectedKind(string $workType): ?string
@@ -124,7 +97,7 @@ final class NarrativeSynthesis
         };
     }
 
-    /** @param array<string, mixed> $proposal @return list<string> */
+    /** @param array<string, mixed> $proposal */
     public static function validationErrors(string $workType, array $proposal): array
     {
         $errors = [];
@@ -195,24 +168,22 @@ final class NarrativeSynthesis
      * @param array<string, mixed> $compile
      * @return array<string, mixed>
      */
-    private function enqueueOne(
-        string $workType,
-        string $compileCommand,
-        array $compile,
-        string $reason,
-        string $batchKey,
-        array $additionalInputRefs = []
-    ): array {
+    private function enqueueOne(string $workType, array $compile, string $reason, string $batchKey, array $additionalInputRefs = []): array {
+        $compileCommand = match ($workType) {
+            self::PERSONALITY_WORK_TYPE => 'personality:compile',
+            self::MOTIVATION_WORK_TYPE => 'motivation:compile',
+            self::INTENTION_WORK_TYPE => 'intention:compile',
+        };
         $evidence = CompilerText::render($compileCommand, $compile);
         $checksum = hash('sha256', $evidence);
         $prompt = $this->prompt($workType, $evidence);
 
-        return $this->core->enqueueWork(
-            parentRunId: null,
-            parentIntentionId: null,
-            workType: $workType,
-            prompt: $prompt,
-            inputRefs: array_merge([
+        return $this->core->enqueueWork(new WorkItem([
+            'parent_run_id' => null,
+            'parent_intention_id' => null,
+            'work_type' => $workType,
+            'prompt' => $prompt,
+            'input_refs' => array_merge([
                 'context_scope' => 'no_workspace',
                 'experimental' => true,
                 'trigger_reason' => $reason,
@@ -222,10 +193,10 @@ final class NarrativeSynthesis
                 'evidence_bytes' => strlen($evidence),
                 'evidence_count' => $this->evidenceCount($workType, $compile),
             ], $additionalInputRefs),
-            tokenBudget: $workType === self::PERSONALITY_WORK_TYPE ? 2048 : 1536,
-            wallBudgetSeconds: $workType === self::INTENTION_WORK_TYPE ? 300 : 900,
-            idempotencyKey: sprintf('%s:%s', $workType, $batchKey)
-        );
+            'token_budget' => $workType === self::PERSONALITY_WORK_TYPE ? 2048 : 1536,
+            'wall_budget_seconds' => $workType === self::INTENTION_WORK_TYPE ? 300 : 900,
+            'idempotency_key' => sprintf('%s:%s', $workType, $batchKey),
+        ], true, true));
     }
 
     private function prompt(string $workType, string $evidence): string

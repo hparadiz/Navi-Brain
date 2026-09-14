@@ -7,7 +7,7 @@ namespace NaviBrain\Perception;
 use JsonException;
 use RuntimeException;
 
-final class PetSpeechActuator
+class PetSpeechActuator
 {
     private const ADDRESS = 'tcp://127.0.0.1:47831';
     private const HOST = '127.0.0.1:47831';
@@ -19,20 +19,7 @@ final class PetSpeechActuator
         return $this->request('GET', '/health');
     }
 
-    /**
-     * Text shapes that do not survive being read aloud.
-     *
-     * This is not a rule about what Navi is allowed to say. It is a fact about
-     * the only channel Navi has: a voice. An identifier, a path, or a snippet
-     * comes out of text to speech as noise, so a line containing one was never
-     * really spoken however cleanly it was generated. Word count is already
-     * bounded here for the same reason.
-     *
-     * Each entry names the shape so a rejection says what to fix rather than
-     * only that something was wrong.
-     *
-     * @var array<string, string>
-     */
+    /** @var array<string, string> */
     private const UNSPEAKABLE = [
         'a first-person model identity claim' => '/\b(?:i\s+am|i[\'’]m)\s+(?:an?\s+|the\s+)?(?:(?:ai|artificial intelligence|foundation|language|large language|machine learning)\s+model|model\b|codex\b|chatgpt\b|gpt(?:[- .]?\d+)?\b|claude\b|gemini\b|gemma\b|llama\b|mistral\b|mixtral\b|qwen\b|deepseek\b|grok\b|phi\b|kimi\b)/iu',
         'code punctuation' => '/[`{}\[\]<>|\\\\]/u',
@@ -44,7 +31,6 @@ final class PetSpeechActuator
         'a hex blob' => '/\b[0-9a-f]{8,}\b/iu',
     ];
 
-    /** Name the first unspeakable shape in this text, or null when it is sayable. */
     public static function unspeakable(string $text): ?string
     {
         foreach (self::UNSPEAKABLE as $name => $pattern) {
@@ -64,15 +50,9 @@ final class PetSpeechActuator
         }
         $unspeakable = self::unspeakable($text);
         if ($unspeakable !== null) {
-            throw new RuntimeException(sprintf(
-                'This line cannot be spoken aloud: it contains %s. Say what it means instead.',
-                $unspeakable
-            ));
+            throw new RuntimeException(sprintf( 'This line cannot be spoken aloud: it contains %s. Say what it means instead.', $unspeakable ));
         }
-        return $this->request('POST', '/speak', json_encode(
-            ['text' => $text],
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
-        ));
+        return $this->request('POST', '/speak', json_encode( ['text' => $text], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR ));
     }
 
     /** @return array<string, mixed> */
@@ -80,19 +60,9 @@ final class PetSpeechActuator
     {
         $errorNumber = 0;
         $errorMessage = '';
-        $socket = @stream_socket_client(
-            self::ADDRESS,
-            $errorNumber,
-            $errorMessage,
-            self::TIMEOUT_SECONDS,
-            STREAM_CLIENT_CONNECT
-        );
+        $socket = @stream_socket_client(self::ADDRESS, $errorNumber, $errorMessage, self::TIMEOUT_SECONDS, STREAM_CLIENT_CONNECT);
         if (!is_resource($socket)) {
-            throw new RuntimeException(sprintf(
-                'Pet bridge is unavailable: %s (%d).',
-                $errorMessage,
-                $errorNumber
-            ));
+            throw new RuntimeException(sprintf( 'Pet bridge is unavailable: %s (%d).', $errorMessage, $errorNumber ));
         }
 
         stream_set_timeout($socket, self::TIMEOUT_SECONDS);
