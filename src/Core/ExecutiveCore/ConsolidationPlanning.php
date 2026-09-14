@@ -260,7 +260,7 @@ class ConsolidationPlanning extends Component
             str_starts_with($content, 'Action "') => 'action_outcome',
             str_starts_with($content, 'The user said:') => 'user_utterance',
             str_starts_with($content, 'Session in '),
-            str_starts_with($content, 'Automatic Navi continuity '),
+            preg_match('/\AAutomatic .+ continuity from the most recent captured (?:Codex|Claude Code) session\./u', $content) === 1,
             str_starts_with($content, 'Implemented and verified ') => 'session_record',
             default => 'observation',
         };

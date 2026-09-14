@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOCAL_BRAIN_DIR="${NAVI_REPLICATION_LOCAL_DIR:-/home/akujin/Sources/Navi-Brain}"
-REMOTE_HOST="${NAVI_REPLICATION_REMOTE_HOST:-akuj.in}"
-REMOTE_BRAIN_DIR="${NAVI_REPLICATION_REMOTE_DIR:-/home/akujin/navi-brain}"
-DATABASE_PATH="${NAVI_BRAIN_DB:-$LOCAL_BRAIN_DIR/var/navi-brain.sqlite}"
-TOKEN_STORE_PATH="${NAVI_TOKEN_MEMORY_STORE:-$LOCAL_BRAIN_DIR/memories/store}"
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+mapfile -d '' -t REPLICATION_CONFIG < <(php -n -r '
+$environment = require $argv[1] . "/config/environment.php";
+foreach (["NAVI_REPLICATION_LOCAL_DIR", "NAVI_REPLICATION_REMOTE_HOST", "NAVI_REPLICATION_REMOTE_DIR", "NAVI_BRAIN_DB", "NAVI_TOKEN_MEMORY_STORE", "NAVI_REPLICATION_QUIESCE_HELPER"] as $key) {
+    echo $environment[$key] ?? "", "\0";
+}
+' "$PROJECT_ROOT")
+if [[ "${#REPLICATION_CONFIG[@]}" -ne 6 ]]; then
+    echo "[replicate] Unable to load replication configuration." >&2
+    exit 2
+fi
+LOCAL_BRAIN_DIR="${REPLICATION_CONFIG[0]:-$PROJECT_ROOT}"
+REMOTE_HOST="${REPLICATION_CONFIG[1]}"
+REMOTE_BRAIN_DIR="${REPLICATION_CONFIG[2]}"
+DATABASE_PATH="${REPLICATION_CONFIG[3]:-$LOCAL_BRAIN_DIR/var/navi-brain.sqlite}"
+TOKEN_STORE_PATH="${REPLICATION_CONFIG[4]:-$LOCAL_BRAIN_DIR/memories/store}"
 TOKMEM_PATH="$LOCAL_BRAIN_DIR/memories/build/tokmem"
-QUIESCE_HELPER="${NAVI_REPLICATION_QUIESCE_HELPER:-}"
+QUIESCE_HELPER="${REPLICATION_CONFIG[5]}"
 TIMESTAMP="$(date -u +%Y%m%d-%H%M%S)"
 BUNDLE_NAME="navi-brain-$TIMESTAMP-$$.bundle"
 LOCAL_BACKUP_DIR="$LOCAL_BRAIN_DIR/var/backups"
@@ -15,6 +26,11 @@ BUNDLE_PATH="$LOCAL_BACKUP_DIR/$BUNDLE_NAME"
 REMOTE_BACKUP_DIR="$REMOTE_BRAIN_DIR/var/backups"
 REMOTE_INCOMING="$REMOTE_BACKUP_DIR/.$BUNDLE_NAME.incoming"
 REMOTE_BUNDLE="$REMOTE_BACKUP_DIR/$BUNDLE_NAME"
+
+if [[ -z "$REMOTE_HOST" || -z "$REMOTE_BRAIN_DIR" ]]; then
+    echo "[replicate] Set NAVI_REPLICATION_REMOTE_HOST and NAVI_REPLICATION_REMOTE_DIR in .env or the environment." >&2
+    exit 2
+fi
 
 case "$REMOTE_HOST" in
     ""|-*|*[!A-Za-z0-9_.@:-]*)

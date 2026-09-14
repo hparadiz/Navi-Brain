@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Support\Name;
 use NaviBrain\Support\PlainText;
 
 class ExecutiveComposition
@@ -35,7 +36,7 @@ class ExecutiveComposition
             }
         }
         if ($demands !== []) {
-            $lines[] = 'What each part of Navi is asking of this moment:';
+            $lines[] = sprintf('What each part of %s is asking of this moment:', Name::get());
             $lines[] = implode("\n", $demands);
             $lines[] = '';
         }

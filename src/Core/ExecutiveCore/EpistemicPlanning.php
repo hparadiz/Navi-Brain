@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core\ExecutiveCore;
 
+use NaviBrain\Support\Name;
 use NaviBrain\Model\CognitiveThread;
 use NaviBrain\Model\ThreadStep;
 use NaviBrain\Support\PlainText;
@@ -55,7 +56,7 @@ class EpistemicPlanning extends Component
         }
 
         $prompt = implode("\n", [
-            'You are advancing one bounded step of Navi\'s user-authorized epistemic self-advance thread.',
+            sprintf('You are advancing one bounded step of %s\'s user-authorized epistemic self-advance thread.', Name::get()),
             'You have no tools, no actuator, and no access beyond the supplied capsule below.',
             'The thread is self-perpetuating: it wakes without a fresh prompt and must leave evidence for the NEXT wake.',
             'Return exactly one JSON object with the exact keys kind, content, confidence, and challenged_assumption.',

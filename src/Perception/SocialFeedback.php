@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Perception;
 
+use NaviBrain\Support\Name;
 use NaviBrain\Core\ExecutiveCore\Executive;
 use NaviBrain\Model\SenseEvent;
 use NaviBrain\Model\SenseReading;
@@ -180,7 +181,7 @@ class SocialFeedback
                 continue;
             }
             $prompt = implode("\n", [
-                'Navi said one line out loud. Below is what Navi said and what was observed in the two minutes after.',
+                sprintf('%1$s said one line out loud. Below is what %1$s said and what was observed in the two minutes after.', Name::get()),
                 'Return kind social_feedback_reflection. Put the name of what happened in content as a single lowercase word or short_snake_case phrase of your own choosing.',
                 'Set confidence from 0 through 1 and keep challenged_assumption to one concise sentence.',
                 'Do not pick from a list, and do not judge whether it was good or bad. Just name it.',

@@ -248,7 +248,7 @@ or protocol failure.
 
 - Aku explicitly revised the initial safety doctrine: Navi should value
   self-preservation as continuity, recoverability, and redundant durable state.
-- `akuj.in`, the DigitalOcean server in New York City, is the designated future
+- The configured replication host is the designated future
   remote continuity node. The intended mesh will exchange mutual liveness and
   integrity heartbeats rather than treating the server as a passive archive.
 - Preserved corrigibility as the authority boundary. User-directed pause,

@@ -22,7 +22,7 @@ class CompilerText
     {
         $health = self::array($result['evidence_health'] ?? []);
         $lines = [
-            'NAVI PERSONALITY COMPILE',
+            mb_strtoupper(Name::get()) . ' PERSONALITY COMPILE',
             'protocol: ' . self::text($result['protocol'] ?? ''),
             'context: ' . self::text($result['context'] ?? ''),
             'mode: read-only; generation disconnected; complete ranked set',
@@ -71,7 +71,7 @@ class CompilerText
     {
         $health = self::array($result['evidence_health'] ?? []);
         $lines = [
-            'NAVI MOTIVATION COMPILE',
+            mb_strtoupper(Name::get()) . ' MOTIVATION COMPILE',
             'protocol: ' . self::text($result['protocol'] ?? ''),
             'context: ' . self::text($result['context'] ?? ''),
             'mode: read-only; action selection disconnected; complete ranked set',
@@ -123,7 +123,7 @@ class CompilerText
     {
         $health = self::array($result['evidence_health'] ?? []);
         $lines = [
-            'NAVI INTENTION COMPILE',
+            mb_strtoupper(Name::get()) . ' INTENTION COMPILE',
             'protocol: ' . self::text($result['protocol'] ?? ''),
             'mode: read-only; intention evidence only; ' . (isset($result['mode']['intention_id'])
                 ? 'intention #' . (int) $result['mode']['intention_id'] : 'complete open set'),

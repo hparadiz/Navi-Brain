@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core\ExecutiveCore;
 
+use NaviBrain\Support\Name;
 use InvalidArgumentException;
 use NaviBrain\Model\CognitiveThread;
 use NaviBrain\Model\Need;
@@ -58,7 +59,7 @@ class ThreadCreation extends Component
                 'wake_at' => time(),
                 'budget' => $budget,
                 'status' => 'active',
-                'last_observation' => 'The user corrected timer-gated presence: no speech cooldown and no worker rate floor; Navi may speak whenever.',
+                'last_observation' => sprintf('No speech cooldown and no worker rate floor; %s may speak whenever.', Name::get()),
                 'updated_at' => time(),
             ]);
             $existing->save();
@@ -152,8 +153,8 @@ class ThreadCreation extends Component
 
         $now = time();
         $concern = sprintf(
-            'Advance Navi\'s grounded understanding behind the authorized intention "%s". Each wake refines a bounded belief, records the accepted refinement with evidence, and reduces uncertainty without a fresh prompt.',
-            substr((string) $intention->title, 0, 120)
+            'Advance %s\'s grounded understanding behind the authorized intention "%s". Each wake refines a bounded belief, records the accepted refinement with evidence, and reduces uncertainty without a fresh prompt.',
+            Name::get(), substr((string) $intention->title, 0, 120)
         );
 
         $thread = new CognitiveThread([

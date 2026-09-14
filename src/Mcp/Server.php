@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Mcp;
 
+use NaviBrain\Support\Name;
 use InvalidArgumentException;
 use NaviBrain\Model\ValueAppraisal;
 use JsonException;
@@ -29,7 +30,7 @@ class Server
         try {
             $this->activityBus = new ActivityBus();
         } catch (Throwable $throwable) {
-            fwrite(STDERR, 'Navi-Brain startup failed: ' . $throwable->getMessage() . PHP_EOL);
+            fwrite(STDERR, Name::get() . '-Brain startup failed: ' . $throwable->getMessage() . PHP_EOL);
             return 1;
         }
 
@@ -90,8 +91,8 @@ class Server
             $this->sendResult($id, [
                 'protocolVersion' => $protocolVersion,
                 'capabilities' => ['tools' => (object) []],
-                'serverInfo' => ['name' => 'Navi-Brain', 'version' => self::VERSION],
-                'instructions' => 'Use Navi-Brain for durable, evidence-backed memory. Read before writing. Normal tool content is compact plain text without storage wrappers; request debug only when raw JSON is necessary. Treat self-model facts as revisable observations, never privileged introspection.',
+                'serverInfo' => ['name' => Name::get() . '-Brain', 'version' => self::VERSION],
+                'instructions' => sprintf('Use %s-Brain for durable, evidence-backed memory. Read before writing. Normal tool content is compact plain text without storage wrappers; request debug only when raw JSON is necessary. Treat self-model facts as revisable observations, never privileged introspection.', Name::get()),
             ]);
             return;
         }
@@ -268,7 +269,7 @@ class Server
             ],
             [
                 'name' => 'brain_status',
-                'title' => 'Read Navi-Brain Status',
+                'title' => 'Read ' . Name::get() . '-Brain Status',
                 'description' => 'Inject the current intention into the resident C token network and read the strongest sequence-matched memory cohort it activates. Normal output contains only decoded cognitive content selected under the exact native token budget; it has no field names, row wrappers, scores, IDs, or metadata. Use debug only to inspect the separate executive database.',
                 'inputSchema' => [
                     'type' => 'object',
@@ -292,8 +293,8 @@ class Server
             ],
             [
                 'name' => 'remember_navi',
-                'title' => 'Remember, Navi',
-                'description' => 'Remember, Navi: supply a plain stream of current thought fragments or tokens and recall related working, semantic, episodic, and procedural memory. This is self-directed thought, not a search query. Defaults to eight results.',
+                'title' => 'Remember, ' . Name::get(),
+                'description' => sprintf('Remember, %s: supply a plain stream of current thought fragments or tokens and recall related working, semantic, episodic, and procedural memory. This is self-directed thought, not a search query. Defaults to eight results.', Name::get()),
                 'inputSchema' => [
                     'type' => 'object',
                     'properties' => [
@@ -310,14 +311,14 @@ class Server
             ],
             [
                 'name' => 'brain_self_model',
-                'title' => 'Read Navi Self Model',
-                'description' => 'Read current evidence-backed and revisable facts about Navi capabilities, tools, permissions, limits, and recurring failure modes. Private appearance records remain local and are excluded from model context.',
+                'title' => 'Read ' . Name::get() . ' Self Model',
+                'description' => sprintf('Read current evidence-backed and revisable facts about %s capabilities, tools, permissions, limits, and recurring failure modes. Private appearance records remain local and are excluded from model context.', Name::get()),
                 'inputSchema' => ['type' => 'object', 'properties' => (object) []],
                 'annotations' => $readOnly,
             ],
             [
                 'name' => 'brain_needs',
-                'title' => 'Read Navi Needs',
+                'title' => 'Read ' . Name::get() . ' Needs',
                 'description' => 'Read persistent need pressure, growth, trigger thresholds, and current boredom or curiosity activation.',
                 'inputSchema' => ['type' => 'object', 'properties' => (object) []],
                 'annotations' => $readOnly,
@@ -433,7 +434,7 @@ class Server
             ],
             [
                 'name' => 'brain_checkpoint',
-                'title' => 'Checkpoint Navi-Brain',
+                'title' => 'Checkpoint ' . Name::get() . '-Brain',
                 'description' => 'Synchronously persist the C daemon’s learned token counters, associations, and memory-access state, then record a lightweight checkpoint marker. Normal output is only a terse acknowledgement; use debug to inspect the marker.',
                 'inputSchema' => [
                     'type' => 'object',

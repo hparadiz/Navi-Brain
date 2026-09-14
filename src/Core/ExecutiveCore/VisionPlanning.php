@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core\ExecutiveCore;
 
+use NaviBrain\Support\Name;
 use NaviBrain\Model\WorkItem;
 
 use InvalidArgumentException;
@@ -243,12 +244,12 @@ class VisionPlanning extends Component
 
         $unexplained = array_map(static fn (array $event): array => [ 'sense' => $event['sense_key'], 'noticed' => $event['summary'], ], $this->sensoryCortex()->pendingEvents(5));
 
-        $composition = new ExecutiveComposition('Navi can request one installed observation of this machine. ' . 'The service reads bounded, fixed kernel information files for the selected operation.');
+        $composition = new ExecutiveComposition(sprintf('%s can request one installed observation of this machine. The service reads bounded, fixed kernel information files for the selected operation.', Name::get()));
 
         $thread = CognitiveThread::getByField('thread_key', Executive::SELF_PRESENCE_THREAD_KEY);
         $track = $thread instanceof CognitiveThread ? $this->heldFocus($thread, $now) : null;
         if ($track !== null) {
-            $composition->contribute('intent', 'This is what Navi is working on. If something could be found out that moves it forward, ' . 'look at that rather than at whatever is merely nearby.', $track);
+            $composition->contribute('intent', sprintf('This is what %s is working on. If something could be found out that moves it forward, look at that rather than at whatever is merely nearby.', Name::get()), $track);
         }
 
         $composition->contribute(

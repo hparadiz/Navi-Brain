@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core\ExecutiveCore;
 
+use NaviBrain\Support\Name;
 use NaviBrain\Core\ExecutiveComposition;
 use NaviBrain\Model\CognitiveThread;
 use NaviBrain\Model\Intention;
@@ -45,7 +46,7 @@ class IntentionCompletion extends Component
             ];
         }
 
-        $composition = new ExecutiveComposition('Navi is checking whether something being worked on is actually finished.');
+        $composition = new ExecutiveComposition(sprintf('%s is checking whether something being worked on is actually finished.', Name::get()));
         $composition->contribute(
             'termination_test',
             'Decide whether the success condition is met by the evidence, and nothing more. '

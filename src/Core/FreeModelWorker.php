@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Support\Name;
 use NaviBrain\Model\WorkItem;
 
 use NaviBrain\Core\ExecutiveCore\Executive;
@@ -233,7 +234,7 @@ class FreeModelWorker
             '/usr/bin/timeout', '--signal=TERM', '--kill-after=5s', '85s',
             $this->opencodeBinary, 'run', '--pure', '--format', 'json', '--model', $model,
             '--variant', 'minimal', '--agent', 'navi-dream', '--dir', $this->runtimeRoot . '/work',
-            '--title', 'Navi memory consolidation',
+            '--title', Name::get() . ' memory consolidation',
         ], $prompt, 95, ['OPENCODE_CONFIG_CONTENT' => $config]);
         try {
             $this->checkStreamErrors($result['output']);
@@ -287,7 +288,7 @@ class FreeModelWorker
             . "\n\nRequired response fields:\n"
             . PlainText::render($this->workerSchema((string) $work['work_type']), 5000, 20);
         $wall = max(1, min(3600, $wall));
-        $title = sprintf('navi:%s:%d', $work['work_type'], $work['id']);
+        $title = sprintf('%s:%s:%d', mb_strtolower(Name::get()), $work['work_type'], $work['id']);
         $result = $this->runProcess([
             '/usr/bin/timeout',
             '--signal=TERM',

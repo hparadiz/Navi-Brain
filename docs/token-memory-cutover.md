@@ -206,6 +206,12 @@ before its trigger commit; replacement fails closed.
 
 ## Mesh replication
 
+Configure `NAVI_REPLICATION_REMOTE_HOST` and `NAVI_REPLICATION_REMOTE_DIR` in
+the checkout's `.env`; there is no default remote destination. Set
+`NAVI_REPLICATION_LOCAL_DIR` only to use a different local checkout. Process
+environment values override `.env`. Database, token store, and quiescence-helper
+overrides can also be set in `.env`.
+
 `bin/replicate` now requires `NAVI_REPLICATION_QUIESCE_HELPER` to be an absolute,
 non-symlink executable. The helper protocol is:
 

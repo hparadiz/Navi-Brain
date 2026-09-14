@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Support\Name;
+
 class ActionSelector
 {
 
@@ -20,7 +22,7 @@ class ActionSelector
         if (($available['answer'] ?? false) === true) {
             return [
                 'chosen' => 'answer',
-                'because' => 'someone is waiting on an answer, which outranks anything Navi might prefer',
+                'because' => sprintf('someone is waiting on an answer, which outranks anything %s might prefer', Name::get()),
                 'scores' => ['answer' => 1.0],
                 'action_distribution' => ['answer' => 1.0],
                 'baseline_chosen' => 'answer',

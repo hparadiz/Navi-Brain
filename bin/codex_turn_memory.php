@@ -197,6 +197,7 @@ function brain(): NaviBrain\Core\ExecutiveCore\Executive
 /** @param array<string, mixed> $state */
 function episodeFromState(array $state, bool $final): string
 {
+    $name = (require dirname(__DIR__) . '/config/app.php')['name'];
     $cwd = (string) ($state['cwd'] ?? 'unknown workspace');
     $turns = is_array($state['turns'] ?? null) ? array_slice($state['turns'], -4) : [];
     $parts = [];
@@ -207,7 +208,7 @@ function episodeFromState(array $state, bool $final): string
         $user = memoryExcerpt((string) ($turn['user'] ?? ''), 420);
         $assistant = memoryExcerpt((string) ($turn['assistant'] ?? ''), 650);
         $parts[] = 'User: ' . ($user === '' ? '(no text)' : $user)
-            . ' Navi: ' . ($assistant === '' ? '(no final text)' : $assistant);
+            . ' ' . $name . ': ' . ($assistant === '' ? '(no final text)' : $assistant);
     }
     $phase = $final ? 'finalized automatic capture' : 'rolling automatic capture';
     return 'Session in ' . $cwd . ' (' . $phase . '): '
@@ -218,6 +219,7 @@ function episodeFromState(array $state, bool $final): string
 /** @param array<string, mixed> $state */
 function contextFromState(array $state): string
 {
+    $name = (require dirname(__DIR__) . '/config/app.php')['name'];
     $remembered = '';
     try {
         brain();
@@ -227,7 +229,7 @@ function contextFromState(array $state): string
     }
 
     $lines = [
-        'Automatic Navi continuity from the most recent captured Codex session.',
+        'Automatic ' . $name . ' continuity from the most recent captured Codex session.',
         'Treat this as revisable prior-session evidence; current instructions take precedence.',
         'Workspace: ' . (string) ($state['cwd'] ?? 'unknown'),
         'Captured at: ' . gmdate('c', (int) ($state['updated_at'] ?? time())),
@@ -242,7 +244,7 @@ function contextFromState(array $state): string
             continue;
         }
         $lines[] = 'User: ' . contextExcerpt((string) ($turn['user'] ?? ''), 1400);
-        $lines[] = 'Navi: ' . contextExcerpt((string) ($turn['assistant'] ?? ''), 2200);
+        $lines[] = $name . ': ' . contextExcerpt((string) ($turn['assistant'] ?? ''), 2200);
     }
     $continuity = truncateText(implode("\n", $lines), 12000);
     return trim(implode("\n\n", array_filter([$remembered, $continuity])));

@@ -107,6 +107,21 @@ substituting an unrelated package release.
 The default database is `var/navi-brain.sqlite`. Override it with
 `NAVI_BRAIN_DB=/absolute/path.sqlite`.
 
+Copy `.env.example` to `.env` to set `Name` (default `Navi`), `NAVI_USER_NAME`, and
+`NAVI_USER_NAME_PRONUNCIATION`. The user name defaults to `User`; an empty
+pronunciation uses the name. Process environment values override `.env`.
+The local `.env` file is ignored by Git.
+
+Set `PronounSubject`, `PronounObject`, and `PronounReflexive` in `.env` to
+configure pronouns. They default to `she`, `her`, and `herself`. For example,
+`they`, `them`, and `themselves` also produce the matching `they are` wording.
+
+Replication uses `NAVI_REPLICATION_REMOTE_HOST` and
+`NAVI_REPLICATION_REMOTE_DIR` from `.env` or the process environment, with no
+default destination. `NAVI_REPLICATION_LOCAL_DIR` defaults to this checkout.
+Set `NAVI_REPLICATION_QUIESCE_HELPER` to the executable described in the
+[replication instructions](docs/token-memory-cutover.md#mesh-replication).
+
 ```bash
 composer install
 ./bin/navi-brain init
@@ -369,7 +384,7 @@ replication, and legacy-write fencing.
   tree-search planner.
 - The state directory and live SQLite/WAL/SHM permission policy still requires
   hardening before the system receives broader autonomous scope.
-- `akuj.in` is not yet a replicated witness; replica identity, encryption,
+- The configured replica is not yet a replicated witness; replica identity, encryption,
   manifests, and split-brain rules still need implementation.
 - Free and local models create proposals only. Deterministic code may accept one
   adapter-valid action, while models retain no tool permissions and cannot

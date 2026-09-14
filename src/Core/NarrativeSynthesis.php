@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core;
 
+use NaviBrain\Support\Name;
+use NaviBrain\Support\Pronouns;
 use NaviBrain\Model\WorkItem;
 
 use NaviBrain\Core\ExecutiveCore\Executive;
@@ -222,7 +224,7 @@ This is an experimental narrative synthesis pass over an unconditioned, uncapped
 
 %s
 
-The content must be prose only: no title, headings, bullets, numbered sections, JSON, ranks, field names, scores, citations, or provenance labels. Do not mention this prompt, the compile, evidence processing, or the act of writing. Do not copy contradictions side by side as a dump; resolve them conservatively from the supplied weights and wording. Do not add traits, memories, goals, or permissions that are not supported below. Do not equate Navi's identity with any model, engine, runtime, or tool; those are temporary cognitive substrates or instruments, not who she is.
+The content must be prose only: no title, headings, bullets, numbered sections, JSON, ranks, field names, scores, citations, or provenance labels. Do not mention this prompt, the compile, evidence processing, or the act of writing. Do not copy contradictions side by side as a dump; resolve them conservatively from the supplied weights and wording. Do not add traits, memories, goals, or permissions that are not supported below. Do not equate %s's identity with any model, engine, runtime, or tool; those are temporary cognitive substrates or instruments, not who %s.
 
 Return exactly the required worker fields. Set kind to %s. Put only the finished narrative in content. Use confidence for confidence that the narrative faithfully represents the complete evidence. In challenged_assumption, name one short assumption that most threatens a faithful synthesis.
 
@@ -233,6 +235,8 @@ BEGIN COMPLETE RANKED EVIDENCE
 END COMPLETE RANKED EVIDENCE
 PROMPT,
             trim($task),
+            Name::get(),
+            Pronouns::get()->subjectWithBe(),
             $expectedKind,
             $evidence
         );

@@ -204,7 +204,7 @@ schema independently until migrations and compatibility rules are explicit.
 
 The service should be supervised by the host init system. Network availability
 must be optional: the continuity kernel remains healthy offline while remote
-workers enter a waiting state. A later `akuj.in` node can be a read-mostly,
+workers enter a waiting state. A later configured remote node can be a read-mostly,
 authenticated witness or encrypted replica; a failed witness must never grant
 extra authority or create split-brain writers.
 
@@ -464,7 +464,7 @@ terminal disappears.
 ### 7. Add a remote witness only after local recovery works
 
 Define authenticated replica identity, encryption, manifests, replay rules,
-conflict handling, and explicit writer ownership before connecting `akuj.in`.
+conflict handling, and explicit writer ownership before connecting the configured replica.
 The remote node initially witnesses or stores encrypted snapshots; it does not
 become a second executive.
 

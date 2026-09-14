@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core\ExecutiveCore;
 
+use NaviBrain\Support\Name;
+use NaviBrain\Support\Pronouns;
 use NaviBrain\Model\WorkItem;
 
 use InvalidArgumentException;
@@ -207,7 +209,7 @@ class SelfPresenceComposition extends Component
                 $addressed
             ));
             return implode("\n", [
-                'Navi is answering speech addressed to her right now.',
+                sprintf('%s is answering speech addressed to %s right now.', Name::get(), Pronouns::get()->object),
                 'Answer the spoken content directly. Do not discuss sensors, cognition, waiting, or this instruction.',
                 "Heard, oldest to newest:\n" . PlainText::render($heard, 3000, 8),
                 'Use 3 to 36 spoken words. No code, file paths, identifiers, brackets, symbols, or URLs.',
@@ -219,16 +221,16 @@ class SelfPresenceComposition extends Component
 
         $track = $this->heldFocus($thread, $now);
 
-        $composition = new ExecutiveComposition('Navi is deciding whether to say one thing out loud right now, and what.');
+        $composition = new ExecutiveComposition(sprintf('%s is deciding whether to say one thing out loud right now, and what.', Name::get()));
 
         if ($track !== null) {
             $composition->contribute(
                 'goal_maintenance',
-                'This is what Navi has been working on and means to tell the user about. If Navi speaks, it is about this. Say the specific thing Navi found or is stuck on, not that Navi has been busy.',
+                sprintf('This is what %1$s has been working on and means to tell the user about. If %1$s speaks, it is about this. Say the specific thing %1$s found or is stuck on, not that %1$s has been busy.', Name::get()),
                 $track
             );
-            if (($track['what_navi_already_knows'] ?? []) !== []) {
-                $composition->contribute('knowledge', 'Ground the line in one of these rather than speaking in general terms.', $track['what_navi_already_knows']);
+            if (($track['what_is_already_known'] ?? []) !== []) {
+                $composition->contribute('knowledge', 'Ground the line in one of these rather than speaking in general terms.', $track['what_is_already_known']);
             }
         }
 
@@ -255,7 +257,7 @@ class SelfPresenceComposition extends Component
 
         $composition->contribute(
             'working_memory',
-            'Navi has said these already. Saying a version of one again is worse than saying nothing.',
+            sprintf('%s has said these already. Saying a version of one again is worse than saying nothing.', Name::get()),
             ['recent_lines' => $recentMoments, 'recent_thoughts' => $recentThoughts]
         );
 
@@ -387,7 +389,7 @@ class SelfPresenceComposition extends Component
             'following' => (string) $intention->title,
             'why_it_matters' => (string) $intention->reason,
             'what_is_next' => (string) $intention->next_action,
-            'what_navi_already_knows' => $knows,
+            'what_is_already_known' => $knows,
         ];
     }
 

@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace NaviBrain\Core\ExecutiveCore;
 
+use NaviBrain\Support\Name;
+use NaviBrain\Support\Pronouns;
+use Divergence\App;
 use NaviBrain\Core\ExecutiveControl;
 use NaviBrain\Model\CognitiveThread;
 use NaviBrain\Model\SenseEvent;
@@ -46,8 +49,8 @@ class MindStream extends Component
 
         $recentMonologue = $this->recentStreamThoughts(5);
         $priorityLines = [
-            'You are one line of Navi\'s inner monologue.',
-            'Talk to yourself. This is not a status report and not a chat reply to Aku.',
+            sprintf('You are one line of %s\'s inner monologue.', Name::get()),
+            sprintf('Talk to yourself. This is not a status report and not a chat reply to %s.', App::$App->Config['user_name']),
             'This line stays private. Write as addressing yourself, never the user.',
             'Do not act, do not request tools, and do not invent observations outside the workspace.',
             'Return exactly one JSON object with the exact keys kind, content, confidence, and challenged_assumption.',
@@ -60,7 +63,7 @@ class MindStream extends Component
             'If safety_notice is filled, address that interrupt before anything else.',
             'If newest_edge or heard_focus is heard_speech, stay with that spoken change instead of an unchanged constraint.',
             'Do not claim to be conscious, sentient, alive, or a person. Do not claim you ran tools or changed the world.',
-            'Do not address Aku by name and do not ask the user a question; if you ask, ask yourself.',
+            sprintf('Do not address %s by name and do not ask the user a question; if you ask, ask yourself.', App::$App->Config['user_name']),
             'confidence is a number from 0 through 1 reflecting how well the workspace supports this line.',
             'challenged_assumption names what this line of self-talk puts in question.',
             "Your recent inner monologue, newest first (advance from yourself; do not restate the latest line):\n"
@@ -110,7 +113,7 @@ class MindStream extends Component
             'next_operation' => 'think',
             'wake_at' => null,
             'status' => 'active',
-            'last_observation' => sprintf('Talking to herself, with %d attended edge(s) in the workspace.', count($consumed)),
+            'last_observation' => sprintf('Talking to %s, with %d attended edge(s) in the workspace.', Pronouns::get()->reflexive, count($consumed)),
             'updated_at' => $now,
         ]);
         $currentThread->save();
@@ -393,7 +396,10 @@ class MindStream extends Component
             ];
         }
 
-        if (preg_match('/\b(?:aku|ahkoo|hey(?: there)?\b.*\b(?:you|aku)|do you (?:want|think|know)|what(?:\'s| is) on your mind)\b/iu', $content) === 1) {
+        $names = array_unique([App::$App->Config['user_name'], App::$App->Config['user_name_pronunciation']]);
+        $namePattern = '/(?<![\p{L}\p{N}_])(?:' . implode('|', array_map(static fn (string $name): string => preg_quote($name, '/'), $names)) . ')(?![\p{L}\p{N}_])/iu';
+        if (preg_match($namePattern, $content) === 1
+            || preg_match('/\b(?:hey(?: there)?\b.*\byou|do you (?:want|think|know)|what(?:\'s| is) on your mind)\b/iu', $content) === 1) {
             return ['spoken' => false, 'reason' => 'addresses_user'];
         }
 
@@ -432,7 +438,7 @@ class MindStream extends Component
 
         $spent = is_array($thread->spent) ? $thread->spent : [];
         $spent['murmur_count'] = (int) ($spent['murmur_count'] ?? 0) + 1;
-        $thread->setFields([ 'spent' => $spent, 'last_observation' => 'Murmured to herself: ' . $content, 'updated_at' => time(), ]);
+        $thread->setFields([ 'spent' => $spent, 'last_observation' => sprintf('Murmured to %s: %s', Pronouns::get()->reflexive, $content), 'updated_at' => time(), ]);
         $thread->save();
 
         $event = $this->emit('stream.murmur.spoken', [
