@@ -6,7 +6,8 @@ expected filenames, bibliographic records, retrieval sources, and page counts;
 copy. After obtaining the papers, verify the corpus from this directory with
 `sha256sum -c SHA256SUMS`.
 
-Collected 2026-08-07 and expanded 2026-08-08 through 2026-08-10. All 84 numbered
+Collected 2026-08-07 and expanded 2026-08-08 through 2026-08-10, with later
+additions through 2026-10-01. All 85 numbered
 records were validated as parseable PDFs. Numbered filenames retain the
 reading-list order; records #28–#30 were supplied by the user and normalized to
 canonical filenames without being downloaded again. Records #31–#45 form a
@@ -18,7 +19,8 @@ Records #71–#80 trace computational theory of mind from Bayesian inverse
 planning through language-grounded and automated agent models; #81–#83 are
 evaluation guardrails against treating benchmark fluency as functional ToM;
 #84 extends the long-horizon set with a living-world benchmark for proactive,
-persistent life agents.
+persistent life agents. Record #85 adds a five-level framework and Bayesian
+assessment method for AI consciousness.
 
 | # | Paper | Expected filename | Bibliographic record | Retrieval source | Pages |
 |---:|---|---|---|---|---:|
@@ -106,6 +108,7 @@ persistent life agents.
 | 82 | Bawatneh et al. — OmniToM: Benchmarking Theory of Mind in LLMs via Explicit Belief Modeling | `82-bawatneh-et-al-2026-omnitom.pdf` | [arXiv:2605.26322](https://arxiv.org/abs/2605.26322) | [arXiv PDF](https://arxiv.org/pdf/2605.26322) | 30 |
 | 83 | Riemer et al. — Position: Theory of Mind Benchmarks are Broken for Large Language Models | `83-riemer-et-al-2025-tom-benchmarks-broken.pdf` | [ICML 2025 / PMLR 267](https://proceedings.mlr.press/v267/riemer25a.html) | [PMLR PDF](https://raw.githubusercontent.com/mlresearch/v267/main/assets/riemer25a/riemer25a.pdf) | 40 |
 | 84 | Xiaohongshu Dots Studio & Evolvent AI — VibeLifeBench: Can Your Life Agent Be Proactive and Persistent in a Living World? | `84-xiaohongshu-2026-vibelifebench.pdf` | [arXiv:2608.10875](https://arxiv.org/abs/2608.10875) | [arXiv PDF](https://arxiv.org/pdf/2608.10875) | 19 |
+| 85 | Chandaria et al. — From cacophony to hierarchy: a principled framework for assessing AI consciousness | `85-chandaria-et-al-2026-cacophony-to-hierarchy.pdf` | [arXiv:2609.35618v2](https://arxiv.org/abs/2609.35618v2) | [arXiv PDF v2](https://arxiv.org/pdf/2609.35618v2) | 151 |
 
 ## Version notes
 
@@ -149,6 +152,10 @@ persistent life agents.
 - #81–#83 are catalogued as evaluation guardrails for the theory-of-mind set.
 - #84 is the arXiv v1 preprint. Its cover credits Xiaohongshu Dots Studio and
   Evolvent AI; arXiv's PDF metadata identifies the author as Xiaohongshu Inc.
+- #85 is the arXiv v2 preprint dated 2026-09-29, retrieved 2026-10-01.
+  The local PDF has 151 pages, although the arXiv comments list 150. Its
+  illustrative consciousness probabilities demonstrate sensitivity to theoretical
+  assumptions and indicator readings, not empirically established probabilities.
 - #64 was requested as "EvolveMem: Self-Evolving Memory Architecture via
   Autonomous Optimization" by Xia et al. The actual paper is *EvolveMem:
   Self-Evolving Memory Architecture via AutoResearch for LLM Agents*, whose
@@ -161,6 +168,10 @@ persistent life agents.
 ## Validation
 
 Every numbered file has PDF magic, parses with `pdfinfo`, and has title and author information matching the requested record. See [SHA256SUMS](SHA256SUMS) for integrity hashes.
+
+- #85 preserves the original arXiv bytes. Poppler reports unterminated-string,
+  dictionary, and font-type warnings, but extracts nonempty text from all 151
+  pages; the title and final conclusion pages were also rendered and inspected.
 
 ## Retrieval failures and substitutions
 
