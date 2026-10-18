@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "navi-brain": {
-      "command": "php",
-      "args": ["./bin/navi-brain-mcp"],
+      "command": "navi-brain-mcp",
+      "args": [],
       "cwd": ".",
       "env_vars": [
         "NAVI_BRAIN_DB",

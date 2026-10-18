@@ -19,6 +19,34 @@ class TokenMemoryDaemon
 
     private static bool $ready = false;
 
+    /** Send prose to the resident FIFO and return without awaiting a write result. */
+    public static function remember(string $content): void
+    {
+        if (trim($content) === '' || strlen($content) > self::MAX_RESPONSE_BYTES
+            || str_contains($content, "\0") || preg_match('//u', $content) !== 1) {
+            throw new RuntimeException('Memory prose must be non-empty UTF-8 text within the request bound.');
+        }
+        $socketPath = self::storePath(dirname(__DIR__, 2)) . '/tokmem.sock';
+        $socket = self::connect($socketPath, $errorMessage);
+        if (!is_resource($socket)) {
+            self::$ready = false;
+            self::ensureRunning();
+            $socket = self::connect($socketPath, $errorMessage);
+            if (!is_resource($socket)) {
+                throw new RuntimeException('Unable to connect to token-memory daemon: ' . $errorMessage);
+            }
+        }
+        try {
+            stream_set_timeout($socket, (int) self::IO_TIMEOUT_SECONDS);
+            $key = self::operationKey('memory-add-prose', hash('sha256', $content));
+            self::writeExact($socket, self::PROTOCOL_ABI . ' REMEMBER ' . $key . ' '
+                . strlen($content) . "\n" . $content);
+            stream_socket_shutdown($socket, STREAM_SHUT_WR);
+        } finally {
+            fclose($socket);
+        }
+    }
+
     public static function activate(string $cue, int $tokenBudget = self::DEFAULT_CONTEXT_TOKENS): string {
         if (trim($cue) === '' || strlen($cue) > self::MAX_RESPONSE_BYTES) {
             throw new RuntimeException('Token-memory activation cue is out of range.');
@@ -479,7 +507,7 @@ class TokenMemoryDaemon
         $last = null;
         for ($attempt = 0; $attempt < 2; $attempt++) {
             try {
-                [$ok, $payload] = self::exchange($header, $body);
+                [$ok, $payload] = self::exchange($header, $body, true);
                 if (!$ok) {
                     throw new RuntimeException('Token-memory daemon rejected receipt request: ' . trim($payload));
                 }
@@ -495,7 +523,7 @@ class TokenMemoryDaemon
     }
 
     /** @return array{bool, string} */
-    private static function exchange(string $header, string $body): array
+    private static function exchange(string $header, string $body, bool $waitForCommit = false): array
     {
         $socketPath = self::storePath(dirname(__DIR__, 2)) . '/tokmem.sock';
         $socket = self::connect($socketPath, $errorMessage);
@@ -508,7 +536,7 @@ class TokenMemoryDaemon
             }
         }
         try {
-            stream_set_timeout($socket, (int) self::IO_TIMEOUT_SECONDS);
+            stream_set_timeout($socket, $waitForCommit ? PHP_INT_MAX : (int) self::IO_TIMEOUT_SECONDS);
             self::writeExact($socket, self::PROTOCOL_ABI . ' ' . $header . $body);
             $responseHeader = @fgets($socket, 128);
             if (!is_string($responseHeader)

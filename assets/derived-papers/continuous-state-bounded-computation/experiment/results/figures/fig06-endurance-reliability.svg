@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="600" viewBox="0 0 1100 600" role="img" aria-labelledby="title desc">
+<title id="title">Sparse maintenance repair and latency</title>
+<desc id="desc">Error repair counts and semantic transition latency quantiles.</desc>
+<style>text{font-family:Inter,DejaVu Sans,Arial,sans-serif;fill:#172033}.small{font-size:13px;fill:#667085}.tick{font-size:12px;fill:#667085}.label{font-size:14px;font-weight:600}.title{font-size:24px;font-weight:700}.subtitle{font-size:14px;fill:#667085}</style>
+<rect width="1100" height="600" fill="#FFFFFF"/>
+<text x="52.00" y="42.00" text-anchor="start" font-size="14" font-weight="400" class="title">Persistent state repairs most errors—but not in 140 ms</text>
+<text x="52.00" y="66.00" text-anchor="start" font-size="14" font-weight="400" class="subtitle">Error episodes are lifecycle counts; latency is measured CPU model time per semantic transition.</text>
+<rect x="55.00" y="105.00" width="460.00" height="410.00" fill="#F7F9FC" stroke="#E4E9F0" stroke-width="1" rx="10" opacity="1"/>
+<text x="71.00" y="131.00" text-anchor="start" font-size="15" font-weight="700">A  Semantic error lifecycle</text>
+<rect x="550.00" y="105.00" width="495.00" height="410.00" fill="#F7F9FC" stroke="#E4E9F0" stroke-width="1" rx="10" opacity="1"/>
+<text x="566.00" y="131.00" text-anchor="start" font-size="15" font-weight="700">B  Transition latency</text>
+<text x="285.00" y="205.00" text-anchor="middle" font-size="54" font-weight="700" style="fill:#059669">944</text>
+<text x="285.00" y="235.00" text-anchor="middle" font-size="15" font-weight="600">of 946 observed episodes repaired</text>
+<rect x="105.00" y="285.00" width="360.00" height="34.00" fill="#E5E7EB" stroke="none" stroke-width="1" rx="7" opacity="1"/>
+<rect x="105.00" y="285.00" width="359.24" height="34.00" fill="#059669" stroke="none" stroke-width="1" rx="7" opacity="1"/>
+<text x="285.00" y="307.00" text-anchor="middle" font-size="14" font-weight="700" style="fill:#FFFFFF">99.79%</text>
+<text x="105.00" y="355.00" text-anchor="start" font-size="15" font-weight="700" style="fill:#DC2626">Unresolved at end: 2</text>
+<text x="105.00" y="383.00" text-anchor="start" font-size="14" font-weight="400">Maximum observed error age: 1,688 ticks</text>
+<text x="105.00" y="408.00" text-anchor="start" font-size="14" font-weight="400">Error-state occupancy: 20.153%</text>
+<text x="105.00" y="433.00" text-anchor="start" font-size="14" font-weight="400">Final presence fields wrong: 2 of 2</text>
+<line x1="610.00" y1="475.00" x2="1005.00" y2="475.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="598.00" y="479.00" text-anchor="end" font-size="14" font-weight="400" class="tick">0.0s</text>
+<line x1="610.00" y1="395.00" x2="1005.00" y2="395.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="598.00" y="399.00" text-anchor="end" font-size="14" font-weight="400" class="tick">0.5s</text>
+<line x1="610.00" y1="315.00" x2="1005.00" y2="315.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="598.00" y="319.00" text-anchor="end" font-size="14" font-weight="400" class="tick">1.0s</text>
+<line x1="610.00" y1="235.00" x2="1005.00" y2="235.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="598.00" y="239.00" text-anchor="end" font-size="14" font-weight="400" class="tick">1.5s</text>
+<line x1="610.00" y1="155.00" x2="1005.00" y2="155.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="598.00" y="159.00" text-anchor="end" font-size="14" font-weight="400" class="tick">2.0s</text>
+<line x1="610.00" y1="452.60" x2="1005.00" y2="452.60" stroke="#DC2626" stroke-width="2" opacity="1" stroke-dasharray="7 5"/>
+<text x="998.00" y="444.60" text-anchor="end" font-size="12" font-weight="700" style="fill:#DC2626">140 ms</text>
+<rect x="660.00" y="255.81" width="60.00" height="219.19" fill="#7C3AED" stroke="none" stroke-width="1" rx="4" opacity="0.84"/>
+<text x="690.00" y="246.81" text-anchor="middle" font-size="12" font-weight="700">1.370s</text>
+<text x="690.00" y="500.00" text-anchor="middle" font-size="14" font-weight="700">p50</text>
+<rect x="785.00" y="219.77" width="60.00" height="255.23" fill="#7C3AED" stroke="none" stroke-width="1" rx="4" opacity="0.84"/>
+<text x="815.00" y="210.77" text-anchor="middle" font-size="12" font-weight="700">1.595s</text>
+<text x="815.00" y="500.00" text-anchor="middle" font-size="14" font-weight="700">p95</text>
+<rect x="910.00" y="177.10" width="60.00" height="297.90" fill="#7C3AED" stroke="none" stroke-width="1" rx="4" opacity="0.84"/>
+<text x="940.00" y="168.10" text-anchor="middle" font-size="12" font-weight="700">1.862s</text>
+<text x="940.00" y="500.00" text-anchor="middle" font-size="14" font-weight="700">p99</text>
+</svg>

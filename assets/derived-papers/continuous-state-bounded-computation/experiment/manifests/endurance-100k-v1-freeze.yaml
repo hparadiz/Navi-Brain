@@ -1,0 +1,29 @@
+manifest_id: endurance-100k-v1-freeze
+frozen_at: 2026-08-13T10:49:06-07:00
+status: locked-before-first-run
+execution_host: kaiju
+
+config:
+  path: configs/endurance-100k-v1.json
+  sha256: 82fac96f6e5aefa5775f748b6324cfdc90730d32e4f9138455befe684fec2419
+
+code:
+  src/csbc_ledger.py: 54c4b73c94c3fa82e679f60210c89650ea751801dd28d21cf0c8b25430b85f80
+  src/llama_adapter.py: 803b43a9f3bb9bb306ac7af9cc29bcac2b2712b3bd1d70014d77d170c549921a
+  scripts/run_oracle.py: 3d5039f9d54eefaf4b665b521708ed0ed28abb23a6f88b36a0690d09da6175e7
+  scripts/run_sparse_neural.py: 38b9644b585f9d69c3d513db4799fd98f0460098ad46c5784f1184bc69a71027
+  scripts/run_reconstruction.py: 791f6bbc983f98b35e906b0a7b5907b6eb77c1068df4f9c35b954fc3a900e8fa
+
+model:
+  manifest: qwen35-9b-heretic-q4ks-provisional-2026-08-13
+  sha256: 9150b2e210b6b6ccb64e5de1f7ed4d66c2edab8d18fb35bba9b427bd782f2328
+  model_seed: 42
+  protocol: compact
+  reasoning: false
+  server_context_tokens: 50000
+
+notes:
+  - One 100,000-tick trajectory corresponds to 3.89 hours at the paper's nominal 140 ms tick.
+  - Full-history context exhaustion is a measured outcome and must not be excluded.
+  - D is the no-maintenance baseline for the later sleep-like audit experiment.
+  - Any code or config change requires a new protocol and freeze manifest.

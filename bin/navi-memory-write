@@ -1,0 +1,17 @@
+#!/usr/bin/env -S php -n
+<?php
+
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/vendor/autoload.php';
+
+try {
+    $prose = stream_get_contents(STDIN, 67_108_865);
+    if (!is_string($prose)) {
+        throw new RuntimeException('Unable to read memory prose from stdin.');
+    }
+    NaviBrain\Storage\TokenMemoryDaemon::remember($prose);
+} catch (Throwable $error) {
+    fwrite(STDERR, $error->getMessage() . PHP_EOL);
+    exit(1);
+}

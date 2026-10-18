@@ -3,10 +3,14 @@
 
 declare(strict_types=1);
 
+require_once dirname(__DIR__) . '/vendor/autoload.php';
+
 const SESSION_MEMORY_VERSION = 1;
 const MAX_STORED_TURNS = 8;
 const MAX_CONTEXT_AGE_SECONDS = 2592000;
 const TRANSCRIPT_TAIL_LINES = 80;
+const TRANSCRIPT_USER_LOOKBACK_LINES = 600;
+const TRANSCRIPT_TAIL_MAX_BYTES = 8388608;
 
 $mode = $argv[1] ?? '--help';
 
@@ -159,7 +163,21 @@ function printHelp(): void
 /** @return array{0: ?string, 1: string, 2: string} [turnId, userText, assistantText] */
 function lastTurnFromTranscript(string $path): array
 {
-    $lines = readLastLines($path, TRANSCRIPT_TAIL_LINES);
+    $turn = scanTranscript($path, TRANSCRIPT_TAIL_LINES);
+    if ($turn[0] === null || $turn[1] !== '') {
+        return $turn;
+    }
+
+    // Tool-heavy turns push the originating user message beyond the short tail
+    // window, so widen the scan once rather than storing an empty user excerpt.
+    $wider = scanTranscript($path, TRANSCRIPT_USER_LOOKBACK_LINES);
+    return $wider[0] === $turn[0] && $wider[1] !== '' ? $wider : $turn;
+}
+
+/** @return array{0: ?string, 1: string, 2: string} [turnId, userText, assistantText] */
+function scanTranscript(string $path, int $maxLines): array
+{
+    $lines = readLastLines($path, $maxLines);
     $assistantText = '';
     $assistantUuid = null;
     $userText = '';
@@ -241,9 +259,10 @@ function readLastLines(string $path, int $maxLines): array
         $buffer = '';
         $chunkSize = 65536;
         $position = fstat($handle)['size'] ?? 0;
+        $floor = max(0, $position - TRANSCRIPT_TAIL_MAX_BYTES);
         $lines = [];
-        while ($position > 0 && count($lines) <= $maxLines) {
-            $read = min($chunkSize, $position);
+        while ($position > $floor && count($lines) <= $maxLines) {
+            $read = min($chunkSize, $position - $floor);
             $position -= $read;
             fseek($handle, $position);
             $buffer = fread($handle, $read) . $buffer;
@@ -257,10 +276,13 @@ function readLastLines(string $path, int $maxLines): array
 }
 
 /** @param array<string, mixed> $state */
-function storeEpisode(array $state, bool $final, ?int $previous): int
+function storeEpisode(array $state, bool $final, ?int $previous): ?int
 {
-    brain();
     $content = episodeFromState($state, $final);
+    if ($content === '') {
+        return $previous;
+    }
+    brain();
     $memory = new NaviBrain\Model\Memory([
         'tier' => 'episodic', 'content' => $content, 'confidence' => 0.97, 'supersedes_id' => $previous,
         'operation_key' => NaviBrain\Storage\TokenMemoryDaemon::operationKey('claude-session-episode', hash('sha256', $content) . ':' . ($previous ?? 0)),
@@ -285,29 +307,13 @@ function brain(): NaviBrain\Core\ExecutiveCore\Executive
 /** @param array<string, mixed> $state */
 function episodeFromState(array $state, bool $final): string
 {
-    $name = (require dirname(__DIR__) . '/config/app.php')['name'];
-    $cwd = (string) ($state['cwd'] ?? 'unknown workspace');
     $turns = is_array($state['turns'] ?? null) ? array_slice($state['turns'], -4) : [];
-    $parts = [];
-    foreach ($turns as $turn) {
-        if (!is_array($turn)) {
-            continue;
-        }
-        $user = memoryExcerpt((string) ($turn['user'] ?? ''), 420);
-        $assistant = memoryExcerpt((string) ($turn['assistant'] ?? ''), 650);
-        $parts[] = 'User: ' . ($user === '' ? '(no text)' : $user)
-            . ' ' . $name . ': ' . ($assistant === '' ? '(no final text)' : $assistant);
-    }
-    $phase = $final ? 'finalized automatic capture' : 'rolling automatic capture';
-    return 'Session in ' . $cwd . ' (' . $phase . '): '
-        . implode(' ', $parts)
-        . ' Earlier rolling revisions for this Claude Code session are superseded.';
+    return NaviBrain\Support\MemoryProse::fromTurns($turns);
 }
 
 /** @param array<string, mixed> $state */
 function contextFromState(array $state): string
 {
-    $name = (require dirname(__DIR__) . '/config/app.php')['name'];
     $remembered = '';
     try {
         brain();
@@ -316,26 +322,9 @@ function contextFromState(array $state): string
         recordError('--session-start remembered context: ' . $throwable->getMessage());
     }
 
-    $lines = [
-        'Automatic ' . $name . ' continuity from the most recent captured Claude Code session.',
-        'Treat this as revisable prior-session evidence; current instructions take precedence.',
-        'Workspace: ' . (string) ($state['cwd'] ?? 'unknown'),
-        'Captured at: ' . gmdate('c', (int) ($state['updated_at'] ?? time())),
-    ];
-    if (is_int($state['memory_id'] ?? null)) {
-        $lines[] = 'Canonical episodic memory id: ' . $state['memory_id'];
-    }
-
     $turns = is_array($state['turns'] ?? null) ? array_slice($state['turns'], -4) : [];
-    foreach ($turns as $turn) {
-        if (!is_array($turn)) {
-            continue;
-        }
-        $lines[] = 'User: ' . contextExcerpt((string) ($turn['user'] ?? ''), 1400);
-        $lines[] = $name . ': ' . contextExcerpt((string) ($turn['assistant'] ?? ''), 2200);
-    }
-    $continuity = truncateText(implode("\n", $lines), 8000);
-    return trim(implode("\n\n", array_filter([$remembered, $continuity])));
+    $continuity = truncateText(NaviBrain\Support\MemoryProse::fromTurns($turns), 8000);
+    return implode("\n\n", array_filter([$remembered, $continuity], static fn (string $text): bool => $text !== ''));
 }
 
 /** @return array<string, mixed> */

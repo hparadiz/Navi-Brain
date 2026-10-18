@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Rebuild a locked token store from a verified store.old, without rewriting prose.
+
+Builds a separate candidate. Publishing is a separate, fully reverified action.
+The engineering log contains hashes and storage metadata, never memory prose.
+"""
+from __future__ import annotations
+import argparse
+import collections
+import ctypes
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import stat
+import struct
+import subprocess
+import tempfile
+
+os.umask(0o077)
+ROOT = Path(__file__).resolve().parent.parent
+LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def require(ok, message):
+    if not ok:
+        raise RuntimeError(message)
+
+
+def read(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOATIME)
+    with os.fdopen(fd, 'rb') as handle:
+        require(stat.S_ISREG(os.fstat(handle.fileno()).st_mode), f'Not a regular file: {path}')
+        return handle.read()
+
+
+def catalog(store):
+    path = store / 'catalog.sqlite3'
+    for suffix in ('-wal', '-journal'):
+        sidecar = Path(str(path) + suffix)
+        require(not sidecar.exists() or sidecar.stat().st_size == 0, f'Uncheckpointed catalog: {sidecar}')
+    data = bytearray(read(path))
+    # deserialize operates on a private, rollback-mode copy; source stays untouched.
+    data[18:20] = b'\1\1'
+    con = sqlite3.connect(':memory:')
+    con.deserialize(data)
+    con.execute('PRAGMA query_only=ON')
+    require(con.execute('PRAGMA integrity_check').fetchone() == ('ok',), 'Catalog integrity failure')
+    return con
+
+
+def inventory(root):
+    result = {}
+    def walk(path):
+        info = path.lstat()
+        require(stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode), f'Unexpected file type: {path}')
+        entry = dict(mode=stat.S_IMODE(info.st_mode), uid=info.st_uid, gid=info.st_gid,
+                     atime_ns=info.st_atime_ns, mtime_ns=info.st_mtime_ns,
+                     ctime_ns=info.st_ctime_ns, inode=info.st_ino,
+                     directory=stat.S_ISDIR(info.st_mode))
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NOATIME
+        if entry['directory']:
+            flags |= os.O_DIRECTORY
+        fd = os.open(path, flags)
+        try:
+            buffer = ctypes.create_string_buffer(256)
+            if LIBC.statx(fd, b'', 0x1000, 0xfff, buffer) == 0:
+                mask = struct.unpack_from('<I', buffer.raw)[0]
+                if mask & 0x800:
+                    seconds, nanos = struct.unpack_from('<qI', buffer.raw, 80)
+                    entry['birthtime_ns'] = seconds * 1_000_000_000 + nanos
+            if entry['directory']:
+                names = sorted(os.listdir(fd))
+            else:
+                digest = hashlib.sha256()
+                with os.fdopen(os.dup(fd), 'rb') as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b''):
+                        digest.update(block)
+                entry.update(size=info.st_size, sha256=digest.hexdigest())
+        finally:
+            os.close(fd)
+        result[str(path.relative_to(root))] = entry
+        if entry['directory']:
+            for name in names:
+                walk(path / name)
+    walk(root)
+    return result
+
+
+def same_bytes(left, right):
+    keys = ('directory', 'mode', 'uid', 'gid', 'size', 'sha256')
+    return {p: {k: s[k] for k in keys if k in s} for p, s in left.items()} == {
+        p: {k: s[k] for k in keys if k in s} for p, s in right.items()}
+
+
+def tokens(con):
+    rows = list(con.execute('SELECT token_id,segment,left_id,right_id FROM token_translation ORDER BY token_id'))
+    require([r[0] for r in rows] == list(range(len(rows))), 'Token IDs have gaps')
+    result = [bytes(r[1]) for r in rows]
+    require(result[:256] == [bytes([i]) for i in range(256)], 'Invalid foundational tokens')
+    for i, segment, left, right in rows:
+        require((left is None) == (right is None), f'Invalid token parents: {i}')
+        if left is not None:
+            require(0 <= left < i and 0 <= right < i and result[left] + result[right] == segment,
+                    f'Invalid composite token: {i}')
+    return result
+
+
+def decode(path, segments):
+    data = read(path)
+    require(data[:8] == b'NAVIMEM1' and len(data) >= 16, f'Invalid memory magic: {path}')
+    count = struct.unpack_from('<Q', data, 8)[0]
+    ids = []
+    value = shift = 0
+    for byte in data[16:]:
+        value |= (byte & 127) << shift
+        if byte < 128:
+            require(value < len(segments), f'Unknown token: {path}')
+            ids.append(value)
+            value = shift = 0
+        else:
+            shift += 7
+            require(shift < 70, f'Invalid ULEB128: {path}')
+    require(shift == 0 and len(ids) == count, f'Invalid token count: {path}')
+    return b''.join(segments[i] for i in ids), ids
+
+
+def metadata(raw):
+    lines = raw.splitlines()
+    require(len(lines) in (10, 11) and raw.endswith(b'\n'), 'Invalid metadata framing')
+    def field(line):
+        count, _, encoded = line.partition(b' ')
+        value = bytes.fromhex(encoded.decode())
+        require(len(value) == int(count), 'Invalid metadata byte length')
+        return value.decode('utf-8')
+    nullable = lambda line: None if line == b'-' else int(line)
+    return (int(lines[0]), field(lines[1]), field(lines[2]), field(lines[3]),
+            struct.unpack('>d', bytes.fromhex(lines[4].decode()))[0], field(lines[5]),
+            nullable(lines[6]), nullable(lines[7]), nullable(lines[8]),
+            None if lines[9] == b'-' else field(lines[9]),
+            lines[10].decode() if len(lines) == 11 else None)
+
+
+def records(store, segments):
+    paths = sorted((store / 'memories').glob('*/*'), key=lambda p: int(p.name))
+    for path in paths:
+        content, ids = decode(path / 'content.memory', segments)
+        raw_meta, _ = decode(path / 'metadata.memory', segments)
+        meta = metadata(raw_meta)
+        require(meta[0] == int(path.name) and meta[3] == path.parent.name, 'Memory identity mismatch')
+        manifest = read(path / 'manifest.sha256').decode().splitlines()
+        require(len(manifest) == 2, f'Invalid manifest: {path}')
+        for line, filename in zip(manifest, ('content.memory', 'metadata.memory')):
+            expected = hashlib.sha256(read(path / filename)).hexdigest() + '  ' + filename
+            require(line == expected, f'Checksum failure: {path}')
+        yield path, content, raw_meta, meta, ids
+
+
+class Normalizer:
+    def __init__(self):
+        code = ('require $argv[1]; while (($line = fgets(STDIN)) !== false) {'
+                '$text = json_decode($line, true, 512, JSON_THROW_ON_ERROR);'
+                'echo json_encode(NaviBrain\\Support\\MemoryProse::fromLegacy($text),'
+                'JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE), "\\n"; fflush(STDOUT); }')
+        self.process = subprocess.Popen(['php', '-r', code, str(ROOT / 'vendor/autoload.php')],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    def __call__(self, data):
+        self.process.stdin.write(json.dumps(data.decode('utf-8'), ensure_ascii=False) + '\n')
+        self.process.stdin.flush()
+        line = self.process.stdout.readline()
+        require(bool(line), 'Prose normalizer failed; rebuild is not publishable')
+        return json.loads(line).encode('utf-8')
+    def close(self):
+        self.process.stdin.close()
+        require(self.process.wait() == 0, 'Prose normalizer did not exit cleanly')
+
+
+def event(handle, kind, **fields):
+    handle.write(json.dumps(dict(at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                 event=kind, **fields), sort_keys=True) + '\n')
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def restore_state(source, destination, log):
+    old = catalog(source)
+    new = sqlite3.connect(destination / 'catalog.sqlite3')
+    old_segments = dict(old.execute('SELECT token_id,segment FROM token_translation'))
+    new_ids = {bytes(segment): i for i, segment in new.execute('SELECT token_id,segment FROM token_translation')}
+    mapping = {i: new_ids[bytes(segment)] for i, segment in old_segments.items() if bytes(segment) in new_ids}
+    for i, writes, reads, usage in old.execute('SELECT token_id,write_count,read_count,usage_count FROM token_translation'):
+        if i in mapping:
+            new.execute('UPDATE token_translation SET write_count=?,read_count=?,usage_count=? WHERE token_id=?',
+                        (writes, reads, usage, mapping[i]))
+    for table in ('memory_state', 'operation_receipt'):
+        rows = old.execute('SELECT * FROM ' + table).fetchall()
+        new.execute('DELETE FROM ' + table)
+        if rows:
+            new.executemany('INSERT INTO ' + table + ' VALUES(' + ','.join('?' * len(rows[0])) + ')', rows)
+    wanted = {}
+    missing_token = 0
+    for left, right, reinforcement in old.execute('SELECT source_id,target_id,reinforcement FROM link_reinforcement'):
+        if left in mapping and right in mapping:
+            wanted[mapping[left], mapping[right]] = reinforcement
+        else:
+            missing_token += 1
+    found = set()
+    new_segments = tokens(new)
+    for _, _, _, _, sequence in records(destination, new_segments):
+        for offset, left in enumerate(sequence):
+            for right in sequence[offset + 1:offset + 17]:
+                if left != right:
+                    if (left, right) in wanted:
+                        found.add((left, right))
+                    if (right, left) in wanted:
+                        found.add((right, left))
+    new.executemany('INSERT INTO link_reinforcement(source_id,target_id,reinforcement) VALUES(?,?,?)',
+                    [(left, right, wanted[left, right]) for left, right in sorted(found)])
+    new.commit()
+    require(new.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0, 'Candidate checkpoint is busy')
+    new.close()
+    event(log, 'state-preserved', memory_access_rows=old.execute('SELECT count(*) FROM memory_state').fetchone()[0],
+          receipt_rows=old.execute('SELECT count(*) FROM operation_receipt').fetchone()[0],
+          matching_token_counters=len(mapping), reinforcement_rows=len(found),
+          reinforcement_removed_token=missing_token, reinforcement_removed_edge=len(wanted) - len(found),
+          pair_observations='rebuilt in memory ID order from cleaned content')
+    old.close()
+
+
+def verify(source, destination, normalizer):
+    old = catalog(source)
+    new = catalog(destination)
+    source_segments = tokens(old)
+    target_segments = tokens(new)
+    source_rows = records(source, source_segments)
+    target_rows = records(destination, target_segments)
+    markers = {i: (tier, bytes(c), bytes(m)) for i, tier, c, m in new.execute('SELECT * FROM memory_accounting')}
+    count = changed = empty = 0
+    for before in source_rows:
+        after = next(target_rows, None)
+        require(after is not None, 'Rebuild lost a memory')
+        p, content, raw_meta, meta, _ = before
+        q, rebuilt, new_meta, new_fields, _ = after
+        require(raw_meta == new_meta and meta == new_fields, f'Metadata changed for memory {meta[0]}')
+        expected = normalizer(content)
+        require(rebuilt == expected, f'Content changed beyond wrappers for memory {meta[0]}')
+        require(meta[0] == count + 1, 'Memory IDs have gaps')
+        require(markers.pop(meta[0], None) == (meta[3], hashlib.sha256(read(q / 'content.memory')).digest(),
+                                             hashlib.sha256(read(q / 'metadata.memory')).digest()),
+                f'Accounting mismatch for memory {meta[0]}')
+        count += 1
+        changed += content != expected
+        empty += not expected
+    require(next(target_rows, None) is None and not markers, 'Unexpected rebuilt records')
+    require(read(source / 'sqlite-sequence') == read(destination / 'sqlite-sequence'), 'Memory sequence changed')
+    require(int(read(destination / 'sqlite-sequence')) == count, 'Memory sequence is not contiguous')
+    for table in ('memory_state', 'operation_receipt'):
+        require(sorted(old.execute('SELECT * FROM ' + table).fetchall()) == sorted(new.execute('SELECT * FROM ' + table).fetchall()),
+                f'Historical state changed: {table}')
+    require(new.execute('SELECT count(*) FROM neutral_accounting_intent').fetchone()[0] == 0, 'Unsettled import')
+    old_counters = {bytes(segment): (writes, reads, usage) for segment, writes, reads, usage in old.execute('SELECT segment,write_count,read_count,usage_count FROM token_translation')}
+    for segment, writes, reads, usage in new.execute('SELECT segment,write_count,read_count,usage_count FROM token_translation'):
+        expected = old_counters.get(bytes(segment), (bytes(8), bytes(8), bytes(8)))
+        require((writes, reads, usage) == expected, 'Token counters changed for a retained segment')
+    old_ids = {segment: i for i, segment in enumerate(source_segments)}
+    old_links = {(left, right): value for left, right, value in old.execute('SELECT * FROM link_reinforcement')}
+    for left, right, value in new.execute('SELECT * FROM link_reinforcement'):
+        pair = (old_ids.get(target_segments[left]), old_ids.get(target_segments[right]))
+        require(old_links.get(pair) == value, 'Remapped reinforcement changed')
+    old.close()
+    new.close()
+    return dict(memories=count, changed=changed, empty=empty, tokens=len(target_segments))
+
+
+def restore_times(destination, original):
+    for relative, info in sorted(original.items(), key=lambda item: item[0].count('/'), reverse=True):
+        path = destination / relative
+        require(path.exists(), f'Missing rebuilt path: {relative}')
+        os.chmod(path, info['mode'])
+        os.utime(path, ns=(info['atime_ns'], info['mtime_ns']), follow_symlinks=False)
+        actual = path.stat()
+        require(actual.st_atime_ns == info['atime_ns'] and actual.st_mtime_ns == info['mtime_ns'],
+                f'Timestamp precision lost: {relative}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('build', 'publish'))
+    parser.add_argument('--source', type=Path, required=True)
+    parser.add_argument('--active', type=Path, required=True)
+    parser.add_argument('--destination', type=Path, required=True)
+    parser.add_argument('--log', type=Path, required=True)
+    parser.add_argument('--tokmem', type=Path)
+    args = parser.parse_args()
+    source, active, destination = (p.absolute() for p in (args.source, args.active, args.destination))
+    require(len({source, active, destination}) == 3, 'Paths must be distinct')
+    require(source.name == 'store.old', 'Source must be the requested store.old backup')
+    require((source / 'WRITE_LOCK').is_file() and (active / 'WRITE_LOCK').is_file(), 'Source and active store must be write locked')
+    lock_fd = os.open(active / '.lock', os.O_RDWR | os.O_NOFOLLOW)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    before_source = inventory(source)
+    before_active = inventory(active)
+    require(same_bytes(before_source, before_active), 'Active store no longer matches store.old')
+    normalizer = Normalizer()
+    try:
+        if args.action == 'build':
+            require(not destination.exists(), 'Destination already exists; will not overwrite it')
+            require(args.tokmem is not None and os.access(args.tokmem, os.X_OK), 'An offline native importer is required')
+            with args.log.open('x', encoding='utf-8') as log:
+                event(log, 'begin', source=str(source), active=str(active), destination=str(destination),
+                      normalizer_sha256=hashlib.sha256(read(ROOT / 'src/Support/MemoryProse.php')).hexdigest(),
+                      timestamp_limit='Memory timestamps and file atime/mtime preserved exactly; new inode birthtime/ctime cannot be restored.')
+                for relative, info in before_active.items():
+                    log.write(json.dumps(dict(event='original-file', path=relative, **info), sort_keys=True) + '\n')
+                log.flush()
+                old = catalog(source)
+                require(old.execute('SELECT count(*) FROM operation_receipt WHERE state<>1').fetchone()[0] == 0, 'Pending source operation')
+                with tempfile.TemporaryDirectory(prefix='navi-rebuild-input-') as scratch:
+                    input_path = Path(scratch) / 'memories.sqlite'
+                    con = sqlite3.connect(input_path)
+                    con.execute('CREATE TABLE memories(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,updated_at TEXT,tier TEXT,content TEXT,confidence REAL,status TEXT,source_event_id INTEGER,source_memory_id INTEGER,supersedes_id INTEGER,expires_at TEXT,source_event_kind TEXT)')
+                    for path, content, raw_meta, meta, _ in records(source, tokens(old)):
+                        clean = normalizer(content)
+                        con.execute('INSERT INTO memories VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                                    (*meta[:4], clean.decode('utf-8'), *meta[4:]))
+                        log.write(json.dumps(dict(event='memory', id=meta[0], changed=clean != content,
+                            original_content_sha256=hashlib.sha256(content).hexdigest(),
+                            rebuilt_content_sha256=hashlib.sha256(clean).hexdigest(),
+                            metadata_sha256=hashlib.sha256(raw_meta).hexdigest(),
+                            created_at=meta[1], updated_at=meta[2], empty=not clean), sort_keys=True) + '\n')
+                    con.execute("UPDATE sqlite_sequence SET seq=? WHERE name='memories'", (int(read(source / 'sqlite-sequence')),))
+                    con.commit()
+                    con.close()
+                    event(log, 'import-start')
+                    process = subprocess.Popen([str(args.tokmem), 'import', str(destination), str(input_path)],
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    for line in process.stdout:
+                        print(line.rstrip(), flush=True)
+                        event(log, 'native-import', message=line.rstrip())
+                    require(process.wait() == 0, 'Native importer failed; active store remains untouched')
+                old.close()
+                restore_state(source, destination, log)
+                subprocess.run([str(args.tokmem), 'verify', str(destination)], check=True)
+                for name in ('WRITE_LOCK', '.start.lock'):
+                    if (source / name).exists():
+                        (destination / name).write_bytes(read(source / name))
+                result = verify(source, destination, normalizer)
+                restore_times(destination, before_active)
+                require(same_bytes(before_source, inventory(source)), 'Backup changed during rebuild')
+                require(same_bytes(before_active, inventory(active)), 'Active store changed during rebuild')
+                event(log, 'verified-candidate', **result)
+                print(json.dumps(result), flush=True)
+        else:
+            log_entries = [json.loads(line) for line in args.log.read_text().splitlines()]
+            require(any(row['event'] == 'verified-candidate' for row in log_entries), 'No verified build log')
+            first = log_entries[0]
+            require((first['source'], first['active'], first['destination']) == (str(source), str(active), str(destination)), 'Build log path mismatch')
+            require(first['normalizer_sha256'] == hashlib.sha256(read(ROOT / 'src/Support/MemoryProse.php')).hexdigest(), 'Normalizer changed since build')
+            original = {row['path']: {k: v for k, v in row.items() if k not in ('event', 'path')} for row in log_entries if row['event'] == 'original-file'}
+            require(same_bytes(original, before_active), 'Original store changed since build')
+            require((destination / 'WRITE_LOCK').is_file(), 'Candidate is not write locked')
+            result = verify(source, destination, normalizer)
+            restore_times(destination, original)
+            with args.log.open('a', encoding='utf-8') as log:
+                for path in (destination / 'WRITE_LOCK', destination / 'catalog.sqlite3', destination / 'sqlite-sequence', destination):
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOATIME)
+                    os.fsync(fd)
+                    os.close(fd)
+                event(log, 'publish-ready', **result)
+                require(LIBC.renameat2(-100, os.fsencode(active), -100, os.fsencode(destination), 2) == 0,
+                        f'Atomic store exchange failed: {ctypes.get_errno()}')
+                parent_fd = os.open(active.parent, os.O_RDONLY | os.O_DIRECTORY)
+                os.fsync(parent_fd)
+                os.close(parent_fd)
+                event(log, 'published', write_lock=True, tokenizer_executable=False)
+                require(same_bytes(before_active, inventory(destination)), 'Exchanged original failed verification')
+                require(same_bytes(before_source, inventory(source)), 'Backup changed during publication')
+                shutil.rmtree(destination)
+                print(json.dumps(dict(published=str(active), backup=str(source), **result)), flush=True)
+    finally:
+        normalizer.close()
+        os.close(lock_fd)
+
+
+if __name__ == '__main__':
+    main()

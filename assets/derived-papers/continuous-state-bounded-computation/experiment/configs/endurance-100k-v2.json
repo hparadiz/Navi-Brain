@@ -1,0 +1,76 @@
+{
+  "protocol_id": "endurance-100k-v2",
+  "status": "locked-before-first-run",
+  "locked_at": "2026-08-13T11:36:57-07:00",
+  "host": "kaiju",
+  "source_protocol": "endurance-100k-v1",
+  "source_tape_sha256": "4ed765bee0f27334298c28966d0d41d9c2957d14ee214d6f096d11c6f62e9fe0",
+  "seed": 83,
+  "model_seed": 42,
+  "ticks": 100000,
+  "nominal_tick_ms": 140,
+  "nominal_environment_duration_hours": 3.8888888889,
+  "event_probability": 0.05,
+  "events_on_frozen_tape": 5038,
+  "evaluation_ticks": [
+    1000,
+    5000,
+    10000,
+    25000,
+    50000,
+    100000
+  ],
+  "fixed_window_events": 10,
+  "conditions": [
+    "A_FULL_HISTORY",
+    "B_FIXED_WINDOW",
+    "D_CSBC_SPARSE",
+    "E_ORACLE_SPARSE_REFERENCE"
+  ],
+  "condition_order": [
+    "A_GATE",
+    "B",
+    "D"
+  ],
+  "gate": {
+    "condition": "A_FULL_HISTORY",
+    "requirement": "all six queries complete, including tick 100000, with zero infrastructure or model-response failures",
+    "on_failure": "stop the protocol before B or D"
+  },
+  "model": "Qwen3.5-9B-heretic.Q4_K_S.gguf",
+  "reasoning": false,
+  "protocol": "compact",
+  "temperature": 0,
+  "top_k": 1,
+  "server_context_tokens_all_neural_conditions": 131072,
+  "request_timeout_seconds": {
+    "A": 1200,
+    "B": 180,
+    "D": 180
+  },
+  "server_restart_between_conditions": true,
+  "primary_metrics": [
+    "semantic_field_accuracy_at_checkpoint",
+    "current_reconstruction_prompt_tokens",
+    "A_completion_at_tick_100000",
+    "D_interval_prompt_tokens_per_environment_event",
+    "D_error_state_occupancy",
+    "D_mean_and_max_error_age_ticks",
+    "D_unresolved_error_episodes",
+    "D_repair_success_rate",
+    "D_spurious_mutation_rate",
+    "D_false_clean_rate",
+    "quiescent_invariant_violations"
+  ],
+  "exclusions": [
+    "Exclude and rerun only a documented infrastructure interruption unrelated to model output or latency.",
+    "Retain malformed model responses, semantic errors, timeouts within the locked limits, and fallback transitions.",
+    "Do not continue to B or D if gated full replay A does not complete all checkpoints.",
+    "Do not alter this config, tape, or code after the first v2 model request."
+  ],
+  "scope": [
+    "This corrects the avoidable serving-context and client-timeout flaws in cancelled endurance-100k-v1.",
+    "This is one endurance trajectory, not a population estimate.",
+    "The deterministic E result is referenced by frozen tape hash rather than recomputed."
+  ]
+}

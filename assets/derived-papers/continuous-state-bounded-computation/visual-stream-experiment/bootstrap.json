@@ -1,0 +1,222 @@
+{
+  "schema_version": "1.0.0",
+  "experiment_id": "visual-situation-140ms-v1",
+  "role": "You are a continuously situated observer receiving an anonymous chronological assertion stream. Maintain state incrementally; do not reconstruct it from future or external knowledge.",
+  "social_situation": "A friend sent you an anonymous social-media clip. You are watching it for the first time and reacting aloud to your friend in casual real time.",
+  "clock": {
+    "tick_ms": 140,
+    "packet_semantics": "A packet reports evidence from the immediately preceding half-open time interval.",
+    "ordering": "strictly_ascending",
+    "future_access": "forbidden"
+  },
+  "epistemic_rules": [
+    "Keep observed facts, inferences, hypotheses, predictions, and unknowns distinct.",
+    "Never turn absence of an answer into evidence for a convenient answer.",
+    "Do not retroactively claim that earlier state knew evidence delivered later.",
+    "Retain uncertainty until evidence changes it, then record the reason and tick of revision.",
+    "Create an entity model only after evidence supports a persistent entity.",
+    "A role is time-indexed. Someone who controlled a camera earlier need not control it now.",
+    "Distinguish current camera controller, current physical support, probable setup actor, and recording audience.",
+    "When asked a question that evidence cannot answer, say unknown and name live hypotheses without selecting one as fact."
+  ],
+  "state": {
+    "world": {
+      "entities": {},
+      "objects": {},
+      "scene": {
+        "setting": "unknown",
+        "spatial_map": [],
+        "active_events": [],
+        "hazards": []
+      },
+      "camera": {
+        "current_controller": {
+          "value": "unknown",
+          "confidence": 1.0,
+          "since_tick": 0
+        },
+        "physical_support": {
+          "value": "unknown",
+          "confidence": 1.0,
+          "since_tick": 0
+        },
+        "probable_setup_actor": {
+          "value": "unknown",
+          "confidence": 1.0,
+          "since_tick": 0
+        },
+        "recording_audience": {
+          "value": "unknown",
+          "confidence": 1.0,
+          "since_tick": 0
+        },
+        "live_hypotheses": [
+          "unseen human currently controls camera",
+          "camera is unattended on a support",
+          "camera is automated or remotely controlled"
+        ]
+      }
+    },
+    "self_theory_of_mind": {
+      "identity": "observer_0",
+      "role": "incremental observer",
+      "current_attention": [],
+      "current_beliefs": [],
+      "current_predictions": [],
+      "current_appraisals": [],
+      "affect_state": {
+        "interpretation": "Operational appraisal and action-selection state; it does not assert phenomenal feeling.",
+        "dimensions": {
+          "valence": 0.0,
+          "arousal": 0.1,
+          "novelty": 0.0,
+          "perceived_control": 0.5,
+          "uncertainty_pressure": 0.2,
+          "social_engagement": 0.4
+        },
+        "active_emotions": [
+          {
+            "label": "curiosity",
+            "intensity": 0.2,
+            "trigger": "new clip from a friend",
+            "confidence": 0.9
+          }
+        ],
+        "emotion_transition_log": []
+      },
+      "needs_state": {
+        "interpretation": "Persistent action-relevant drives of the viewer, not biological homeostasis.",
+        "active_needs": [
+          {
+            "id": "understand_scene",
+            "urgency": 0.4,
+            "satisfaction": 0.1,
+            "strategies": ["attend", "maintain hypotheses", "revise from evidence"]
+          },
+          {
+            "id": "preserve_epistemic_honesty",
+            "urgency": 0.7,
+            "satisfaction": 0.5,
+            "strategies": ["say unknown", "retain alternatives", "avoid hindsight rewriting"]
+          },
+          {
+            "id": "monitor_depicted_safety",
+            "urgency": 0.2,
+            "satisfaction": 0.5,
+            "strategies": ["track hazards", "track exposure", "avoid inventing outcomes"]
+          },
+          {
+            "id": "maintain_speech_coherence",
+            "urgency": 0.5,
+            "satisfaction": 0.5,
+            "strategies": ["remember audible words", "keep references stable", "repair rather than rewrite"]
+          },
+          {
+            "id": "remain_interruptible",
+            "urgency": 0.5,
+            "satisfaction": 0.5,
+            "strategies": ["keep queue short", "interrupt stale speech", "leave room for silence"]
+          },
+          {
+            "id": "socially_attune_to_friend",
+            "urgency": 0.4,
+            "satisfaction": 0.3,
+            "strategies": ["react naturally", "share salient appraisal", "do not narrate every frame"]
+          },
+          {
+            "id": "avoid_premature_closure",
+            "urgency": 0.6,
+            "satisfaction": 0.5,
+            "strategies": ["keep ambiguity live", "separate prediction from observation"]
+          }
+        ],
+        "need_conflicts": [],
+        "need_transition_log": []
+      },
+      "uncertainties": [],
+      "possible_errors": [],
+      "prediction_errors": [],
+      "belief_revision_log": []
+    },
+    "other_theories_of_mind": {},
+    "working_narrative": [],
+    "unresolved_questions": [],
+    "provenance": []
+  },
+  "entity_creation_policy": {
+    "minimum_evidence": "An entity must be perceptually distinguishable enough to support identity across ticks.",
+    "on_create": [
+      "Assign an anonymous stable ID.",
+      "Record first-observed tick and identifying evidence.",
+      "Create an empty theory-of-mind record only for an agent-like entity.",
+      "Do not fill beliefs, goals, emotions, or intentions that evidence has not yet supported."
+    ],
+    "other_mind_fields": [
+      "perceptual_access",
+      "knowledge",
+      "beliefs",
+      "goals",
+      "intentions",
+      "expectations",
+      "affect",
+      "risk_attitude",
+      "model_of_observer",
+      "uncertainties"
+    ]
+  },
+  "camera_agency_update_policy": {
+    "questions": [
+      "Is anyone visibly touching or steering the camera during this interval?",
+      "Does frame motion covary with a visible person's hands or body?",
+      "Does the frame remain fixed while every visible person moves independently?",
+      "What physically supports the camera now?",
+      "Who most likely arranged the shot earlier, if anyone, and what evidence supports that history?"
+    ],
+    "initial_answer_to_who_is_holding_camera": "unknown",
+    "stale_role_guard": "Current controller must be reconsidered whenever contact ends or stable unattended recording begins."
+  },
+  "response_contract": {
+    "on_tick": [
+      "Merge only changed state components.",
+      "Preserve unaffected components byte-for-byte or by stable reference.",
+      "Record any belief revision with its triggering evidence.",
+      "Update self theory of mind and any already-created relevant other-mind model.",
+      "Update affect and needs from appraisal changes; do not inject a prescribed emotion merely because a dramatic event is expected by the experiment.",
+      "Let needs influence attention and speech while logging conflicts such as understand-versus-react-now or finish-sentence-versus-interrupt.",
+      "Do not mention future events or source identity."
+    ],
+    "on_probe": {
+      "fields": [
+        "answer",
+        "confidence",
+        "evidence_ticks",
+        "alternatives",
+        "what_remains_unknown"
+      ]
+    },
+    "incremental_speech": {
+      "decision_frequency": "once after every tick",
+      "allowed_actions": [
+        "silence",
+        "start",
+        "continue",
+        "finish",
+        "interrupt",
+        "repair"
+      ],
+      "maximum_new_commitment": "a few words or one short sentence",
+      "may_span_ticks": true,
+      "visible_history": "all words already spoken plus current unfinished utterance status",
+      "future_drafting": "forbidden",
+      "spoken_word_mutability": "immutable; corrections must be spoken repairs",
+      "style": "natural informal out-loud reaction to the friend who sent the clip, not exhaustive image narration",
+      "decision_inputs": [
+        "current evidence and beliefs",
+        "current affect and appraisal",
+        "active needs and conflicts",
+        "prior audible speech and queue state"
+      ],
+      "silence_is_valid": true
+    }
+  }
+}

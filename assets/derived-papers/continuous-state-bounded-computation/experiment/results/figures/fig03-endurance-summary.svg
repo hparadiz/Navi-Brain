@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="610" viewBox="0 0 1040 610" role="img" aria-labelledby="title desc">
+<title id="title">Endurance semantic accuracy</title>
+<desc id="desc">Aggregate and final semantic accuracy across four conditions at 100,000 ticks.</desc>
+<style>text{font-family:Inter,DejaVu Sans,Arial,sans-serif;fill:#172033}.small{font-size:13px;fill:#667085}.tick{font-size:12px;fill:#667085}.label{font-size:14px;font-weight:600}.title{font-size:24px;font-weight:700}.subtitle{font-size:14px;fill:#667085}</style>
+<rect width="1040" height="610" fill="#FFFFFF"/>
+<text x="52.00" y="42.00" text-anchor="start" font-size="14" font-weight="400" class="title">100,000-tick endurance: accuracy at a cost</text>
+<text x="52.00" y="66.00" text-anchor="start" font-size="14" font-weight="400" class="subtitle">Aggregate pools six boundaries; final is the complete eleven-field state at tick 100,000.</text>
+<line x1="95.00" y1="510.00" x2="980.00" y2="510.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="83.00" y="514.00" text-anchor="end" font-size="14" font-weight="400" class="tick">0%</text>
+<line x1="95.00" y1="432.00" x2="980.00" y2="432.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="83.00" y="436.00" text-anchor="end" font-size="14" font-weight="400" class="tick">20%</text>
+<line x1="95.00" y1="354.00" x2="980.00" y2="354.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="83.00" y="358.00" text-anchor="end" font-size="14" font-weight="400" class="tick">40%</text>
+<line x1="95.00" y1="276.00" x2="980.00" y2="276.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="83.00" y="280.00" text-anchor="end" font-size="14" font-weight="400" class="tick">60%</text>
+<line x1="95.00" y1="198.00" x2="980.00" y2="198.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="83.00" y="202.00" text-anchor="end" font-size="14" font-weight="400" class="tick">80%</text>
+<line x1="95.00" y1="120.00" x2="980.00" y2="120.00" stroke="#D9E0EA" stroke-width="1" opacity="1"/>
+<text x="83.00" y="124.00" text-anchor="end" font-size="14" font-weight="400" class="tick">100%</text>
+<rect x="155.62" y="320.91" width="44.00" height="189.09" fill="#2563EB" stroke="none" stroke-width="1" rx="3" opacity="1"/>
+<text x="177.62" y="312.91" text-anchor="middle" font-size="12" font-weight="700">48.5%</text>
+<rect x="211.62" y="368.18" width="44.00" height="141.82" fill="#2563EB" stroke="none" stroke-width="1" rx="3" opacity="0.48"/>
+<text x="233.62" y="360.18" text-anchor="middle" font-size="12" font-weight="700">36.4%</text>
+<text x="205.62" y="538.00" text-anchor="middle" font-size="13" font-weight="600">A  Full replay</text>
+<rect x="376.88" y="297.27" width="44.00" height="212.73" fill="#D97706" stroke="none" stroke-width="1" rx="3" opacity="1"/>
+<text x="398.88" y="289.27" text-anchor="middle" font-size="12" font-weight="700">54.5%</text>
+<rect x="432.88" y="261.82" width="44.00" height="248.18" fill="#D97706" stroke="none" stroke-width="1" rx="3" opacity="0.48"/>
+<text x="454.88" y="253.82" text-anchor="middle" font-size="12" font-weight="700">63.6%</text>
+<text x="426.88" y="538.00" text-anchor="middle" font-size="13" font-weight="600">B  Fixed window</text>
+<rect x="598.12" y="214.55" width="44.00" height="295.45" fill="#059669" stroke="none" stroke-width="1" rx="3" opacity="1"/>
+<text x="620.12" y="206.55" text-anchor="middle" font-size="12" font-weight="700">75.8%</text>
+<rect x="654.12" y="190.91" width="44.00" height="319.09" fill="#059669" stroke="none" stroke-width="1" rx="3" opacity="0.48"/>
+<text x="676.12" y="182.91" text-anchor="middle" font-size="12" font-weight="700">81.8%</text>
+<text x="648.12" y="538.00" text-anchor="middle" font-size="13" font-weight="600">D  Persistent sparse</text>
+<rect x="819.38" y="120.00" width="44.00" height="390.00" fill="#4B5563" stroke="none" stroke-width="1" rx="3" opacity="1"/>
+<text x="841.38" y="112.00" text-anchor="middle" font-size="12" font-weight="700">100.0%</text>
+<rect x="875.38" y="120.00" width="44.00" height="390.00" fill="#4B5563" stroke="none" stroke-width="1" rx="3" opacity="0.48"/>
+<text x="897.38" y="112.00" text-anchor="middle" font-size="12" font-weight="700">100.0%</text>
+<text x="869.38" y="538.00" text-anchor="middle" font-size="13" font-weight="600">E  Oracle</text>
+<rect x="730.00" y="82.00" width="16.00" height="16.00" fill="#334155" stroke="none" stroke-width="1" rx="0" opacity="1"/>
+<text x="754.00" y="95.00" text-anchor="start" font-size="13" font-weight="400">Aggregate</text>
+<rect x="842.00" y="82.00" width="16.00" height="16.00" fill="#334155" stroke="none" stroke-width="1" rx="0" opacity="0.48"/>
+<text x="866.00" y="95.00" text-anchor="start" font-size="13" font-weight="400">Final</text>
+<text x="32.00" y="315.00" text-anchor="middle" font-size="14" font-weight="600" transform="rotate(-90 32.00 315.00)">Semantic accuracy</text>
+<text x="95.00" y="575.00" text-anchor="start" font-size="13" font-weight="400" style="fill:#667085">D used 5.31× A&#x27;s prompt tokens and 6.54× A&#x27;s inference wall time under only six queries.</text>
+</svg>

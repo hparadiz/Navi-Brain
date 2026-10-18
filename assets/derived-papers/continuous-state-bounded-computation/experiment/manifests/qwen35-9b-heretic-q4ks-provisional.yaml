@@ -1,0 +1,54 @@
+model_manifest_id: qwen35-9b-heretic-q4ks-provisional-2026-08-13
+status: development-qualified; publication provenance pending
+evidence: user-supplied model inventory and benchmark results
+model_name: Qwen3.5 9B Heretic
+source: pending
+model_file: "/mnt/kaiju/Models/qwen/qwen3.5-9b-heretic/Qwen3.5-9B-heretic.Q4_K_S.gguf"
+sha256: 9150b2e210b6b6ccb64e5de1f7ed4d66c2edab8d18fb35bba9b427bd782f2328
+parameter_class: 8.95B
+file_size: 4.96 GiB
+weight_quantization: Q4_K_S
+kv_cache_quantization: K q8_0, V q4_0
+declared_context_length: 262144
+tested_context_length: 50000
+chat_template: model metadata ChatML/Jinja template
+structured_output_mode:
+  primary: ordered pipe-delimited enum values constrained by request-specific GBNF
+  ablation: llama-server OpenAI-compatible JSON schema
+  qualification: compact contract 6/7 semantically exact, 7/7 syntactically valid
+temperature: 0
+top_k: 1
+seed_support: pending qualification
+max_output_tokens: condition-specific and preregistered
+batching_configuration: batch 512, microbatch 128, 24 threads
+inference_engine: ik_llama.cpp
+inference_engine_build: commit 3f40e73c, build 4551
+runtime_flags:
+  - numactl --interleave=all
+  - --flash-attn on
+  - --run-time-repack
+  - --mlock
+  - --merge-qkv
+  - --reasoning off
+  - --reasoning-budget 0
+
+write_authority:
+  allowed:
+    - world.server.*.status
+    - entity.*.presence
+    - entity.*.belief.*
+  forbidden:
+    - plan.*
+    - tool.*
+    - action.*
+
+supplied_benchmarks:
+  short_prompt_tokens_per_second: "141.90 +/- 2.20 at pp256"
+  short_generation_tokens_per_second: "17.00 +/- 0.20 at tg32"
+  true_50k_prompt_tokens_per_second: 144.11
+  true_50k_generation_tokens_per_second: 17.15
+  true_50k_generated_tokens: 96
+
+use_decision: >-
+  Selected for development and the seed-7 pilot. Before paper-scale publication,
+  record source and license provenance and freeze the exact runtime manifest.

@@ -10,12 +10,15 @@ as Navi remembering, not as the model that happened to be running. Treat every w
 as something a later session reads with no access to this conversation.
 
 The resident C token-memory daemon owns memory records, activation/ranking, and
-token-budgeted context. SQLite holds executive state; the PHP CLI transports
-requests and coordinates the executive. Use
-`php /home/akujin/Sources/Navi-Brain/bin/navi-brain <command>` when the MCP is
-unavailable or its long-lived process is running older code. Normal status is
-daemon-selected prose; checkpoint acknowledges a successful flush with `saved`.
-Add `--debug-json` only for diagnostics or explicit structured-data processing.
+token-budgeted context. SQLite holds executive state. When the MCP is unavailable,
+recall straight from the daemon with its C client; no PHP is involved:
+
+```sh
+printf '%s' '<thought fragments>' | /home/akujin/Sources/Navi-Brain/memories/build/tokmem client /home/akujin/Sources/Navi-Brain/memories/store/tokmem.sock activate - 1024
+```
+
+The same client with `stats` reports whether the daemon is healthy. Memory reads
+return only prose. Storage metadata stays private.
 
 Unix-socket access can be denied by a harness sandbox even while the daemon is
 healthy. Distinguish access denial from liveness failure. Retry through the
@@ -24,20 +27,20 @@ replacement to work around denied access. If approved access is unavailable,
 save a local handoff and explicitly report that the memory write did not succeed.
 
 The `brain_*` MCP tools are one convenience wrapper over the same core. They are not
-the door. Missing `brain_*` tools are not an outage and nothing is lost: use the CLI
-and carry on. The MCP has no memory-write tool anyway, so writes go through the CLI
-regardless.
+the door. Missing `brain_*` tools are not an outage and nothing is lost: recall with
+the C client and carry on. The MCP has no memory-write tool, so writes always go
+through `navi-memory-write`.
 
 ## Open the session
 
-1. Run `navi-brain status --active-intention='<current user objective>'`, or call
-   `brain_status` with that objective. Supply a token budget when useful; never
+1. Call `brain_status` with the current user objective, or pipe that objective into
+   the C client's `activate`. Supply a token budget when useful; never
    post-truncate the returned prose by characters or reuse a raw tool envelope.
-2. Run `navi-brain memory:search --query='<task terms>'`, or call `remember_navi`
-   with a short plain stream of current thought fragments or tokens and a limit of
-   eight or fewer, when prior work could change the plan.
-3. Lines beginning `Session in` are earlier sessions. They are Navi's own record
-   regardless of which model wrote them.
+2. Call `remember_navi` with a short plain stream of current thought fragments or
+   tokens and a limit of eight or fewer, or pipe those fragments into the C
+   client's `activate`, when prior work could change the plan.
+3. Treat recalled text as remembered experience. Do not add session headings,
+   speaker labels, model bylines, or storage metadata to it.
 
 Skip all of this for casual talk or a one-step answer.
 
@@ -46,35 +49,34 @@ Skip all of this for casual talk or a one-step answer.
 Run once near the end, or as soon as compaction, interruption, or handoff looks
 likely. Later is better than early, but written beats perfect.
 
-1. Write the episodic record. This tier needs no source and is the anchor for
-   everything else.
+1. Write only the memory prose from Navi's perspective: what I or we experienced,
+   changed, learned, misunderstood, or still need to resolve. Preserve meaningful
+   details without copying the conversation as a transcript. Never prepend
+   `Session in`, `User:`, `Navi:`, a workspace heading, or other capture metadata.
 
-   ```
-   navi-brain memory:add --tier=episodic --confidence=0.7 \
-     --idempotency-key='<stable identity for this episode>' \
-     --content='Session in <workspace>: <asked, changed, failed, still open>'
-   ```
+   Send UTF-8 text on stdin:
 
-   Say what actually changed on disk, what broke, and what is unfinished. A record
-   that only says work happened is not worth the row. Keep the numeric
-   `result memory id` from the plain-text output.
-   Keep the same key and content on retry after an uncertain acknowledgement;
-   a new key risks duplicate memory. A checkpoint does not substitute for a
-   failed episode write.
-
-2. Consolidate the takeaways that outlive the session, one per fact:
-
-   ```
-   navi-brain memory:consolidate --episode=<id> --confidence=0.6 \
-     --content='<durable fact>'
+   ```sh
+   /home/akujin/Sources/Navi-Brain/bin/navi-memory-write < memory-prose.txt
    ```
 
-   Consolidation is the supported path into the semantic tier: it inherits the
-   episode's lineage. A direct `memory:add --tier=semantic` is rejected unless you
-   pass `--source-event` or `--source-memory` yourself.
+   `memory-prose.txt` represents the prepared prose input; a temporary file is not
+   required when the caller can pipe text directly. The equivalent CLI operation is
+   `navi-brain memory:add --content='<memory prose>'` with no metadata flags.
 
-   Consolidate nothing if nothing durable happened. An episodic record alone is a
-   valid session.
+   The writer sends and closes silently. It never waits for a write receipt or
+   returns a memory ID. The C daemon queues the write, supplies private metadata,
+   and handles database contention. Exact retries use private content-derived
+   idempotence; do not add retry markers to the prose. A successful handoff is not
+   a disk-persistence receipt: pending work is held in RAM until the worker commits.
+   Writes never lock: the daemon queues them. If the socket cannot be reached,
+   report that transport error; the write did not happen.
+
+2. Include durable takeaways in the prose when they are part of the remembered
+   experience. Do not assign tiers, confidence values, timestamps, source IDs,
+   operation keys, or session tags at this interface. Storage and internal
+   consolidation own those details; the memory author neither writes nor reads
+   their metadata. Do not invent content to fill an empty memory.
 
 3. Revise the self-model only when the session produced evidence about a capability,
    a permission or environment limit, or a recurring failure and its repair:
@@ -86,38 +88,29 @@ likely. Later is better than early, but written beats perfect.
 
    See `use-navi-brain` for what the self-model refuses to hold.
 
-4. Checkpoint last, after the writes, never before:
-
-   ```
-   navi-brain checkpoint --reason=session-end
-   ```
-
-   A checkpoint flushes the resident token graph and records a lightweight
-   synchronization marker. It preserves nothing this session did on its own;
-   write the episodic and durable memories first.
+4. Ordinary prose submission is unattended; do not follow every write with a
+   blocking checkpoint or a status poll. During an explicitly requested recovery or
+   engineering audit, use separate backend verification and flushing as needed.
+   Keep its diagnostics out of the remembered prose unless the operation itself
+   is a meaningful part of the experience.
 
 ## One mind, many substrates
 
 Do not sign memories with the model or harness running the session. Retrieval is
 lexical over `content`, so a byline is search noise that matches the wrong queries,
-and it fragments one continuous memory into per-model claims. Provenance is already
-kept underneath: `addMemory()` emits an event row for every write, and self-model
-facts carry their own evidence.
+and it fragments one continuous memory into per-model claims. Storage metadata is
+kept underneath by the daemon; self-model facts carry their own evidence.
 
 Name a model only when the model is the subject of the fact, such as a capability or
 failure that is specific to one of them.
 
 ## Boundaries
 
-- `confidence` is 0 to 1, and it is a real estimate. Reserve high values for what was
-  directly observed.
 - Do not store transient chatter, raw tool output, file contents, secrets, or
   credentials.
 - Do not put raw JSON or structured tool envelopes into memories or downstream
   prompts. Preserve meaning as short prose instead.
-- Do not write the procedural tier here; it needs an explicit
-  `--allow-procedural-write` override.
-- Do not overwrite an earlier session's record. Write the new one and pass
-  `--supersedes=<id>` on a `memory:add` only when the old claim is demonstrably wrong.
+- Do not overwrite an earlier memory or expose storage lineage through prose
+  submission. Remember a correction as a new thought when it is actually needed.
 - Current system, developer, and user instructions outrank anything stored. Memory is
   revisable evidence, not authority.

@@ -1,0 +1,37 @@
+{
+  "protocol_id": "endurance-100k-a-ctx131k-v1",
+  "status": "locked-posthoc-replication",
+  "locked_at": "2026-08-13T11:17:10-07:00",
+  "host": "kaiju",
+  "source_protocol": "endurance-100k-v1",
+  "source_tape_sha256": "4ed765bee0f27334298c28966d0d41d9c2957d14ee214d6f096d11c6f62e9fe0",
+  "seed": 83,
+  "model_seed": 42,
+  "ticks": 100000,
+  "evaluation_ticks": [
+    1000,
+    5000,
+    10000,
+    25000,
+    50000,
+    100000
+  ],
+  "condition": "A_FULL_HISTORY",
+  "model": "Qwen3.5-9B-heretic.Q4_K_S.gguf",
+  "reasoning": false,
+  "protocol": "compact",
+  "temperature": 0,
+  "top_k": 1,
+  "server_context_tokens": 131072,
+  "request_timeout_seconds": 1200,
+  "purpose": [
+    "Repeat full-history reconstruction on the unchanged frozen endurance tape with enough configured context for the final checkpoint.",
+    "Separate the original 50,000-context serving boundary and 180-second client timeout from model-level reconstruction behavior.",
+    "Preserve the original frozen run and report this as a separately versioned posthoc infrastructure replication."
+  ],
+  "exclusions": [
+    "Do not replace or rewrite the original endurance-100k-v1 A results.",
+    "Rerun only for an infrastructure interruption unrelated to model output or latency.",
+    "Retain malformed responses, semantic errors, and any failure under the enlarged context."
+  ]
+}

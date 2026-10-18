@@ -48,7 +48,7 @@
 #define DAEMON_PENDING_CAPACITY 128u
 #define DAEMON_PENDING_TOTAL (DAEMON_PENDING_CAPACITY + 1u)
 #define DAEMON_REQUEST_BUDGET_BYTES (2u * MAX_REQUEST_BYTES)
-#define DAEMON_RESPONSE_CAPACITY (DAEMON_QUEUE_CAPACITY + DAEMON_WORKER_COUNT)
+#define DAEMON_RESPONSE_CAPACITY (DAEMON_QUEUE_CAPACITY + DAEMON_WORKER_COUNT + 1u)
 #define DAEMON_RESPONSE_BUDGET_BYTES \
     (2u * MAX_RESPONSE_BYTES + DAEMON_RESPONSE_CAPACITY * 4096u)
 #define DAEMON_SMALL_RESPONSE_RESERVATION 4096u
@@ -303,6 +303,7 @@ typedef struct {
     pthread_cond_t condition;
     pthread_t rank_thread;
     atomic_bool stop_ranker;
+    atomic_bool stop_sqlite_wait;
     bool mutex_ready;
     bool condition_ready;
     bool ranker_started;
@@ -317,6 +318,7 @@ typedef struct {
     size_t request_bytes;
     unsigned char *request;
     size_t request_size;
+    bool no_reply;
 } DaemonClient;
 
 typedef struct {
@@ -341,6 +343,14 @@ typedef struct {
     size_t request_bytes;
     pthread_mutex_t queue_mutex;
     pthread_cond_t queue_ready;
+    DaemonClient write_clients[DAEMON_QUEUE_CAPACITY];
+    size_t write_head;
+    size_t write_count;
+    bool write_active;
+    pthread_cond_t write_ready;
+    pthread_cond_t write_drained;
+    pthread_t memory_writer;
+    bool memory_writer_started;
     pthread_rwlock_t admission;
     pthread_t workers[DAEMON_WORKER_COUNT];
     size_t worker_count;
@@ -1243,6 +1253,24 @@ static int decode_uleb128(const unsigned char *bytes, size_t size,
         shift += 7;
     }
     return -1;
+}
+
+/* The private catalog has one mutex-protected connection. External writers
+ * produce SQLITE_BUSY, which stays inside the daemon rather than escaping to
+ * a caller after a fixed timeout. SQLITE_LOCKED is a programming error here. */
+static int sqlite_wait_for_writer(void *context, int attempts)
+{
+    Engine *engine = context;
+    unsigned milliseconds = attempts < 7 ? 1u << attempts : 100u;
+    struct timespec delay = {0, (long)milliseconds * 1000000L};
+    if (daemon_stop || atomic_load_explicit(&engine->stop_sqlite_wait,
+                                             memory_order_acquire)) return 0;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+        if (daemon_stop || atomic_load_explicit(&engine->stop_sqlite_wait,
+                                                 memory_order_acquire)) return 0;
+    }
+    return !daemon_stop &&
+        !atomic_load_explicit(&engine->stop_sqlite_wait, memory_order_acquire);
 }
 
 static int sqlite_exec_checked(sqlite3 *db, const char *sql)
@@ -3757,6 +3785,7 @@ static int engine_open(Engine *engine, const char *store_path, bool with_ranker)
 {
     char *lock_path;
     memset(engine, 0, sizeof(*engine));
+    atomic_init(&engine->stop_sqlite_wait, false);
     engine->lock_fd = -1;
     engine->store_path = xstrdup(store_path);
     engine->memory_dir = path_join(store_path, "memories");
@@ -3769,12 +3798,12 @@ static int engine_open(Engine *engine, const char *store_path, bool with_ranker)
         goto fail;
     }
     if (sqlite3_open_v2(engine->catalog_path, &engine->db,
-                        SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_PRIVATECACHE, NULL) != SQLITE_OK) {
         fprintf(stderr, "open token catalog: %s\n",
                 engine->db == NULL ? "failed" : sqlite3_errmsg(engine->db));
         goto fail;
     }
-    sqlite3_busy_timeout(engine->db, 5000);
+    sqlite3_busy_handler(engine->db, sqlite_wait_for_writer, engine);
     if (sqlite_exec_checked(engine->db,
             "CREATE TABLE IF NOT EXISTS operation_receipt("
             "op_key TEXT PRIMARY KEY,request_sha256 BLOB NOT NULL "
@@ -6749,7 +6778,8 @@ static int daemon_pending_header(DaemonRuntime *runtime, PendingClient *pending,
         if (parse_size(words[2], MAX_REQUEST_BYTES, &body_size) != 0) body_size = 0;
     } else if (count == 3 && strcmp(words[0], "RECALL_RECORDS") == 0) {
         if (parse_size(words[2], MAX_REQUEST_BYTES, &body_size) != 0) body_size = 0;
-    } else if (count == 3 && strcmp(words[0], "ACTIVATE") == 0) {
+    } else if (count == 3 && (strcmp(words[0], "ACTIVATE") == 0 ||
+                              strcmp(words[0], "REMEMBER") == 0)) {
         if (parse_size(words[2], MAX_REQUEST_BYTES, &body_size) != 0) body_size = 0;
     } else if (count == 5 && strcmp(words[0], "RANK_RECORDS") == 0) {
         if (parse_size(words[4], MAX_REQUEST_BYTES, &body_size) != 0) body_size = 0;
@@ -7110,6 +7140,8 @@ static bool daemon_engine_poisoned(DaemonRuntime *runtime)
 static void daemon_begin_close(DaemonRuntime *runtime)
 {
     atomic_store_explicit(&runtime->closing, true, memory_order_release);
+    atomic_store_explicit(&runtime->engine->stop_sqlite_wait, true,
+                          memory_order_release);
     daemon_wake_writer(runtime);
 }
 
@@ -7134,7 +7166,8 @@ static bool daemon_command_has_large_response(size_t count, char **words)
 
 static bool handle_daemon_client(DaemonRuntime *runtime, int client,
                                  const unsigned char *request,
-                                 size_t request_size)
+                                 size_t request_size, bool queued_write,
+                                 bool no_reply)
 {
     Engine *engine = runtime->engine;
     RequestReader reader = {request, request_size, 0};
@@ -7170,9 +7203,10 @@ static bool handle_daemon_client(DaemonRuntime *runtime, int client,
         goto respond;
     }
     close_command = versioned && count == 1 && strcmp(words[0], "CLOSE") == 0;
-    response_reservation = daemon_command_has_large_response(count, words) ?
-        MAX_RESPONSE_BYTES : DAEMON_SMALL_RESPONSE_RESERVATION;
-    if (!daemon_reserve_response(runtime, response_reservation, close_command)) {
+    response_reservation = no_reply ? 0 :
+        (daemon_command_has_large_response(count, words) ?
+         MAX_RESPONSE_BYTES : DAEMON_SMALL_RESPONSE_RESERVATION);
+    if (!no_reply && !daemon_reserve_response(runtime, response_reservation, close_command)) {
         response_reservation = DAEMON_SMALL_RESPONSE_RESERVATION;
         if (!daemon_reserve_response(runtime, response_reservation,
                                      close_command)) {
@@ -7195,6 +7229,12 @@ static bool handle_daemon_client(DaemonRuntime *runtime, int client,
             atomic_store_explicit(&runtime->close_client, client,
                                   memory_order_release);
         }
+        atomic_store_explicit(&engine->stop_sqlite_wait, true,
+                              memory_order_release);
+        pthread_mutex_lock(&runtime->queue_mutex);
+        while (runtime->write_count != 0 || runtime->write_active)
+            pthread_cond_wait(&runtime->write_drained, &runtime->queue_mutex);
+        pthread_mutex_unlock(&runtime->queue_mutex);
         if (pthread_rwlock_wrlock(&runtime->admission) != 0) {
             atomic_store_explicit(&runtime->close_flush_failed, true,
                                   memory_order_release);
@@ -7208,7 +7248,7 @@ static bool handle_daemon_client(DaemonRuntime *runtime, int client,
             goto respond;
         }
         admission_locked = true;
-        if (atomic_load_explicit(&runtime->closing, memory_order_acquire)) {
+        if (!queued_write && atomic_load_explicit(&runtime->closing, memory_order_acquire)) {
             error = "daemon is closing\n";
             goto respond;
         }
@@ -7224,7 +7264,8 @@ static bool handle_daemon_client(DaemonRuntime *runtime, int client,
     } else if (versioned && count == 1 && strcmp(words[0], "CAPABILITIES") == 0) {
         buffer_append_text(&response, PROTOCOL_ABI "\n"
                            "metadata-source-kind-1\n"
-                           "provenance-source-kind-1\n");
+                           "provenance-source-kind-1\n"
+                           "prose-remember-fifo-1\n");
         ok = true;
     } else if (count == 1 && strcmp(words[0], "STATS") == 0) {
         ok = stats_engine(engine, &response) == 0;
@@ -7427,6 +7468,49 @@ static bool handle_daemon_client(DaemonRuntime *runtime, int client,
                             words[1], words[2], true, false, true,
                             0, &response) == 0;
         if (!ok) error = "rank failed\n";
+    } else if (versioned && count == 3 && strcmp(words[0], "REMEMBER") == 0) {
+        Metadata metadata = {0};
+        int64_t assigned_id = 0;
+        bool complete = false;
+        unsigned char request_digest[32];
+        if (!valid_operation_key(words[1]) ||
+            parse_size(words[2], MAX_REQUEST_BYTES, &input_size) != 0 ||
+            input_size == 0) {
+            error = "invalid prose bounds\n";
+            goto respond;
+        }
+        input = request_reader_slice(&reader, input_size);
+        if (input == NULL || reader.offset != reader.size ||
+            memchr(input, '\0', input_size) != NULL) {
+            error = "invalid prose body\n";
+            goto respond;
+        }
+        if (current_utc(&metadata.created_at) != 0) {
+            error = "memory clock unavailable\n";
+            goto respond;
+        }
+        metadata.updated_at = bytes_copy(metadata.created_at.data, metadata.created_at.size);
+        metadata.tier = bytes_copy((const unsigned char *)"episodic", 8);
+        metadata.status = bytes_copy((const unsigned char *)"active", 6);
+        metadata.confidence = 0.97;
+        operation_request_digest(&metadata, NULL, input, input_size, request_digest);
+        if (receipt_begin(engine, words[1], request_digest, "create", 0,
+                          &assigned_id, &complete) != 0) {
+            metadata_free(&metadata);
+            error = "prose receipt conflict\n";
+            goto respond;
+        }
+        ok = complete;
+        if (!complete) {
+            metadata.id = assigned_id;
+            ok = record_semantically_matches(engine, assigned_id, &metadata,
+                                             input, input_size);
+            if (!ok) ok = add_record(engine, &metadata, input, input_size,
+                                     true, false) == 0;
+            if (ok) ok = receipt_finish(engine, words[1], assigned_id, true) == 0;
+        }
+        metadata_free(&metadata);
+        if (!ok) error = "prose memory write failed\n";
     } else if (count == 4 &&
                (strcmp(words[0], "CREATE") == 0 ||
                 strcmp(words[0], "UPDATE") == 0)) {
@@ -7608,6 +7692,12 @@ respond:
         error = "resident state diverged from durable registry; daemon is closing\n";
         daemon_begin_close(runtime);
     }
+    if (no_reply) {
+        if (!ok) fprintf(stderr, "queued memory: %s", error);
+        if (admission_locked) pthread_rwlock_unlock(&runtime->admission);
+        free(response.items);
+        return true;
+    }
     if (!ok) {
         free(response.items);
         response.items = NULL;
@@ -7636,6 +7726,28 @@ respond:
     return response_enqueued;
 }
 
+static void daemon_process_client(DaemonRuntime *runtime, DaemonClient admitted,
+                                  bool queued_write)
+{
+    bool response_enqueued;
+    if (!queued_write &&
+        atomic_load_explicit(&runtime->closing, memory_order_acquire) &&
+        atomic_load_explicit(&runtime->close_client,
+                             memory_order_acquire) != admitted.fd) {
+        response_enqueued = daemon_enqueue_literal_response(
+            runtime, admitted.fd, false, "daemon is closing\n", false
+        );
+    } else {
+        response_enqueued = handle_daemon_client(runtime, admitted.fd,
+                                                  admitted.request,
+                                                  admitted.request_size,
+                                                  queued_write, admitted.no_reply);
+    }
+    if (!response_enqueued && admitted.fd >= 0) close(admitted.fd);
+    free(admitted.request);
+    daemon_release_request(runtime, admitted.request_bytes);
+}
+
 static void *daemon_worker(void *argument)
 {
     DaemonRuntime *runtime = argument;
@@ -7653,22 +7765,33 @@ static void *daemon_worker(void *argument)
             (runtime->client_head + 1) % DAEMON_QUEUE_CAPACITY;
         --runtime->client_count;
         pthread_mutex_unlock(&runtime->queue_mutex);
+        daemon_process_client(runtime, admitted, false);
+    }
+}
 
-        bool response_enqueued;
-        if (atomic_load_explicit(&runtime->closing, memory_order_acquire) &&
-            atomic_load_explicit(&runtime->close_client,
-                                 memory_order_acquire) != admitted.fd) {
-            response_enqueued = daemon_enqueue_literal_response(
-                runtime, admitted.fd, false, "daemon is closing\n", false
-            );
-        } else {
-            response_enqueued = handle_daemon_client(runtime, admitted.fd,
-                                                      admitted.request,
-                                                      admitted.request_size);
+/* One owner executes each complete mutation lifecycle in admission order. */
+static void *daemon_memory_writer(void *argument)
+{
+    DaemonRuntime *runtime = argument;
+    for (;;) {
+        DaemonClient admitted;
+        pthread_mutex_lock(&runtime->queue_mutex);
+        while (runtime->write_count == 0 && !runtime->accepting_done)
+            pthread_cond_wait(&runtime->write_ready, &runtime->queue_mutex);
+        if (runtime->write_count == 0 && runtime->accepting_done) {
+            pthread_mutex_unlock(&runtime->queue_mutex);
+            return NULL;
         }
-        if (!response_enqueued) close(admitted.fd);
-        free(admitted.request);
-        daemon_release_request(runtime, admitted.request_bytes);
+        admitted = runtime->write_clients[runtime->write_head];
+        runtime->write_head = (runtime->write_head + 1) % DAEMON_QUEUE_CAPACITY;
+        --runtime->write_count;
+        runtime->write_active = true;
+        pthread_mutex_unlock(&runtime->queue_mutex);
+        daemon_process_client(runtime, admitted, true);
+        pthread_mutex_lock(&runtime->queue_mutex);
+        runtime->write_active = false;
+        pthread_cond_broadcast(&runtime->write_drained);
+        pthread_mutex_unlock(&runtime->queue_mutex);
     }
 }
 
@@ -7677,7 +7800,30 @@ static void daemon_finish_admission(DaemonRuntime *runtime)
     pthread_mutex_lock(&runtime->queue_mutex);
     runtime->accepting_done = true;
     pthread_cond_broadcast(&runtime->queue_ready);
+    pthread_cond_broadcast(&runtime->write_ready);
     pthread_mutex_unlock(&runtime->queue_mutex);
+}
+
+static bool daemon_request_is_write(const unsigned char *request,
+                                     size_t request_size, bool *no_reply)
+{
+    RequestReader reader = {request, request_size, 0};
+    char line[4096];
+    char *words[8];
+    size_t count;
+    size_t first = 0;
+    *no_reply = false;
+    if (request_reader_line(&reader, line, sizeof(line)) != 0) return false;
+    count = split_words(line, words, 8);
+    if (count == 0 || count > 8) return false;
+    if (strcmp(words[0], PROTOCOL_ABI) == 0) {
+        first = 1;
+        if (count < 2) return false;
+        *no_reply = strcmp(words[first], "REMEMBER") == 0;
+    }
+    return *no_reply || strcmp(words[first], "CREATE") == 0 ||
+        strcmp(words[first], "UPDATE") == 0 || strcmp(words[first], "REPLACE") == 0 ||
+        strcmp(words[first], "ADD") == 0 || strcmp(words[first], "FLUSH") == 0;
 }
 
 static int daemon_enqueue_client(DaemonRuntime *runtime, int client,
@@ -7685,41 +7831,55 @@ static int daemon_enqueue_client(DaemonRuntime *runtime, int client,
                                  size_t request_size, bool priority)
 {
     size_t tail;
-    DaemonClient rejected = {-1, 0, NULL, 0};
+    bool no_reply;
+    bool write = daemon_request_is_write(request, request_size, &no_reply);
+    DaemonClient rejected = {-1, 0, NULL, 0, false};
     int rc = -1;
     pthread_mutex_lock(&runtime->queue_mutex);
     if (!runtime->accepting_done &&
         (!atomic_load_explicit(&runtime->closing, memory_order_acquire) || priority)) {
-        if (priority && runtime->client_count == DAEMON_QUEUE_CAPACITY) {
+        /* Both queues share the original bounded aggregate request capacity. */
+        if (priority && runtime->client_count + runtime->write_count == DAEMON_QUEUE_CAPACITY &&
+            runtime->client_count != 0) {
             tail = (runtime->client_head + runtime->client_count - 1) %
                    DAEMON_QUEUE_CAPACITY;
             rejected = runtime->clients[tail];
             --runtime->client_count;
         }
-        if (runtime->client_count < DAEMON_QUEUE_CAPACITY) {
-            DaemonClient admitted = {client, request_bytes, request,
-                                     request_size};
-            if (priority) {
-                runtime->client_head =
-                    (runtime->client_head + DAEMON_QUEUE_CAPACITY - 1) %
-                    DAEMON_QUEUE_CAPACITY;
-                runtime->clients[runtime->client_head] = admitted;
-            } else {
-                tail = (runtime->client_head + runtime->client_count) %
-                       DAEMON_QUEUE_CAPACITY;
-                runtime->clients[tail] = admitted;
+        if (priority || runtime->client_count + runtime->write_count < DAEMON_QUEUE_CAPACITY) {
+            DaemonClient admitted = {client, request_bytes, request, request_size, no_reply};
+            if (no_reply) {
+                /* The queued body now belongs to the daemon, not the sender. */
+                close(client);
+                admitted.fd = -1;
             }
-            ++runtime->client_count;
+            if (write) {
+                tail = (runtime->write_head + runtime->write_count) % DAEMON_QUEUE_CAPACITY;
+                runtime->write_clients[tail] = admitted;
+                ++runtime->write_count;
+                pthread_cond_signal(&runtime->write_ready);
+            } else {
+                if (priority) {
+                    runtime->client_head =
+                        (runtime->client_head + DAEMON_QUEUE_CAPACITY - 1) %
+                        DAEMON_QUEUE_CAPACITY;
+                    runtime->clients[runtime->client_head] = admitted;
+                } else {
+                    tail = (runtime->client_head + runtime->client_count) % DAEMON_QUEUE_CAPACITY;
+                    runtime->clients[tail] = admitted;
+                }
+                ++runtime->client_count;
+                pthread_cond_signal(&runtime->queue_ready);
+            }
             rc = 0;
-        } else if (!priority) {
+        } else {
             rc = 1;
         }
-        pthread_cond_signal(&runtime->queue_ready);
     }
     pthread_mutex_unlock(&runtime->queue_mutex);
     if (rejected.fd >= 0) {
-        if (!daemon_enqueue_literal_response(
-                runtime, rejected.fd, false, "daemon is closing\n", false))
+        if (!daemon_enqueue_literal_response(runtime, rejected.fd, false,
+                                              "daemon is closing\n", false))
             close(rejected.fd);
         free(rejected.request);
         daemon_release_request(runtime, rejected.request_bytes);
@@ -7729,10 +7889,13 @@ static int daemon_enqueue_client(DaemonRuntime *runtime, int client,
 
 static void daemon_join_workers(DaemonRuntime *runtime)
 {
-    size_t i;
-    for (i = 0; i < runtime->worker_count; ++i)
+    for (size_t i = 0; i < runtime->worker_count; ++i)
         pthread_join(runtime->workers[i], NULL);
     runtime->worker_count = 0;
+    if (runtime->memory_writer_started) {
+        pthread_join(runtime->memory_writer, NULL);
+        runtime->memory_writer_started = false;
+    }
 }
 
 static void daemon_finish_responses(DaemonRuntime *runtime)
@@ -7758,14 +7921,16 @@ static void daemon_runtime_destroy(DaemonRuntime *runtime)
     if (runtime->writer_wake_write >= 0) close(runtime->writer_wake_write);
     pthread_mutex_destroy(&runtime->response_mutex);
     pthread_rwlock_destroy(&runtime->admission);
+    pthread_cond_destroy(&runtime->write_drained);
+    pthread_cond_destroy(&runtime->write_ready);
     pthread_cond_destroy(&runtime->queue_ready);
     pthread_mutex_destroy(&runtime->queue_mutex);
 }
 
 static int daemon_runtime_init(DaemonRuntime *runtime, Engine *engine)
 {
-    size_t i;
     int wake[2];
+    unsigned initialized = 0;
     memset(runtime, 0, sizeof(*runtime));
     runtime->engine = engine;
     runtime->writer_wake_read = -1;
@@ -7775,50 +7940,48 @@ static int daemon_runtime_init(DaemonRuntime *runtime, Engine *engine)
     atomic_init(&runtime->writer_failed, false);
     atomic_init(&runtime->close_flush_failed, false);
     atomic_init(&runtime->close_client, -1);
-    if (pthread_mutex_init(&runtime->queue_mutex, NULL) != 0) return -1;
-    if (pthread_cond_init(&runtime->queue_ready, NULL) != 0) {
-        pthread_mutex_destroy(&runtime->queue_mutex);
-        return -1;
-    }
-    if (pthread_rwlock_init(&runtime->admission, NULL) != 0) {
-        pthread_cond_destroy(&runtime->queue_ready);
-        pthread_mutex_destroy(&runtime->queue_mutex);
-        return -1;
-    }
-    if (pthread_mutex_init(&runtime->response_mutex, NULL) != 0) {
-        pthread_rwlock_destroy(&runtime->admission);
-        pthread_cond_destroy(&runtime->queue_ready);
-        pthread_mutex_destroy(&runtime->queue_mutex);
-        return -1;
-    }
-    if (pipe2(wake, O_NONBLOCK | O_CLOEXEC) != 0) {
-        pthread_mutex_destroy(&runtime->response_mutex);
-        pthread_rwlock_destroy(&runtime->admission);
-        pthread_cond_destroy(&runtime->queue_ready);
-        pthread_mutex_destroy(&runtime->queue_mutex);
-        return -1;
-    }
+    if (pthread_mutex_init(&runtime->queue_mutex, NULL) != 0) goto failed;
+    initialized = 1;
+    if (pthread_cond_init(&runtime->queue_ready, NULL) != 0) goto failed;
+    initialized = 2;
+    if (pthread_cond_init(&runtime->write_ready, NULL) != 0) goto failed;
+    initialized = 3;
+    if (pthread_cond_init(&runtime->write_drained, NULL) != 0) goto failed;
+    initialized = 4;
+    if (pthread_rwlock_init(&runtime->admission, NULL) != 0) goto failed;
+    initialized = 5;
+    if (pthread_mutex_init(&runtime->response_mutex, NULL) != 0) goto failed;
+    initialized = 6;
+    if (pipe2(wake, O_NONBLOCK | O_CLOEXEC) != 0) goto failed;
     runtime->writer_wake_read = wake[0];
     runtime->writer_wake_write = wake[1];
-    if (pthread_create(&runtime->writer, NULL,
-                       daemon_response_writer, runtime) != 0) {
-        daemon_runtime_destroy(runtime);
-        return -1;
-    }
+    if (pthread_create(&runtime->writer, NULL, daemon_response_writer, runtime) != 0)
+        goto failed;
     runtime->writer_started = true;
-    for (i = 0; i < DAEMON_WORKER_COUNT; ++i) {
-        if (pthread_create(&runtime->workers[i], NULL,
-                           daemon_worker, runtime) != 0) {
-            daemon_finish_admission(runtime);
-            daemon_join_workers(runtime);
-            daemon_finish_responses(runtime);
-            daemon_join_writer(runtime);
-            daemon_runtime_destroy(runtime);
-            return -1;
-        }
+    if (pthread_create(&runtime->memory_writer, NULL, daemon_memory_writer, runtime) != 0)
+        goto workers_failed;
+    runtime->memory_writer_started = true;
+    for (size_t i = 0; i < DAEMON_WORKER_COUNT; ++i) {
+        if (pthread_create(&runtime->workers[i], NULL, daemon_worker, runtime) != 0)
+            goto workers_failed;
         ++runtime->worker_count;
     }
     return 0;
+workers_failed:
+    daemon_finish_admission(runtime);
+    daemon_join_workers(runtime);
+    daemon_finish_responses(runtime);
+    daemon_join_writer(runtime);
+failed:
+    if (runtime->writer_wake_read >= 0) close(runtime->writer_wake_read);
+    if (runtime->writer_wake_write >= 0) close(runtime->writer_wake_write);
+    if (initialized >= 6) pthread_mutex_destroy(&runtime->response_mutex);
+    if (initialized >= 5) pthread_rwlock_destroy(&runtime->admission);
+    if (initialized >= 4) pthread_cond_destroy(&runtime->write_drained);
+    if (initialized >= 3) pthread_cond_destroy(&runtime->write_ready);
+    if (initialized >= 2) pthread_cond_destroy(&runtime->queue_ready);
+    if (initialized >= 1) pthread_mutex_destroy(&runtime->queue_mutex);
+    return -1;
 }
 
 static void daemon_signal(int signal_number)
@@ -7955,10 +8118,10 @@ static int run_daemon(const char *store_path, const char *requested_socket)
             bool remove = false;
             int client = pending[index].fd;
             short events = ready[index + 1].revents;
-            if ((events & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
-                now >= pending[index].deadline_ms) {
+            if ((events & (POLLERR | POLLNVAL)) != 0 ||
+                (!pending[index].complete && now >= pending[index].deadline_ms)) {
                 remove = true;
-            } else if (!pending[index].complete && (events & POLLIN) != 0) {
+            } else if (!pending[index].complete && (events & (POLLIN | POLLHUP)) != 0) {
                 int read_result = daemon_pending_read(&runtime,
                                                       &pending[index], now);
                 if (read_result != 0) {

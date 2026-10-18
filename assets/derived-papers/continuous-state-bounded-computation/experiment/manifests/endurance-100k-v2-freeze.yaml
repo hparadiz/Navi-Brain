@@ -1,0 +1,32 @@
+protocol_id: endurance-100k-v2
+frozen_at: 2026-08-13T11:36:57-07:00
+classification: corrected_confirmatory_endurance
+host: kaiju
+config_sha256: ee6ead7807d64bc19f94244424db045ef5c4bec96a7518852444a4428264cfe9
+source:
+  protocol_id: endurance-100k-v1
+  tape_path: runs/endurance-100k-v1/E/events.jsonl
+  tape_sha256: 4ed765bee0f27334298c28966d0d41d9c2957d14ee214d6f096d11c6f62e9fe0
+  oracle_summary_path: runs/endurance-100k-v1/E/summary.json
+  oracle_invariants: exact
+cancelled_predecessor:
+  protocol_id: endurance-100k-v1
+  cancellation_record_sha256: fa6515b50b72300d2ca35e7f0125af221121ca98cb9b32fccf76ef7d1d4f99b7
+implementation:
+  llama_adapter_sha256: 338c5cab41e0aaae80700d1d556f86cee0300e0ec09a7575285cbe9771616e87
+  run_reconstruction_sha256: 842d738e7fa474867fb1094cd441ea8c3d9f0064a406557ea8a21b1b3dfc8e93
+  run_sparse_neural_sha256: 541879f66fb955435460bc3af3b2ddde81125ab85772332681db85d7f37eff25
+  kaiju_orchestrator_sha256: 3823f55824c0e07022d53b7b05c27bfd62a70218614aef7a9876537ba6c1db82
+server:
+  executable: /home/akujin/Sources/ik_llama.cpp/build-kaiju-cpu/bin/llama-server
+  model: /mnt/kaiju/Models/qwen/qwen3.5-9b-heretic/Qwen3.5-9B-heretic.Q4_K_S.gguf
+  model_sha256: 9150b2e210b6b6ccb64e5de1f7ed4d66c2edab8d18fb35bba9b427bd782f2328
+  context_tokens_all_neural_conditions: 131072
+  invariant_flags: -t 24 -b 512 -ub 128 -ctk q8_0 -ctv q4_0 --flash-attn on --run-time-repack --mlock --no-warmup --jinja --merge-qkv --reasoning off --reasoning-budget 0
+execution:
+  order: A_GATE, B, D
+  restart_server_between_conditions: true
+  stop_if_A_fails: true
+  D_progress_every_ticks: 5000
+output:
+  directory: runs/endurance-100k-v2

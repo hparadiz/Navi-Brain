@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="650" viewBox="0 0 1120 650" role="img" aria-labelledby="title desc">
+<title id="title">CSBC runtime architecture</title>
+<desc id="desc">Persistent state is separate from executing cognition and temporal control.</desc>
+<style>text{font-family:Inter,DejaVu Sans,Arial,sans-serif;fill:#172033}.small{font-size:13px;fill:#667085}.tick{font-size:12px;fill:#667085}.label{font-size:14px;font-weight:600}.title{font-size:24px;font-weight:700}.subtitle{font-size:14px;fill:#667085}</style>
+<rect width="1120" height="650" fill="#FFFFFF"/>
+<text x="52.00" y="42.00" text-anchor="start" font-size="14" font-weight="400" class="title">CSBC runtime: state persists while control recurs</text>
+<text x="52.00" y="66.00" text-anchor="start" font-size="14" font-weight="400" class="subtitle">The temporal kernel arbitrates bounded work; model execution is a transition service, not the process itself.</text>
+<rect x="55.00" y="100.00" width="1010.00" height="470.00" fill="#F8FAFD" stroke="#D7DEE9" stroke-width="1" rx="18" opacity="1"/>
+<rect x="90.00" y="190.00" width="190.00" height="90.00" fill="#DBEAFE" stroke="#AAB4C3" stroke-width="1.2" rx="12" opacity="1"/>
+<text x="185.00" y="228.00" text-anchor="middle" font-size="17" font-weight="700">Event + delta bus</text>
+<text x="185.00" y="254.00" text-anchor="middle" font-size="13" font-weight="400" style="fill:#667085">timestamped evidence</text>
+<rect x="400.00" y="105.00" width="320.00" height="105.00" fill="#EDE9FE" stroke="#AAB4C3" stroke-width="1.2" rx="12" opacity="1"/>
+<text x="560.00" y="143.00" text-anchor="middle" font-size="17" font-weight="700">Temporal kernel</text>
+<text x="560.00" y="169.00" text-anchor="middle" font-size="13" font-weight="400" style="fill:#667085">admit · defer · cancel · arbitrate</text>
+<rect x="400.00" y="280.00" width="320.00" height="120.00" fill="#DCFCE7" stroke="#AAB4C3" stroke-width="1.2" rx="12" opacity="1"/>
+<text x="560.00" y="318.00" text-anchor="middle" font-size="17" font-weight="700">Persistent cognitive state</text>
+<text x="560.00" y="344.00" text-anchor="middle" font-size="13" font-weight="400" style="fill:#667085">self · world · social · goals · uncertainty</text>
+<rect x="805.00" y="190.00" width="220.00" height="90.00" fill="#FEF3C7" stroke="#AAB4C3" stroke-width="1.2" rx="12" opacity="1"/>
+<text x="915.00" y="228.00" text-anchor="middle" font-size="17" font-weight="700">Neural transition service</text>
+<text x="915.00" y="254.00" text-anchor="middle" font-size="13" font-weight="400" style="fill:#667085">bounded semantic jobs</text>
+<rect x="805.00" y="390.00" width="220.00" height="90.00" fill="#FCE7F3" stroke="#AAB4C3" stroke-width="1.2" rx="12" opacity="1"/>
+<text x="915.00" y="428.00" text-anchor="middle" font-size="17" font-weight="700">Action + speech</text>
+<text x="915.00" y="454.00" text-anchor="middle" font-size="13" font-weight="400" style="fill:#667085">small revocable commitments</text>
+<rect x="90.00" y="390.00" width="190.00" height="90.00" fill="#E5E7EB" stroke="#AAB4C3" stroke-width="1.2" rx="12" opacity="1"/>
+<text x="185.00" y="428.00" text-anchor="middle" font-size="17" font-weight="700">Durable memory</text>
+<text x="185.00" y="454.00" text-anchor="middle" font-size="13" font-weight="400" style="fill:#667085">episodic log · consolidation</text>
+<line x1="280.00" y1="235.00" x2="400.00" y2="330.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="400.00" y1="330.00" x2="393.00" y2="323.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="400.00" y1="330.00" x2="393.00" y2="337.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="340.00" y="274.50" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">new evidence</text>
+<line x1="560.00" y1="210.00" x2="560.00" y2="280.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="560.00" y1="280.00" x2="553.00" y2="273.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="560.00" y1="280.00" x2="553.00" y2="287.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="560.00" y="237.00" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">control</text>
+<line x1="720.00" y1="330.00" x2="805.00" y2="235.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="805.00" y1="235.00" x2="798.00" y2="228.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="805.00" y1="235.00" x2="798.00" y2="242.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="762.50" y="274.50" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">dirty state</text>
+<line x1="805.00" y1="265.00" x2="720.00" y2="350.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="720.00" y1="350.00" x2="713.00" y2="343.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="720.00" y1="350.00" x2="713.00" y2="357.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="762.50" y="299.50" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">versioned delta</text>
+<line x1="720.00" y1="375.00" x2="805.00" y2="435.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="805.00" y1="435.00" x2="798.00" y2="428.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="805.00" y1="435.00" x2="798.00" y2="442.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="762.50" y="397.00" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">latest snapshot</text>
+<line x1="400.00" y1="365.00" x2="280.00" y2="435.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="280.00" y1="435.00" x2="273.00" y2="428.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="280.00" y1="435.00" x2="273.00" y2="442.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="340.00" y="392.00" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">commit log</text>
+<line x1="280.00" y1="415.00" x2="400.00" y2="385.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="400.00" y1="385.00" x2="393.00" y2="378.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="400.00" y1="385.00" x2="393.00" y2="392.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="340.00" y="392.00" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">retrieval</text>
+<line x1="720.00" y1="155.00" x2="805.00" y2="205.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="805.00" y1="205.00" x2="798.00" y2="198.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="805.00" y1="205.00" x2="798.00" y2="212.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="762.50" y="172.00" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">budget</text>
+<line x1="915.00" y1="280.00" x2="915.00" y2="390.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="915.00" y1="390.00" x2="908.00" y2="383.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<line x1="915.00" y1="390.00" x2="908.00" y2="397.00" stroke="#5B6575" stroke-width="2" opacity="1"/>
+<text x="915.00" y="327.00" text-anchor="middle" font-size="11" font-weight="400" style="fill:#667085">bounded output</text>
+<text x="560.00" y="530.00" text-anchor="middle" font-size="20" font-weight="700">persistent state ≠ executing cognition ≠ temporal control</text>
+</svg>

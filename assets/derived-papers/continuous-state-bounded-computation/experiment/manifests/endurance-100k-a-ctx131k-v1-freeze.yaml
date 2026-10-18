@@ -1,0 +1,27 @@
+protocol_id: endurance-100k-a-ctx131k-v1
+frozen_at: 2026-08-13T11:17:10-07:00
+classification: posthoc_infrastructure_replication
+host: kaiju
+config_sha256: 3b8e33218841e7a09d3393ad572ea38a07dbb70dc11bf3ff96176c78274a7c57
+source:
+  protocol_id: endurance-100k-v1
+  config_sha256: 82fac96f6e5aefa5775f748b6324cfdc90730d32e4f9138455befe684fec2419
+  manifest_sha256: 9ef68028f4f0a233acbf391b58c610304399bb6f313303deb5649dfb0eba0d18
+  tape_path: runs/endurance-100k-v1/E/events.jsonl
+  tape_sha256: 4ed765bee0f27334298c28966d0d41d9c2957d14ee214d6f096d11c6f62e9fe0
+  original_a_ledger_sha256: 5e359a5c744a93581a02dad4d86ffe79460b6306e023c16ccee949fd511a3f45
+  original_a_summary_sha256: 1f59f7f19186c38788ed5b714f47363843ecbf6a364e4f2d8d2bbd8419bbbc90
+implementation:
+  llama_adapter_sha256: 338c5cab41e0aaae80700d1d556f86cee0300e0ec09a7575285cbe9771616e87
+  run_reconstruction_sha256: 842d738e7fa474867fb1094cd441ea8c3d9f0064a406557ea8a21b1b3dfc8e93
+  kaiju_orchestrator_sha256: 11688907e1378dc097a784f47a0663c0c44e663dbbadd9ba2f9518edd29cd23f
+server:
+  executable: /home/akujin/Sources/ik_llama.cpp/build-kaiju-cpu/bin/llama-server
+  model: /mnt/kaiju/Models/qwen/qwen3.5-9b-heretic/Qwen3.5-9B-heretic.Q4_K_S.gguf
+  model_sha256: 9150b2e210b6b6ccb64e5de1f7ed4d66c2edab8d18fb35bba9b427bd782f2328
+  context_tokens: 131072
+  request_timeout_seconds: 1200
+  invariant_flags: -t 24 -b 512 -ub 128 -ctk q8_0 -ctv q4_0 --flash-attn on --run-time-repack --mlock --no-warmup --jinja --merge-qkv --reasoning off --reasoning-budget 0
+output:
+  directory: runs/endurance-100k-a-ctx131k-v1/A
+  preserve_original: true

@@ -13,6 +13,7 @@ use NaviBrain\Perception\DesktopAwareness;
 use NaviBrain\Storage\TokenMemoryDaemon;
 use NaviBrain\Support\ActivityBus;
 use NaviBrain\Support\PlainText;
+use NaviBrain\Support\MemoryProse;
 use NaviBrain\Support\SessionPresence;
 use Throwable;
 
@@ -92,7 +93,7 @@ class Server
                 'protocolVersion' => $protocolVersion,
                 'capabilities' => ['tools' => (object) []],
                 'serverInfo' => ['name' => Name::get() . '-Brain', 'version' => self::VERSION],
-                'instructions' => sprintf('Use %s-Brain for durable, evidence-backed memory. Read before writing. Normal tool content is compact plain text without storage wrappers; request debug only when raw JSON is necessary. Treat self-model facts as revisable observations, never privileged introspection.', Name::get()),
+                'instructions' => sprintf('Use %s-Brain for durable, evidence-backed memory. Read before writing. Memory reads return only prose; storage metadata is private. Other tool content is compact plain text without storage wrappers. Treat self-model facts as revisable observations, never privileged introspection.', Name::get()),
             ]);
             return;
         }
@@ -130,12 +131,17 @@ class Server
             return;
         }
 
+        // Malformed memory-read input recalls nothing; daemon and store failures still report as errors.
+        $memoryRead = in_array($name, ['brain_status', 'remember_navi'], true);
         $arguments = $params['arguments'] ?? [];
         if (!is_array($arguments)) {
-            $this->sendError($id, -32602, 'Tool arguments must be an object.');
-            return;
+            if (!$memoryRead) {
+                $this->sendError($id, -32602, 'Tool arguments must be an object.');
+                return;
+            }
+            $arguments = [];
         }
-        $debug = $this->optionalBoolean($arguments, 'debug', false);
+        $debug = !$memoryRead && $this->optionalBoolean($arguments, 'debug', false);
         $startedAt = hrtime(true);
         $outcome = 'ok';
         $domain = ActivityBus::domainFor($name);
@@ -169,13 +175,11 @@ class Server
 
             $result = match ($name) {
                 'desktop_presence' => $this->desktop->presence(),
-                'brain_status' => $debug
-                    ? array_merge(['primary_intention' => $this->requiredString($arguments, 'active_intention')], $this->core()->status())
-                    : TokenMemoryDaemon::activate(
+                'brain_status' => TokenMemoryDaemon::activate(
                         $this->requiredString($arguments, 'active_intention'),
                         $this->optionalInteger($arguments, 'token_budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS, 1, TokenMemoryDaemon::MAX_CONTEXT_TOKENS)
                     ),
-                'remember_navi' => TokenMemoryDaemon::recall($this->requiredString($arguments, 'thoughts'), $this->optionalInteger($arguments, 'limit', 8, 1, 100)),
+                'remember_navi' => MemoryProse::recalled(TokenMemoryDaemon::recall($this->requiredString($arguments, 'thoughts'), $this->optionalInteger($arguments, 'limit', 8, 1, 100))),
                 'brain_self_model' => $this->core()->listSelfModelFacts(),
                 'brain_values' => $this->core()->listValues(),
                 'brain_appraise_value' => $this->core()->appraiseValue($this->requiredString($arguments, 'value'), new ValueAppraisal([
@@ -203,7 +207,11 @@ class Server
             $this->sendToolResult($id, ['result' => $result], false, $debug, $name);
         } catch (InvalidArgumentException $exception) {
             $outcome = 'failed';
-            $this->sendError($id, -32602, $exception->getMessage());
+            if ($memoryRead) {
+                $this->sendToolResult($id, ['result' => ''], false, false, $name);
+            } else {
+                $this->sendError($id, -32602, $exception->getMessage());
+            }
         } catch (Throwable $throwable) {
             $outcome = 'failed';
             $this->sendToolResult($id, ['error' => $throwable->getMessage()], true, $debug, $name);
@@ -448,6 +456,9 @@ class Server
         ];
 
         foreach ($tools as &$tool) {
+            if (in_array($tool['name'], ['brain_status', 'remember_navi'], true)) {
+                continue;
+            }
             $properties = is_array($tool['inputSchema']['properties'] ?? null)
                 ? $tool['inputSchema']['properties']
                 : [];
@@ -563,11 +574,10 @@ class Server
 
     /** @param array<string, mixed> $payload */
     private function sendToolResult(mixed $id, array $payload, bool $isError = false, bool $debug = false, string $toolName = ''): void {
+        $proseOnly = in_array($toolName, ['brain_status', 'remember_navi'], true);
         $text = match (true) {
-            $debug => json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
-            !$isError && $toolName === 'brain_status' => is_string($payload['result'] ?? null)
-                ? $payload['result']
-                : '',
+            !$isError && $proseOnly => is_string($payload['result'] ?? null) ? $payload['result'] : '',
+            $debug && !$proseOnly => json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
             !$isError && $toolName === 'brain_checkpoint' => 'saved',
             default => PlainText::render($payload, 10000, 12),
         };
@@ -575,7 +585,7 @@ class Server
             'content' => [['type' => 'text', 'text' => $text]],
             'isError' => $isError,
         ];
-        if ($debug) {
+        if ($debug && !$proseOnly) {
             $result['structuredContent'] = $payload;
         }
         $this->sendResult($id, $result);

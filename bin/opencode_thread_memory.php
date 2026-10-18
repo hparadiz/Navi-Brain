@@ -3,6 +3,8 @@
 
 declare(strict_types=1);
 
+require_once dirname(__DIR__) . '/vendor/autoload.php';
+
 const STATE_DIR = '/home/akujin/Sources/Navi-Brain/var';
 const STATE_PATH = STATE_DIR . '/navi-thread.json';
 const DEFAULT_DB = '/home/akujin/.local/share/opencode/opencode-dev.db';

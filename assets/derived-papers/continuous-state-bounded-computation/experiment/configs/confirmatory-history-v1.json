@@ -1,0 +1,77 @@
+{
+  "protocol_id": "confirmatory-history-v1",
+  "status": "locked-before-first-run",
+  "locked_at": "2026-08-13T10:23:02-07:00",
+  "host": "kaiju",
+  "seeds": [
+    11,
+    29,
+    47
+  ],
+  "model_seed": 42,
+  "ticks": 5000,
+  "event_probability": 0.05,
+  "evaluation_ticks": [
+    100,
+    500,
+    1000,
+    5000
+  ],
+  "fixed_window_events": 10,
+  "conditions": [
+    "A_FULL_HISTORY",
+    "B_FIXED_WINDOW",
+    "D_CSBC_SPARSE",
+    "E_ORACLE_SPARSE"
+  ],
+  "condition_order": {
+    "11": ["A", "B", "D"],
+    "29": ["D", "A", "B"],
+    "47": ["B", "D", "A"]
+  },
+  "model": "Qwen3.5-9B-heretic.Q4_K_S.gguf",
+  "reasoning": false,
+  "protocol": "compact",
+  "temperature": 0,
+  "top_k": 1,
+  "semantic_fields": {
+    "world": 3,
+    "belief": 6,
+    "presence": 2,
+    "total": 11
+  },
+  "primary_metrics": [
+    "semantic_field_accuracy_at_checkpoint",
+    "current_reconstruction_prompt_tokens",
+    "cumulative_prompt_tokens",
+    "cumulative_completion_tokens",
+    "cumulative_inference_wall_ms",
+    "D_interval_prompt_tokens_per_environment_event",
+    "D_spurious_mutation_rate",
+    "D_false_clean_rate",
+    "quiescent_invariant_violations"
+  ],
+  "primary_comparisons": [
+    "A current reconstruction cost versus history tick",
+    "D interval maintenance cost per event versus history interval",
+    "D semantic accuracy versus B at each checkpoint",
+    "D semantic accuracy and transition-model gap versus E"
+  ],
+  "exclusions": [
+    "Exclude and rerun only a run interrupted by host, service, storage, or network failure.",
+    "Retain malformed model responses, fallback transitions, and semantic errors as results.",
+    "Retain every completed seed; do not select seeds by outcome.",
+    "Do not combine development seed 7 with confirmatory estimates."
+  ],
+  "aggregation": {
+    "center": "arithmetic mean across the three seeds",
+    "spread": "sample standard deviation across the three seeds",
+    "cost_accounting": "all inference since tick zero, plus interval costs between checkpoints",
+    "decision_boundary_for_D": "state lookup with zero neural call; lookup latency not claimed",
+    "source": "scripts/tabulate_history_sweep.py"
+  },
+  "scope": [
+    "This sweep tests history-length behavior under fixed event probability and fixed active-state size.",
+    "It does not test all-dirty C, dependency fan-out, model generalization, hardware portability, or a real-time deadline."
+  ]
+}

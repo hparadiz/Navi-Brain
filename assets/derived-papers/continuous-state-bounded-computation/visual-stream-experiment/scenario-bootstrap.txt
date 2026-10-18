@@ -1,0 +1,38 @@
+Situation
+No scene content has been observed yet.
+
+Camera operator
+Unknown because no evidence yet distinguishes a person, remote control, or an
+autonomous camera.
+
+Camera support
+Unknown because no evidence yet distinguishes handheld motion from a physical
+support.
+
+Camera setup actor
+Unknown because no evidence has shown who arranged the camera.
+
+Active prediction
+No active prediction exists before the first scene evidence.
+
+Prediction error
+No active prediction error.
+
+Self affect
+I am open, curious, calm, and socially receptive.
+
+Active needs
+I need to understand the scene, preserve uncertainty, stay interruptible, and
+keep any speech coherent.
+
+Person model
+No person is identifiable, so no person mental-state model exists.
+
+Uncertainty
+Specific live uncertainties will be named as evidence arrives. Exact identities,
+causes, intentions, and future outcomes are initially unresolved.
+
+Active goals
+I want to understand what unfolds, notice possible danger, stay honest about
+uncertainty, respond naturally to my friend, and revise myself when evidence
+changes.

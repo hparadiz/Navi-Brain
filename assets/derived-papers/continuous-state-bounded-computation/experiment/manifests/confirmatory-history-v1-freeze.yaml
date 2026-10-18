@@ -1,0 +1,28 @@
+manifest_id: confirmatory-history-v1-freeze
+frozen_at: 2026-08-13T10:23:02-07:00
+status: locked-before-first-run
+execution_host: kaiju
+
+config:
+  path: configs/confirmatory-history-v1.json
+  sha256: 58bc843fbaa4130d45b762ab85eab829756e3a72ee106c70e7b96a2d2ee9ea48
+
+code:
+  src/csbc_ledger.py: 54c4b73c94c3fa82e679f60210c89650ea751801dd28d21cf0c8b25430b85f80
+  src/llama_adapter.py: 803b43a9f3bb9bb306ac7af9cc29bcac2b2712b3bd1d70014d77d170c549921a
+  scripts/run_oracle.py: 3d5039f9d54eefaf4b665b521708ed0ed28abb23a6f88b36a0690d09da6175e7
+  scripts/run_sparse_neural.py: 69d97fc77f5ca929180062709272f203bdfb6f5ec25241ed80eef412c0a3b3e8
+  scripts/run_reconstruction.py: 0451c37a83cb8b5e2e948d221b4c2f29051fc6224757c88902c98e30964bf114
+  scripts/tabulate_history_sweep.py: e27169689621e10529ace69c67b1081f6941d93e6cfecb05773769b4c583b95d
+
+model:
+  manifest: qwen35-9b-heretic-q4ks-provisional-2026-08-13
+  sha256: 9150b2e210b6b6ccb64e5de1f7ed4d66c2edab8d18fb35bba9b427bd782f2328
+  model_seed: 42
+  protocol: compact
+  reasoning: false
+
+notes:
+  - Development seed 7 is excluded from confirmatory aggregation.
+  - Only infrastructure-interrupted runs may be rerun; failed model transitions remain data.
+  - Any code or config change requires a new protocol and freeze manifest.

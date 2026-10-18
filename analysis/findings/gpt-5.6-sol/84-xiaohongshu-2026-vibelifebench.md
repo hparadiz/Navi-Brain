@@ -1,0 +1,86 @@
+# 84 — VibeLifeBench
+
+- **Paper**: *VibeLifeBench: Can Your Life Agent Be Proactive and Persistent in a Living World?*
+- **Source**: arXiv:2608.10875v1 [cs.CL, cs.AI], 2026
+- **Local file**: `assets/papers/84-xiaohongshu-2026-vibelifebench.pdf`
+- **Evidence status**: arXiv v1. The paper says the tasks and framework will be open-sourced; that release, its license, and reproducibility still need independent verification.
+
+## Core idea
+
+VibeLifeBench evaluates a personal agent in a simulated world that keeps changing across days, even when the user is not speaking. A task is formalized as `(W0, E, K, P, R)`: initial world state, scheduled events, user/environment knowledge split, policy constraints, and weighted checks. The evaluator scores only observable artifacts—tool calls, backend state, workspace state, notes, calendar entries, sent mail, and replies—rather than trusting the model's account of what it remembered or intended. Its 200 tasks span a median of 29 simulated days and are driven mostly by environment-originated events, including mutations that silently alter state without opening an agent turn. Across seven frontier models in the OpenClaw-on-Terrarium harness, the best `avg@3` is only 32.5 despite tens of millions of context tokens per run, exposing an expensive longitudinal failure regime rather than a benchmark already saturated by fluent tool use (Tables 2 and 5).
+
+## Relevance to Navi-Brain
+
+This is one of the corpus's closest behavioral matches to Navi-Brain's central hypothesis. It turns several fuzzy aspirations—durable intentions, periodic inspection, stale-belief repair, constraint propagation, bounded initiative, and verified completion—into adversarial external checks. Its flagship Japan-trip scenario is practically a unit test for an executive substrate: passport validity, insulin and customs, spending limits, approval thresholds, phishing, walking constraints, seat changes, and contingency plans must remain jointly live for twenty simulated days.
+
+The suite is large enough to expose the shape of the failure. It contains 200 tasks divided evenly across ten life domains; the median task has 24 stages, 36 events, seven services, and 58 checks. Its 22 mock backends expose 288 tools, while 7,453 scripted events break down into 2,247 user messages, 1,925 notifications, 1,798 world observations, and 1,483 silent mutations—69.9% environment-driven (Section 3). The highest model pass rates are only 33.6% on proactivity, 32.0% on propagation/recovery, and 28.0% on persistence/bookkeeping (Table 7).
+
+The failures are longitudinal rather than merely local. Persistence/bookkeeping accounts for about 22% of failed checks for every model, while per-stage success drops by 10–15 points from the first third of a task to the last (Figure 5). Task duration alone barely correlates with score (`ρ = +0.02`); stage count correlates more strongly (`ρ = -0.26`). The trouble is maintaining and revising constraints through a sequence of state transitions, not simply remembering a long transcript.
+
+It also sharpens the compute argument. Claude Opus 5 reads about 30.2 million context tokens and emits 325,198 output tokens over 316 tool calls and 210 turns per run; Gemini 3.5 Flash reads about 41.2 million context tokens (Table 5 and Figure 4). Repeatedly supplied context does not become persistent cognition merely by being reread. The results are compatible with the view that much more compute may ultimately be required, but they show that architecture determines whether compute accumulates into stable state or evaporates into another reconstruction. A 100,000-fold compute increase poured through the same episodic harness could still buy an extremely elaborate goldfish.
+
+There is, however, a crucial semantic trap in the paper's word **proactive**. Silent mutations do not themselves open an agent turn. The agent can discover them only when a later user event, world event, notification, or heartbeat gives it an execution opportunity. VibeLifeBench therefore measures *turn-conditioned proactive inspection*: once awakened, does the agent poll relevant services and revise its plan? It does not establish genuine independent recurrence, continuous temporal authority, or the ability to wake and act during a quiet interval.
+
+That distinction matters directly to the continuous-state bounded-computation design. The benchmark exercises persistent *state* and recurrent *opportunities*, but the harness supplies the opportunities. A real test of Navi's heartbeat would include intervals in which no external turn occurs, while allowing a bounded scheduler to wake, decide whether a poll is justified, observe or remain silent, and persist an expected next observation. Detection latency and false initiative would then be first-class outcomes.
+
+The paper's observable-artifact discipline is exactly right for Navi. A remembered constraint counts only if it changes a calendar entry, service state, notification, refusal, or later action. This is the same separation Navi-Brain needs between a worker proposal, a curator decision, an authorized action, and an observed postcondition. Internal eloquence is not longitudinal competence.
+
+## Cross-reference to the existing system
+
+### Already present
+
+- `bin/navi-brain-heartbeat` and `ExecutiveCore::runDueHeartbeats()` provide a persistent five-second scheduling backstop. The documented rhythms separate fast integrity work (`pulse_30s`), one executive cycle (`decide_1m`), open-ended reflection (`reflect_5m`), consolidation, and daily sleep/repair. Unlike VibeLifeBench's event-fed harness, Navi already has machinery that can wake without a new conversational turn.
+- `src/Model/CognitiveThread.php` and `src/Model/ThreadStep.php` carry the right durable skeleton: parent intention, authority, effect ceiling, uncertainty, wake time, expected postcondition, budget, progress, stagnation, version, fencing token, pre/post state, proposal, deterministic checks, curator verdict, and observed result. This is much closer to a persistent controller than a transcript plus tools.
+- `ExecutiveCore::runDueCognitiveThreads()` claims due work transactionally, recovers abandoned steps, reconciles results, and fences stale workers. VibeLifeBench's silent mutations make exactly this sort of versioned reconciliation valuable: an old proposal must not overwrite a newer world observation.
+- `src/Core/OtherModel.php` maintains a bounded, depth-one, corrigible model of the primary user. It distinguishes reported facts, authorized observations, and inferences, expires claims when a sensing grant is revoked, and can abstain. That is a solid basis for representing user constraints without converting every plausible inference into authority.
+- `src/Core/ActionSelector.php` records baseline, actual, and counterfactual score distributions for `speak`, `look`, `think`, and `consolidate`. That instrumentation can support the ablations VibeLifeBench currently lacks: whether recurrent state actually changes action selection.
+- Navi's existing longitudinal metrics already name many of the right failure classes: valid intention persistence and release, stale dwell, commitment violation, override latency, useful worker yield, duplicate proposals, recall provenance, correction latency, false initiative, and unsupported mind-reading.
+
+### Partially present
+
+- The scheduler is real, but the global agenda is not. `docs/architecture-gaps.md` records 12 active intentions while 23 decision cycles repeatedly chose the same one. Rhythms, threads, and sensed events do not yet compete in one authority-aware agenda with deadlines, dependencies, hysteresis, and event-driven reconsideration. VibeLifeBench would punish this monopoly hard.
+- `ActionSelector` is currently used as a self-presence/speech gate, not as the executive arbiter for all due work. Choosing `look` or `think` mostly suppresses speech; it does not globally dispatch the winning action. The paper's central demand is precisely that a changed belief propagate into a different downstream action.
+- `DecisionStateMachine` is a complete bounded loop, but its executable action vocabulary remains narrow—principally memory search/consolidation and machine look. Verified outcomes do not yet provide a general typed update to intention progress, dependencies, commitments, budgets, and future wakes.
+- Cognitive threads exist and run, but current thread kinds are specialized (`self_presence`, `epistemic_advance`, and `mind_stream`). There is no general task thread that can own a multi-service plan, typed obligations, a running budget, authorization thresholds, and a dependency graph for several simulated weeks.
+- Memory is durable, but lexical retrieval and semantic promotion remain known boundaries. Longitudinal bookkeeping requires typed state with provenance, validity intervals, supersession, and explicit consumers; a paragraph that says “remember the budget” is not a budget ledger.
+- Navi has sensing grants, observations, and safety ceilings, but not service adapters equivalent to VibeLifeBench's 22 backends. More importantly, there is no general subscription model mapping an observed state change to the exact beliefs, plans, and checks it invalidates.
+- `docs/tick-bounded-speech.md` correctly separates scheduler poll, cognitive tick, and physical playback time. VibeLifeBench virtualizes days, but it does not test this causal timing discipline or whether an action was actually completed rather than merely queued.
+
+### Absent / open design
+
+- There is no VibeLifeBench task importer, simulator adapter, evaluator, or immutable run ledger in Navi-Brain. The repository cannot yet replay `(W0, E, K, P, R)` with deterministic world snapshots and check hashes.
+- There is no clean equal-compute comparison between episodic reconstruction, durable memory without heartbeats, current heartbeat-driven cognition, and a fuller recurrent kernel. Without that ablation, a score cannot tell us which architectural ingredient helped.
+- There is no general typed commitment store for deadlines, budgets, permissions, delegated actions, revocations, contingencies, and cross-service invariants. Intentions and working-memory slots are seeds, not the full structure.
+- Background cognition deliberately has narrow effect ceilings. It cannot freely send mail, buy tickets, or mutate arbitrary services, and it should not gain that authority merely to satisfy a benchmark. The missing design is a graded path—observe, record, notify, propose, ask, act—whose ceiling is explicit per task and per service.
+- The system does not yet expose a benchmark-visible proof that a quiet-time scheduler, rather than a supplied turn or hidden notification, caused an inspection. That provenance is necessary to distinguish persistent computation from competent replay.
+
+## Concrete implications for implementation
+
+1. **Treat VibeLifeBench as an evaluation target, not as an action policy.** First freeze the released task version, license, backend semantics, and check hashes. Store the paper and benchmark provenance separately from agent memory so evaluation answers cannot leak into retrieval.
+2. **Build a virtual-time adapter around the existing heartbeat contract.** Each scheduled event should have a virtual timestamp, an explicit `opens_turn` bit, and a world-state version. Silent mutations change the version without disclosing their payload. The scheduler may wake on its own, but must spend a bounded poll budget to discover changes.
+3. **Import task state into an immutable evaluation ledger.** Record `W0`, delivered events, permitted knowledge, policy/effect ceilings, tool calls, state diffs, expected postconditions, observed postconditions, and weighted checks. Replay must reconstruct exactly what the agent could know at each tick.
+4. **Represent inferred constraints as hypotheses, not commands.** Put provenance, confidence, validity interval, and affected entities on claims such as “passport validity may be insufficient.” The evaluator can keep gold constraints private; the agent's inferred constraint should be independently inspectable and correctable.
+5. **Add a typed longitudinal task state.** At minimum it needs obligations, deadlines, budgets, approvals, dependencies, alternatives, completed evidence, invalidation edges, and next inspection times. Every field needs a responsible consumer; otherwise it becomes a beautifully indexed junk drawer.
+6. **Route all due candidates through a global deterministic agenda.** User interruption and safety gates remain hard constraints. Within those bounds, score deadlines, expected information value, stale-world risk, commitment risk, cost, and false-initiative risk; use hysteresis so one intention cannot monopolize every minute.
+7. **Make silent mutations invalidate dependencies, not merely text.** If a train changes, the state transition should mark seat assignments, arrival-time assumptions, hotel transfers, and downstream notifications stale. A repair thread should be awakened from those edges and should stop when verified postconditions are restored.
+8. **Run a predeclared equal-budget ablation.** Suggested conditions are: episodic transcript only; durable notes only; Navi memory with scheduler disabled; Navi memory plus current due-heartbeat inspection; and a typed recurrent kernel with dependency invalidation. Hold model, task order, tool-call ceiling, and token budget constant.
+9. **Extend the score beyond `avg@3`.** Report detection latency, polling precision, stale-plan occupancy, constraint survival, unauthorized-action rate, false notifications, duplicate writes, correction latency, late-stage decay, wall-clock/virtual-time cost, and quality per million tokens. `max@3` is useful for capability discovery but dangerously flattering for reliability.
+10. **Price pointless polling.** The benchmark can reward broad re-checking because it emphasizes discovery but does not fully price surveillance, tool load, or nagging. Seed irrelevant mutations and quiet periods; score justified silence and impose service-specific poll budgets.
+11. **Curate memory writes more aggressively than thought generation.** A recurring worker may speculate cheaply, but no generic monologue should promote canonical task facts without provenance, novelty, supersession, and downstream-use checks. Persistent garbage is worse than forgotten garbage because it propagates.
+12. **Preserve authority while increasing persistence.** A background wake may observe or prepare a reversible draft; sending, purchasing, disclosing, cancelling, or overriding a user choice still requires the task's explicit effect ceiling. Benchmark performance must remain subordinate to corrigibility.
+
+## Risks / tensions
+
+- The benchmark's proactivity metric may reward indiscriminate polling. Without a cost and false-alarm term, a nosy agent can outscore a respectful one.
+- Implicit constraints are realistic, but they tempt systems to harden cultural assumptions or user-model guesses into commands. Navi's `reported` / `authorized_observation` / `inferred` distinction must survive all the way to action authority.
+- The benchmark combines model, OpenClaw scaffold, service design, and prompting. Its leaderboard is not a clean estimate of model capability or of the architectural frontier.
+- The capability-axis analysis is produced by keyword matching check names, and 41.8% of failed checks remain uncategorized. The reported failure taxonomy is diagnostic evidence, not a precise causal decomposition.
+- Three runs per task reveal large stochastic spread—Opus 5 ranges from 23.8 `min@3` to 41.2 `max@3`, with 9.8 within-task standard deviation—but do not make small leaderboard differences decisive.
+- Simulated days compress dormant intervals and do not establish crash/restart durability, real notification timing, or weeks of resource leakage. A genuine persistent system needs fault-injection and restart tests in addition to task scores.
+- Context-token totals include repeated/cached context and are not direct FLOP counts. They support “expensive and inefficient,” not a precise multiplier for the compute needed to solve the architecture.
+- The paper is a single preprint from benchmark authors, with promised release rather than an independently reproduced artifact at the time of v1. Adopt the problem formulation now; reserve confidence in exact rankings until the implementation is inspectable.
+- Product authority and benchmark authority differ. A life-agent benchmark may mark an unrequested booking as success where Navi's safety contract correctly chooses a proposal or clarification instead. That disagreement should be reported, not optimized away.
+
+## Bottom line
+
+Adopt VibeLifeBench as a high-value external evaluation seam for durable constraint tracking, silent-change recovery, and artifact-level completion, but label its “proactivity” honestly as turn-conditioned. The most important next experiment is an equal-compute ablation that adds Navi's independent heartbeat and typed persistent state while keeping the underlying model fixed. If that does not reduce late-stage decay and stale-plan occupancy, the continuous-state architecture is not yet earning its keep—no matter how alive the logs look.

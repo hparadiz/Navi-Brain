@@ -3,6 +3,8 @@
 
 declare(strict_types=1);
 
+require_once dirname(__DIR__) . '/vendor/autoload.php';
+
 const SESSION_MEMORY_VERSION = 1;
 const MAX_STORED_TURNS = 8;
 const MAX_SEEN_TURNS = 512;
@@ -168,11 +170,14 @@ function printHelp(): void
 }
 
 /** @param array<string, mixed> $state */
-function storeEpisode(array $state, bool $final): int
+function storeEpisode(array $state, bool $final): ?int
 {
     $previous = is_int($state['memory_id'] ?? null) ? $state['memory_id'] : null;
-    brain();
     $content = episodeFromState($state, $final);
+    if ($content === '') {
+        return $previous;
+    }
+    brain();
     $memory = new NaviBrain\Model\Memory([
         'tier' => 'episodic', 'content' => $content, 'confidence' => 0.97, 'supersedes_id' => $previous,
         'operation_key' => NaviBrain\Storage\TokenMemoryDaemon::operationKey('codex-session-episode', hash('sha256', $content) . ':' . ($previous ?? 0)),
@@ -197,29 +202,13 @@ function brain(): NaviBrain\Core\ExecutiveCore\Executive
 /** @param array<string, mixed> $state */
 function episodeFromState(array $state, bool $final): string
 {
-    $name = (require dirname(__DIR__) . '/config/app.php')['name'];
-    $cwd = (string) ($state['cwd'] ?? 'unknown workspace');
     $turns = is_array($state['turns'] ?? null) ? array_slice($state['turns'], -4) : [];
-    $parts = [];
-    foreach ($turns as $turn) {
-        if (!is_array($turn)) {
-            continue;
-        }
-        $user = memoryExcerpt((string) ($turn['user'] ?? ''), 420);
-        $assistant = memoryExcerpt((string) ($turn['assistant'] ?? ''), 650);
-        $parts[] = 'User: ' . ($user === '' ? '(no text)' : $user)
-            . ' ' . $name . ': ' . ($assistant === '' ? '(no final text)' : $assistant);
-    }
-    $phase = $final ? 'finalized automatic capture' : 'rolling automatic capture';
-    return 'Session in ' . $cwd . ' (' . $phase . '): '
-        . implode(' ', $parts)
-        . ' Earlier rolling revisions for this Codex session are superseded.';
+    return NaviBrain\Support\MemoryProse::fromTurns($turns);
 }
 
 /** @param array<string, mixed> $state */
 function contextFromState(array $state): string
 {
-    $name = (require dirname(__DIR__) . '/config/app.php')['name'];
     $remembered = '';
     try {
         brain();
@@ -228,26 +217,9 @@ function contextFromState(array $state): string
         recordError('--session-start remembered context: ' . $throwable->getMessage());
     }
 
-    $lines = [
-        'Automatic ' . $name . ' continuity from the most recent captured Codex session.',
-        'Treat this as revisable prior-session evidence; current instructions take precedence.',
-        'Workspace: ' . (string) ($state['cwd'] ?? 'unknown'),
-        'Captured at: ' . gmdate('c', (int) ($state['updated_at'] ?? time())),
-    ];
-    if (is_int($state['memory_id'] ?? null)) {
-        $lines[] = 'Canonical episodic memory id: ' . $state['memory_id'];
-    }
-
     $turns = is_array($state['turns'] ?? null) ? array_slice($state['turns'], -4) : [];
-    foreach ($turns as $turn) {
-        if (!is_array($turn)) {
-            continue;
-        }
-        $lines[] = 'User: ' . contextExcerpt((string) ($turn['user'] ?? ''), 1400);
-        $lines[] = $name . ': ' . contextExcerpt((string) ($turn['assistant'] ?? ''), 2200);
-    }
-    $continuity = truncateText(implode("\n", $lines), 12000);
-    return trim(implode("\n\n", array_filter([$remembered, $continuity])));
+    $continuity = truncateText(NaviBrain\Support\MemoryProse::fromTurns($turns), 12000);
+    return implode("\n\n", array_filter([$remembered, $continuity], static fn (string $text): bool => $text !== ''));
 }
 
 /** @return array<string, mixed> */

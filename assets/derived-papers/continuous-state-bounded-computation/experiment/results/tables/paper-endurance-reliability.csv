@@ -1,0 +1,7 @@
+metric,value
+error_episodes,946
+repaired_error_episodes,944
+unresolved_error_episodes,2
+latency_p50_ms,1369.938218000243
+latency_p95_ms,1595.162713998434
+latency_p99_ms,1861.905730998842

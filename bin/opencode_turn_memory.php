@@ -1,0 +1,389 @@
+#!/usr/bin/env -S php -n
+<?php
+
+declare(strict_types=1);
+
+require_once dirname(__DIR__) . '/vendor/autoload.php';
+
+const SESSION_MEMORY_VERSION = 1;
+const MAX_STORED_TURNS = 8;
+const MAX_CONTEXT_AGE_SECONDS = 2592000;
+
+$mode = $argv[1] ?? '--help';
+
+try {
+    match ($mode) {
+        '--capture' => captureTurn(readPayload($argv[2] ?? null)),
+        '--session-start' => emitSessionContext(readPayload($argv[2] ?? null)),
+        '--session-end' => finalizeSession(readPayload($argv[2] ?? null)),
+        '--context' => printContext($argv[2] ?? getcwd() ?: ''),
+        '--help', '-h' => printHelp(),
+        default => throw new InvalidArgumentException('Unknown mode: ' . $mode),
+    };
+    exit(0);
+} catch (Throwable $throwable) {
+    recordError($mode . ': ' . $throwable->getMessage());
+    fwrite(STDERR, 'opencode-turn-memory: ' . $throwable->getMessage() . PHP_EOL);
+    exit(1);
+}
+
+/** @return array<string, mixed> */
+function readPayload(?string $argument): array
+{
+    $raw = $argument;
+    if ($raw === null || trim($raw) === '') {
+        $stdin = stream_get_contents(STDIN);
+        $raw = is_string($stdin) ? $stdin : '';
+    }
+    if (trim($raw) === '') {
+        return [];
+    }
+    $decoded = json_decode($raw, true, 32, JSON_THROW_ON_ERROR);
+    if (!is_array($decoded)) {
+        throw new InvalidArgumentException('Hook payload must be a JSON object.');
+    }
+    return $decoded;
+}
+
+/** @param array<string, mixed> $payload */
+function captureTurn(array $payload): void
+{
+    $sessionId = requiredString($payload, 'session_id');
+    $cwd = normalizedCwd((string) ($payload['cwd'] ?? ''));
+    $userText = sanitizeText((string) ($payload['user'] ?? ''), 5000);
+    $assistantText = sanitizeText((string) ($payload['assistant'] ?? ''), 8000);
+    $turnId = is_scalar($payload['turn_id'] ?? null) && trim((string) $payload['turn_id']) !== ''
+        ? trim((string) $payload['turn_id'])
+        : hash('sha256', $userText . "\n" . $assistantText);
+
+    if ($userText === '' && $assistantText === '') {
+        return;
+    }
+
+    $path = statePath($sessionId);
+    withStateLock($path, function () use ($path, $sessionId, $cwd, $turnId, $userText, $assistantText): void {
+        $state = loadState($path) ?? newState($sessionId, $cwd);
+        $seen = is_string($state['last_captured_turn_id'] ?? null) ? $state['last_captured_turn_id'] : null;
+        if ($seen === $turnId) {
+            return;
+        }
+
+        $turns = is_array($state['turns'] ?? null) ? $state['turns'] : [];
+        $turns[] = [
+            'turn_id' => $turnId,
+            'captured_at' => time(),
+            'user' => $userText,
+            'assistant' => $assistantText,
+        ];
+        $state['turns'] = array_slice($turns, -MAX_STORED_TURNS);
+        $state['last_captured_turn_id'] = $turnId;
+        $state['cwd'] = $cwd;
+        $state['updated_at'] = time();
+        $state['closed_at'] = null;
+
+        try {
+            $previous = is_int($state['memory_id'] ?? null) ? $state['memory_id'] : null;
+            $state['memory_id'] = storeEpisode($state, false, $previous);
+            $state['last_error'] = null;
+        } catch (Throwable $throwable) {
+            $state['last_error'] = sanitizeText($throwable->getMessage(), 1000);
+            saveState($path, $state);
+            throw $throwable;
+        }
+        saveState($path, $state);
+    });
+}
+
+/** @param array<string, mixed> $payload */
+function emitSessionContext(array $payload): void
+{
+    $cwd = normalizedCwd((string) ($payload['cwd'] ?? $payload['directory'] ?? getcwd() ?: ''));
+    $sessionId = is_scalar($payload['session_id'] ?? null)
+        ? trim((string) $payload['session_id'])
+        : '';
+    $state = $sessionId !== '' && is_file(statePath($sessionId))
+        ? (loadState(statePath($sessionId)) ?? latestState($cwd, $sessionId))
+        : latestState($cwd, $sessionId);
+    if ($state === null) {
+        $state = newState($sessionId === '' ? 'uncaptured-session' : $sessionId, $cwd);
+    }
+
+    echo contextFromState($state) . PHP_EOL;
+}
+
+/** @param array<string, mixed> $payload */
+function finalizeSession(array $payload): void
+{
+    $sessionId = requiredString($payload, 'session_id');
+    $path = statePath($sessionId);
+    if (!is_file($path)) {
+        return;
+    }
+
+    withStateLock($path, function () use ($path): void {
+        $state = loadState($path);
+        if ($state === null || is_int($state['closed_at'] ?? null)) {
+            return;
+        }
+        $state['closed_at'] = time();
+        $state['updated_at'] = time();
+
+        $previous = is_int($state['memory_id'] ?? null) ? $state['memory_id'] : null;
+        $state['memory_id'] = storeEpisode($state, true, $previous);
+        $state['last_error'] = null;
+        saveState($path, $state);
+        brain()->checkpoint('automatic-session-memory-end');
+    });
+}
+
+function printContext(string $cwd): void
+{
+    $cwd = normalizedCwd($cwd);
+    $state = latestState($cwd, '') ?? newState('uncaptured-session', $cwd);
+    echo contextFromState($state) . PHP_EOL;
+}
+
+function printHelp(): void
+{
+    echo "usage:\n";
+    echo "  opencode_turn_memory.php --capture '{\"session_id\":\"...\",\"cwd\":\"...\",\"user\":\"...\",\"assistant\":\"...\"[,\"turn_id\":\"...\"]}'\n";
+    echo "  opencode_turn_memory.php --session-start '{\"session_id\":\"...\",\"cwd\":\"...\"}'\n";
+    echo "  opencode_turn_memory.php --session-end '{\"session_id\":\"...\"}'\n";
+    echo "  opencode_turn_memory.php --context [cwd]\n";
+}
+
+/** @param array<string, mixed> $state */
+function storeEpisode(array $state, bool $final, ?int $previous): ?int
+{
+    $content = episodeFromState($state, $final);
+    if ($content === '') {
+        return $previous;
+    }
+    brain();
+    $memory = new NaviBrain\Model\Memory([
+        'tier' => 'episodic', 'content' => $content, 'confidence' => 0.97, 'supersedes_id' => $previous,
+        'operation_key' => NaviBrain\Storage\TokenMemoryDaemon::operationKey('opencode-session-episode', hash('sha256', $content) . ':' . ($previous ?? 0)),
+    ], true, true);
+    $memory->save();
+    $id = (int) $memory->id;
+    return $id;
+}
+
+function brain(): NaviBrain\Core\ExecutiveCore\Executive
+{
+    static $core = null;
+    if ($core instanceof NaviBrain\Core\ExecutiveCore\Executive) {
+        return $core;
+    }
+    require dirname(__DIR__) . '/bootstrap/app.php';
+    $core = new NaviBrain\Core\ExecutiveCore\Executive();
+    $core->initialize();
+    return $core;
+}
+
+/** @param array<string, mixed> $state */
+function episodeFromState(array $state, bool $final): string
+{
+    $turns = is_array($state['turns'] ?? null) ? array_slice($state['turns'], -4) : [];
+    return NaviBrain\Support\MemoryProse::fromTurns($turns);
+}
+
+/** @param array<string, mixed> $state */
+function contextFromState(array $state): string
+{
+    $remembered = '';
+    try {
+        brain();
+        $remembered = NaviBrain\Support\CodexContext::render();
+    } catch (Throwable $throwable) {
+        recordError('--session-start remembered context: ' . $throwable->getMessage());
+    }
+
+    $turns = is_array($state['turns'] ?? null) ? array_slice($state['turns'], -4) : [];
+    $continuity = truncateText(NaviBrain\Support\MemoryProse::fromTurns($turns), 8000);
+    return implode("\n\n", array_filter([$remembered, $continuity], static fn (string $text): bool => $text !== ''));
+}
+
+/** @return array<string, mixed> */
+function newState(string $sessionId, string $cwd): array
+{
+    return [
+        'version' => SESSION_MEMORY_VERSION,
+        'source' => 'opencode',
+        'session_id' => $sessionId,
+        'cwd' => $cwd,
+        'created_at' => time(),
+        'updated_at' => time(),
+        'closed_at' => null,
+        'memory_id' => null,
+        'last_captured_turn_id' => null,
+        'last_error' => null,
+        'turns' => [],
+    ];
+}
+
+/** @return array<string, mixed>|null */
+function latestState(string $cwd, string $currentSessionId): ?array
+{
+    $bestWorkspace = null;
+    $bestAny = null;
+    foreach (glob(stateDir() . '/*.json') ?: [] as $path) {
+        $state = loadState($path);
+        if ($state === null || (int) ($state['updated_at'] ?? 0) < time() - MAX_CONTEXT_AGE_SECONDS) {
+            continue;
+        }
+        if (($state['source'] ?? null) !== 'opencode') {
+            continue;
+        }
+        $sessionId = (string) ($state['session_id'] ?? '');
+        $updatedAt = (int) ($state['updated_at'] ?? 0);
+        if ($sessionId === $currentSessionId && $currentSessionId !== '') {
+            return $state;
+        }
+        if ($bestAny === null || $updatedAt > (int) ($bestAny['updated_at'] ?? 0)) {
+            $bestAny = $state;
+        }
+        if ((string) ($state['cwd'] ?? '') === $cwd
+            && ($bestWorkspace === null || $updatedAt > (int) ($bestWorkspace['updated_at'] ?? 0))) {
+            $bestWorkspace = $state;
+        }
+    }
+    return $bestWorkspace ?? $bestAny;
+}
+
+/** @return array<string, mixed>|null */
+function loadState(string $path): ?array
+{
+    if (!is_file($path)) {
+        return null;
+    }
+    $raw = file_get_contents($path);
+    if (!is_string($raw) || trim($raw) === '') {
+        return null;
+    }
+    $state = json_decode($raw, true);
+    return is_array($state) ? $state : null;
+}
+
+/** @param array<string, mixed> $state */
+function saveState(string $path, array $state): void
+{
+    ensureStateDir();
+    $temporary = $path . '.tmp.' . getmypid();
+    $json = json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . PHP_EOL;
+    if (file_put_contents($temporary, $json, LOCK_EX) === false) {
+        throw new RuntimeException('Unable to write session-memory state.');
+    }
+    chmod($temporary, 0600);
+    if (!rename($temporary, $path)) {
+        @unlink($temporary);
+        throw new RuntimeException('Unable to publish session-memory state.');
+    }
+    chmod($path, 0600);
+}
+
+function statePath(string $sessionId): string
+{
+    ensureStateDir();
+    return stateDir() . '/opencode-' . hash('sha256', $sessionId) . '.json';
+}
+
+function stateDir(): string
+{
+    $override = getenv('NAVI_SESSION_MEMORY_DIR');
+    return is_string($override) && trim($override) !== ''
+        ? rtrim($override, '/')
+        : dirname(__DIR__) . '/var/session-memory';
+}
+
+function ensureStateDir(): void
+{
+    $directory = stateDir();
+    if (!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) {
+        throw new RuntimeException('Unable to create session-memory state directory.');
+    }
+    chmod($directory, 0700);
+}
+
+function withStateLock(string $path, callable $callback): void
+{
+    $lockPath = $path . '.lock';
+    $lock = fopen($lockPath, 'c+');
+    if (!is_resource($lock)) {
+        throw new RuntimeException('Unable to open session-memory lock.');
+    }
+    chmod($lockPath, 0600);
+    if (!flock($lock, LOCK_EX)) {
+        fclose($lock);
+        throw new RuntimeException('Unable to acquire session-memory lock.');
+    }
+    try {
+        $callback();
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
+}
+
+/** @param array<string, mixed> $payload */
+function requiredString(array $payload, string $key): string
+{
+    $value = $payload[$key] ?? null;
+    if (!is_scalar($value) || trim((string) $value) === '') {
+        throw new InvalidArgumentException('Missing hook field: ' . $key);
+    }
+    return trim((string) $value);
+}
+
+function normalizedCwd(string $cwd): string
+{
+    $cwd = trim($cwd);
+    if ($cwd === '') {
+        return 'unknown-workspace';
+    }
+    $resolved = realpath($cwd);
+    return $resolved === false ? rtrim($cwd, '/') : $resolved;
+}
+
+function sanitizeText(string $text, int $limit): string
+{
+    $text = preg_replace('/-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----/is', '[REDACTED PRIVATE KEY]', $text) ?? $text;
+    $text = preg_replace('/\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16})\b/', '[REDACTED TOKEN]', $text) ?? $text;
+    $text = preg_replace('/\b(password|passwd|api[_ -]?key|access[_ -]?token|token|secret)(\s*[:=]\s*)([^\s,;]+)/i', '$1$2[REDACTED]', $text) ?? $text;
+    $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', ' ', $text) ?? $text;
+    $text = preg_replace('/[ \t]+/u', ' ', trim($text)) ?? trim($text);
+    $text = preg_replace('/ *\R */u', "\n", $text) ?? $text;
+    return truncateText($text, $limit);
+}
+
+function memoryExcerpt(string $text, int $limit): string
+{
+    $text = preg_replace('/\s+/u', ' ', trim($text)) ?? trim($text);
+    return truncateText($text, $limit);
+}
+
+function contextExcerpt(string $text, int $limit): string
+{
+    return truncateText(trim($text), $limit);
+}
+
+function truncateText(string $text, int $limit): string
+{
+    if (strlen($text) <= $limit) {
+        return $text;
+    }
+    $cut = function_exists('mb_strcut') ? mb_strcut($text, 0, max(1, $limit - 4), 'UTF-8') : substr($text, 0, max(1, $limit - 4));
+    return rtrim($cut) . ' ...';
+}
+
+function recordError(string $message): void
+{
+    try {
+        ensureStateDir();
+        $path = stateDir() . '/errors.log';
+        file_put_contents($path, gmdate('c') . ' opencode ' . sanitizeText($message, 2000) . PHP_EOL, FILE_APPEND | LOCK_EX);
+        chmod($path, 0600);
+    } catch (Throwable) {
+
+    }
+}

@@ -1,0 +1,36 @@
+{
+  "status": "exploratory-development",
+  "host": "kaiju",
+  "ticks": 1000,
+  "seed": 7,
+  "event_probability": 0.05,
+  "evaluation_interval_ticks": 25,
+  "fixed_window_events": 10,
+  "semantic_fields": {
+    "world": 3,
+    "belief": 6,
+    "presence": 2,
+    "total": 11
+  },
+  "conditions": [
+    "A_FULL_HISTORY",
+    "B_FIXED_WINDOW",
+    "C_PERSISTENT_ALL_DIRTY",
+    "D_CSBC_SPARSE",
+    "E_ORACLE_SPARSE"
+  ],
+  "model": "Qwen3.5-9B-heretic.Q4_K_S.gguf",
+  "reasoning": false,
+  "protocol": "compact",
+  "protocol_ablation": "json",
+  "temperature": 0,
+  "top_k": 1,
+  "primary_metric": "semantic_field_accuracy",
+  "accounting": "all updater and reconstruction inference is cumulative",
+  "tape": "/home/akujin/Sources/csbc-sparse-belief-ledger/runs/dev-oracle-seed7-v2-stimulus/events.jsonl",
+  "notes": [
+    "Collected after prompt, protocol, and stimulus iteration.",
+    "Must not be relabeled as preregistered or confirmatory evidence.",
+    "Current workstation excluded from execution and profiling."
+  ]
+}

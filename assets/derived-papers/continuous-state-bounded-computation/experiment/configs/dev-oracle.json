@@ -1,0 +1,7 @@
+{
+  "condition": "E_ORACLE_SPARSE",
+  "evaluation_interval": 25,
+  "event_probability": 0.05,
+  "seed": 7,
+  "ticks": 1000
+}

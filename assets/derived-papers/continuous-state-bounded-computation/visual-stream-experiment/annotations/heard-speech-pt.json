@@ -1,0 +1,181 @@
+{
+  "schema_version": "1.0.0",
+  "language": "Brazilian Portuguese, probable",
+  "track_kind": "approximate phonetic hearing track",
+  "policy": "Preserve what the audio sounds like, including uncertain or possibly nonexistent words. Do not silently normalize a phrase into the meaning suggested by the picture.",
+  "verification": "Not native-speaker verified. Several noisy candidate hearings were compared. This track is evidence for the continuous state to interpret, not authoritative dialogue or translation.",
+  "delivery": "Phrase tokens are released gradually according to estimated within-phrase timing. A tick never receives the unspoken remainder of a phrase.",
+  "segments": [
+    {
+      "id": "pt_001",
+      "start_ms": 0,
+      "end_ms": 1560,
+      "heard_as": "Marimbona natura… é eu.",
+      "confidence": 0.34,
+      "alternatives": ["Marimbondo na natura… e eu.", "Marimbondo natural… é eu."],
+      "notes": "Opening noun and connective are unclear; the sound resembles marimbondo/marimbona in context."
+    },
+    {
+      "id": "pt_002",
+      "start_ms": 1560,
+      "end_ms": 3100,
+      "heard_as": "Sem fake ni…",
+      "confidence": 0.3,
+      "alternatives": ["Sem fake news.", "Sem fake nix."],
+      "notes": "Final syllable is not clean enough to normalize."
+    },
+    {
+      "id": "pt_003",
+      "start_ms": 3100,
+      "end_ms": 3650,
+      "heard_as": "Viu?",
+      "confidence": 0.78,
+      "alternatives": [],
+      "notes": "Short discourse marker."
+    },
+    {
+      "id": "pt_004",
+      "start_ms": 3650,
+      "end_ms": 5940,
+      "heard_as": "É melhor vocês ficarem caladinhos",
+      "confidence": 0.72,
+      "alternatives": ["É melhor você ficar caladinho"],
+      "notes": "Number agreement is acoustically ambiguous."
+    },
+    {
+      "id": "pt_005",
+      "start_ms": 5940,
+      "end_ms": 7960,
+      "heard_as": "do jeito que tá mesmo, porque só tem eu mesmo.",
+      "confidence": 0.66,
+      "alternatives": ["do jeito que está mesmo, porque só tenho eu mesmo."],
+      "notes": "Colloquial grammar and tenho/tem are difficult to separate."
+    },
+    {
+      "id": "pt_006",
+      "start_ms": 7960,
+      "end_ms": 9060,
+      "heard_as": "Viu?",
+      "confidence": 0.72,
+      "alternatives": [],
+      "notes": "Short discourse marker."
+    },
+    {
+      "id": "pt_007",
+      "start_ms": 9060,
+      "end_ms": 11860,
+      "heard_as": "Ó…",
+      "confidence": 0.58,
+      "alternatives": ["Olha…"],
+      "notes": "Drawn-out attention call; intervening audio is unclear."
+    },
+    {
+      "id": "pt_008",
+      "start_ms": 11860,
+      "end_ms": 30780,
+      "heard_as": "[fala indistinta e sons da atividade]",
+      "confidence": 0.18,
+      "alternatives": [],
+      "notes": "Do not manufacture lexical content for this long noisy span."
+    },
+    {
+      "id": "pt_009",
+      "start_ms": 30780,
+      "end_ms": 33260,
+      "heard_as": "Bande de calça frouxa.",
+      "confidence": 0.25,
+      "alternatives": ["Bando de cabra frouxo."],
+      "notes": "The alternative is idiomatic Brazilian Portuguese, but the delivered primary text intentionally preserves the rough sound rather than auto-correcting it."
+    },
+    {
+      "id": "pt_010",
+      "start_ms": 33260,
+      "end_ms": 35440,
+      "heard_as": "Só tem a lesteia do prato.",
+      "confidence": 0.16,
+      "alternatives": ["Só tem a… do prato."],
+      "notes": "The middle word may be nonexistent or badly masked; retain it phonetically."
+    },
+    {
+      "id": "pt_011",
+      "start_ms": 35440,
+      "end_ms": 37080,
+      "heard_as": "Ó.",
+      "confidence": 0.46,
+      "alternatives": ["Olha."],
+      "notes": "Short attention call."
+    },
+    {
+      "id": "pt_012",
+      "start_ms": 37080,
+      "end_ms": 38600,
+      "heard_as": "Ó.",
+      "confidence": 0.43,
+      "alternatives": ["Olha."],
+      "notes": "Short attention call."
+    },
+    {
+      "id": "pt_013",
+      "start_ms": 38600,
+      "end_ms": 42600,
+      "heard_as": "Ó… ó…",
+      "confidence": 0.35,
+      "alternatives": [],
+      "notes": "Repeated short vocalizations; timing is approximate."
+    },
+    {
+      "id": "pt_014",
+      "start_ms": 42600,
+      "end_ms": 44600,
+      "heard_as": "Bande de calça frouxa.",
+      "confidence": 0.2,
+      "alternatives": ["Bando de cabra frouxo."],
+      "notes": "May repeat the earlier phrase; preserve uncertainty."
+    },
+    {
+      "id": "pt_015",
+      "start_ms": 44600,
+      "end_ms": 45600,
+      "heard_as": "Só tem milho.",
+      "confidence": 0.14,
+      "alternatives": ["Só tem…"],
+      "notes": "Extremely uncertain short phrase."
+    },
+    {
+      "id": "pt_016",
+      "start_ms": 45600,
+      "end_ms": 46600,
+      "heard_as": "Ó.",
+      "confidence": 0.36,
+      "alternatives": [],
+      "notes": "Short vocalization."
+    },
+    {
+      "id": "pt_017",
+      "start_ms": 46600,
+      "end_ms": 62000,
+      "heard_as": "[fala ou vocalização abafada indistinta sob o plástico]",
+      "confidence": 0.16,
+      "alternatives": ["algo soando como ‘tchau, tchau’"],
+      "notes": "The alternative is too uncertain to promote into the primary transcript."
+    },
+    {
+      "id": "pt_018",
+      "start_ms": 62000,
+      "end_ms": 64500,
+      "heard_as": "[respiração, exclamações e fala indistinta]",
+      "confidence": 0.3,
+      "alternatives": [],
+      "notes": "Lexical content remains unresolved after emergence."
+    },
+    {
+      "id": "pt_019",
+      "start_ms": 64500,
+      "end_ms": 68733,
+      "heard_as": "[risos e vocalização divertida]",
+      "confidence": 0.83,
+      "alternatives": [],
+      "notes": "Confident nonlexical laughter/amusement; no exact words asserted."
+    }
+  ]
+}

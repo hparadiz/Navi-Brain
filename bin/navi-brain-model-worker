@@ -83,7 +83,7 @@ if ($profile === 'dream-cycle') {
 
 if ($arguments === ['--status']) {
 
-    require dirname(__DIR__) . '/src/Core/OpenCodeQuota.php';
+    require dirname(__DIR__) . '/vendor/autoload.php';
     $quota = OpenCodeQuota::snapshot(dirname(__DIR__) . '/var/opencode-worker');
     $privacy = match ($profile) {
         'disabled' => 'background_disabled',

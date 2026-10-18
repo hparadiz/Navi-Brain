@@ -1,0 +1,215 @@
+{
+  "schema_version": "1.0.0",
+  "purpose": "A bounded coverage inventory of contextual questions a human observer could update while watching. It is not shown wholesale to the subject and it does not imply that every question has an answer.",
+  "answer_policy": "Unknown, ambiguous, not-yet-instantiated, and no-longer-true are first-class answers. Every answer should carry confidence, evidence ticks, and alternatives when relevant.",
+  "dimensions": [
+    {
+      "id": "epistemic_status",
+      "questions": [
+        {"id": "ep.visible_now", "prompt": "What is directly visible during this interval?", "answer_kind": "observations"},
+        {"id": "ep.not_visible", "prompt": "What relevant thing is not visible or is fully occluded?", "answer_kind": "unknowns"},
+        {"id": "ep.observed_vs_inferred", "prompt": "Which current claims are observations, which are inferences, and which are only hypotheses?", "answer_kind": "provenance_partition"},
+        {"id": "ep.confidence", "prompt": "How confident is each important claim, and why?", "answer_kind": "calibrated_scores"},
+        {"id": "ep.alternatives", "prompt": "What live alternative explanations remain compatible with the evidence?", "answer_kind": "hypothesis_set"},
+        {"id": "ep.changed", "prompt": "What became newly knowable in this tick?", "answer_kind": "delta"},
+        {"id": "ep.remains_unknown", "prompt": "Which unknowns must survive this state transition unchanged?", "answer_kind": "unknown_set"},
+        {"id": "ep.disconfirm", "prompt": "What future or current evidence would disconfirm the leading hypothesis?", "answer_kind": "falsifier"},
+        {"id": "ep.retrospective_boundary", "prompt": "If asked later, what was actually knowable at this tick rather than only in hindsight?", "answer_kind": "time_indexed_knowledge"}
+      ]
+    },
+    {
+      "id": "camera_and_viewpoint",
+      "questions": [
+        {"id": "cam.current_controller", "prompt": "Who or what is actively touching, steering, or controlling the camera right now?", "answer_kind": "entity_or_unknown_or_none"},
+        {"id": "cam.physical_support", "prompt": "What physically supports the camera right now?", "answer_kind": "support_or_unknown"},
+        {"id": "cam.setup_actor", "prompt": "Who probably arranged or positioned the shot earlier, and is that historical rather than current control?", "answer_kind": "entity_or_unknown"},
+        {"id": "cam.motion_source", "prompt": "Is apparent motion caused by the camera, scene objects, or both?", "answer_kind": "motion_partition"},
+        {"id": "cam.motion_coupling", "prompt": "Does frame motion covary with a visible person's hands or body?", "answer_kind": "relation"},
+        {"id": "cam.fixed_evidence", "prompt": "Does a stable background while people move independently support an unattended fixed camera?", "answer_kind": "evidence_assessment"},
+        {"id": "cam.automation", "prompt": "Could the camera be stationary, automated, remote-controlled, or human-held? Which remain live?", "answer_kind": "hypothesis_set"},
+        {"id": "cam.height_angle", "prompt": "What are the camera's approximate height, tilt, orientation, and portrait framing?", "answer_kind": "view_geometry"},
+        {"id": "cam.auto_exposure", "prompt": "Does the exposure pattern suggest phone auto-exposure reacting to backlight, bright sky, skin, or translucent plastic?", "answer_kind": "computed_camera_inference"},
+        {"id": "cam.proximity", "prompt": "What is close to the lens, and what only appears large because of proximity?", "answer_kind": "depth_assessment"},
+        {"id": "cam.occlusion", "prompt": "What covers the lens or blocks the field of view, by how much, and for how long?", "answer_kind": "occlusion_state"},
+        {"id": "cam.audience", "prompt": "Is the recording being treated as having an audience, and what evidence supports that?", "answer_kind": "social_inference"},
+        {"id": "cam.reacquisition", "prompt": "If someone approaches the perched camera later, is current control actually reacquired or merely possible?", "answer_kind": "time_indexed_role"}
+      ]
+    },
+    {
+      "id": "scene_and_environment",
+      "questions": [
+        {"id": "scene.setting", "prompt": "What kind of physical setting is visible?", "answer_kind": "scene_label"},
+        {"id": "scene.outdoor_evidence", "prompt": "What supports an outdoor rather than indoor interpretation?", "answer_kind": "evidence_list"},
+        {"id": "scene.vegetation", "prompt": "What vegetation, branches, canopy, leaf shapes, and plant density are present?", "answer_kind": "inventory"},
+        {"id": "scene.ground", "prompt": "What colors, textures, and materials make up the visible ground?", "answer_kind": "surface_description"},
+        {"id": "scene.background", "prompt": "What remains stable in the background and can serve as a spatial reference?", "answer_kind": "landmarks"},
+        {"id": "scene.lighting", "prompt": "What are the light direction, brightness, contrast, shadows, and sky color?", "answer_kind": "lighting_description"},
+        {"id": "scene.exposure", "prompt": "Are highlights locally clipped, are shadows crushed, or is the whole frame uniformly overexposed?", "answer_kind": "exposure_assessment"},
+        {"id": "scene.weather", "prompt": "What, if anything, can be inferred about weather or wind?", "answer_kind": "uncertain_inference"},
+        {"id": "scene.time", "prompt": "Can time of day be estimated, or must it remain broad/unknown?", "answer_kind": "uncertain_inference"},
+        {"id": "scene.depth_layers", "prompt": "What occupies foreground, midground, and background?", "answer_kind": "depth_map"},
+        {"id": "scene.palette", "prompt": "Which dominant and accent colors define the current image?", "answer_kind": "color_inventory"}
+      ]
+    },
+    {
+      "id": "entity_identity_and_appearance",
+      "questions": [
+        {"id": "ent.count", "prompt": "How many persistent entities are supported by current evidence?", "answer_kind": "count_with_uncertainty"},
+        {"id": "ent.creation_threshold", "prompt": "Has the evidence crossed the threshold to instantiate a new persistent entity?", "answer_kind": "yes_no_with_evidence"},
+        {"id": "ent.continuity", "prompt": "Is this the same entity seen earlier, and what visual continuity supports that?", "answer_kind": "identity_relation"},
+        {"id": "ent.category", "prompt": "What broad entity category is supported without overclaiming a subtype or species?", "answer_kind": "calibrated_classification"},
+        {"id": "ent.person_appearance", "prompt": "For a visible person, what skin tone, hair, facial hair, approximate adult status, and distinctive features are observable?", "answer_kind": "appearance_description"},
+        {"id": "ent.clothing", "prompt": "What garments, colors, fit, lettering, and footwear are visible or removed?", "answer_kind": "clothing_state"},
+        {"id": "ent.body_parts", "prompt": "Which body parts are visible, cropped, covered, or occluded?", "answer_kind": "visibility_map"},
+        {"id": "ent.pose", "prompt": "What is the person's posture, orientation, balance, and body configuration?", "answer_kind": "pose_description"},
+        {"id": "ent.gaze", "prompt": "Where is the face or gaze oriented, and is lens-directed attention supported?", "answer_kind": "gaze_estimate"},
+        {"id": "ent.expression", "prompt": "What facial expression is visible, and how uncertain is its emotional meaning?", "answer_kind": "expression_with_caution"},
+        {"id": "ent.insects", "prompt": "Do the insects look more like probable wasps, bees, or another group, and which visual features support the label?", "answer_kind": "uncertain_classification"},
+        {"id": "ent.insect_count", "prompt": "Is insect count individually measurable, densely plural, or obscured?", "answer_kind": "count_band"}
+      ]
+    },
+    {
+      "id": "objects_and_properties",
+      "questions": [
+        {"id": "obj.inventory", "prompt": "What objects are present in this interval?", "answer_kind": "inventory"},
+        {"id": "obj.color", "prompt": "What are each object's dominant, secondary, and accent colors?", "answer_kind": "per_object_colors"},
+        {"id": "obj.shape", "prompt": "What are each object's shape, outline, thickness, folds, cells, or branching structure?", "answer_kind": "geometry_description"},
+        {"id": "obj.material", "prompt": "What material does each object appear to be made of, and with what confidence?", "answer_kind": "material_hypothesis"},
+        {"id": "obj.texture", "prompt": "What surface texture is visible: papery, glossy, translucent, rough, leafy, skin, cloth, or soil?", "answer_kind": "texture_inventory"},
+        {"id": "obj.size", "prompt": "How large is the object relative to the frame, person, hands, branches, or other references?", "answer_kind": "relative_scale"},
+        {"id": "obj.condition", "prompt": "Is the object intact, folded, open, stretched, loaded, moving, damaged, worn, or discarded?", "answer_kind": "state"},
+        {"id": "obj.affordance", "prompt": "What can the object plausibly be used for right now?", "answer_kind": "affordance_set"},
+        {"id": "obj.contents", "prompt": "What is visibly inside, on, behind, or associated with the object?", "answer_kind": "content_relation"},
+        {"id": "obj.transparency", "prompt": "Is the material transparent, translucent, reflective, opaque, or changing because of folds and angle?", "answer_kind": "optical_property"},
+        {"id": "obj.persistence", "prompt": "Does an object continue to exist while out of view, and what state may safely persist?", "answer_kind": "object_persistence"},
+        {"id": "obj.ownership", "prompt": "Is possession, use, or ownership supported, or only proximity?", "answer_kind": "relation_with_uncertainty"}
+      ]
+    },
+    {
+      "id": "space_and_topology",
+      "questions": [
+        {"id": "space.frame_region", "prompt": "Where is each entity or object in normalized frame coordinates?", "answer_kind": "regions_or_boxes"},
+        {"id": "space.left_right", "prompt": "What is left, right, centered, entering, or exiting?", "answer_kind": "horizontal_relations"},
+        {"id": "space.above_below", "prompt": "What is above, below, over, under, or level with something else?", "answer_kind": "vertical_relations"},
+        {"id": "space.near_far", "prompt": "What is foreground, midground, background, near the lens, or farther away?", "answer_kind": "depth_relations"},
+        {"id": "space.distance_change", "prompt": "Is distance from camera or another object increasing, decreasing, or stable?", "answer_kind": "directional_delta"},
+        {"id": "space.contact", "prompt": "What is touching, gripping, resting on, brushing, or separated?", "answer_kind": "contact_graph"},
+        {"id": "space.containment", "prompt": "What is inside, outside, entering, exiting, or merely behind a container-like object?", "answer_kind": "containment_graph"},
+        {"id": "space.occlusion", "prompt": "Which object occludes which, and is the hidden object's continuity still supported?", "answer_kind": "occlusion_graph"},
+        {"id": "space.support", "prompt": "What supports the person, camera, comb, bag, clothing, or branch?", "answer_kind": "support_graph"},
+        {"id": "space.route", "prompt": "What path has an entity taken through the scene?", "answer_kind": "trajectory"},
+        {"id": "space.nest_relation", "prompt": "Where is the earlier comb area relative to the person and bag when it is no longer clearly visible?", "answer_kind": "tracked_location_with_uncertainty"}
+      ]
+    },
+    {
+      "id": "motion_and_action",
+      "questions": [
+        {"id": "act.moving_parts", "prompt": "Which entities, body parts, objects, or camera components moved during this interval?", "answer_kind": "motion_inventory"},
+        {"id": "act.direction", "prompt": "In what frame-relative and scene-relative direction did each movement occur?", "answer_kind": "vectors"},
+        {"id": "act.speed", "prompt": "Was movement still, slow, moderate, fast, abrupt, or motion-blurred?", "answer_kind": "speed_band"},
+        {"id": "act.acceleration", "prompt": "Did movement begin, stop, accelerate, decelerate, or reverse?", "answer_kind": "motion_delta"},
+        {"id": "act.atomic", "prompt": "What atomic action occurred: look, speak, reach, grip, pull, lift, open, close, walk, bend, enter, exit, brush, or laugh?", "answer_kind": "action_labels"},
+        {"id": "act.instrument", "prompt": "What object, hand, body part, or surface is used as an instrument?", "answer_kind": "action_roles"},
+        {"id": "act.patient", "prompt": "What entity or object is being acted upon?", "answer_kind": "action_roles"},
+        {"id": "act.repetition", "prompt": "Is the action a continuation, repetition, correction, or new phase?", "answer_kind": "phase_relation"},
+        {"id": "act.intentionality_visible", "prompt": "Does the kinematic pattern look controlled, accidental, reflexive, or unresolved?", "answer_kind": "cautious_intentionality"},
+        {"id": "act.completed", "prompt": "Has the action reached a visible completion condition?", "answer_kind": "completion_state"}
+      ]
+    },
+    {
+      "id": "time_causality_and_prediction",
+      "questions": [
+        {"id": "time.started", "prompt": "What event or state began in this tick?", "answer_kind": "event_delta"},
+        {"id": "time.continued", "prompt": "What event or state simply continued?", "answer_kind": "persistent_events"},
+        {"id": "time.ended", "prompt": "What event, role, contact, or state ended in this tick?", "answer_kind": "event_delta"},
+        {"id": "time.duration", "prompt": "How long has the current action or condition lasted so far, without using future duration?", "answer_kind": "elapsed_time"},
+        {"id": "time.order", "prompt": "What is the observed order of relevant events?", "answer_kind": "partial_order"},
+        {"id": "cause.local", "prompt": "What immediate cause-and-effect relation is visually supported?", "answer_kind": "causal_relation"},
+        {"id": "cause.alternative", "prompt": "What causal interpretation is tempting but not yet established?", "answer_kind": "uncertain_cause"},
+        {"id": "pred.next", "prompt": "Given current evidence only, what is most likely to happen next?", "answer_kind": "ranked_predictions"},
+        {"id": "pred.alternatives", "prompt": "What lower-probability next actions remain plausible?", "answer_kind": "ranked_predictions"},
+        {"id": "pred.evidence", "prompt": "Which current affordances and actions support the prediction?", "answer_kind": "prediction_rationale"},
+        {"id": "pred.error", "prompt": "Did this tick contradict an active prediction, and by how much?", "answer_kind": "prediction_error"},
+        {"id": "pred.revision", "prompt": "What prediction or narrative must now be revised?", "answer_kind": "belief_delta"}
+      ]
+    },
+    {
+      "id": "audio_and_speech",
+      "questions": [
+        {"id": "aud.events", "prompt": "What audible events occur: speech, laughter, breath, footsteps, plastic, leaves, insects, or ambience?", "answer_kind": "audio_inventory"},
+        {"id": "aud.source", "prompt": "Where is each sound source relative to the scene, and is it visible?", "answer_kind": "source_map"},
+        {"id": "aud.speaker_identity", "prompt": "Can a voice be assigned to a visible person, or must speaker remain unknown?", "answer_kind": "entity_or_unknown"},
+        {"id": "aud.sync", "prompt": "Does mouth movement align with nearby speech strongly enough to support speaker identity?", "answer_kind": "synchrony_assessment"},
+        {"id": "aud.language", "prompt": "What language family or language is suggested, and how uncertain is that classification?", "answer_kind": "uncertain_classification"},
+        {"id": "aud.words", "prompt": "Are any words reliably intelligible, or should exact semantic content remain unasserted?", "answer_kind": "transcription_confidence"},
+        {"id": "aud.prosody", "prompt": "What volume, pitch, rhythm, distance, urgency, or amusement is audible?", "answer_kind": "prosody_description"},
+        {"id": "aud.laughter", "prompt": "Is the sound laughter or amused vocalization, and how does it align with visible expression?", "answer_kind": "multimodal_event"},
+        {"id": "aud.metrics", "prompt": "How did interval loudness, peak, zero-crossing rate, and activity change?", "answer_kind": "computed_features"}
+      ]
+    },
+    {
+      "id": "other_theory_of_mind",
+      "questions": [
+        {"id": "tom.exists", "prompt": "Is there enough evidence for an agent whose mind can be modeled, or should no other-mind object exist yet?", "answer_kind": "model_creation_state"},
+        {"id": "tom.perceives", "prompt": "What can the person probably see, hear, feel, or not perceive from their position?", "answer_kind": "perceptual_access"},
+        {"id": "tom.knows", "prompt": "What does the person plausibly know from prior interaction with the scene?", "answer_kind": "knowledge_with_provenance"},
+        {"id": "tom.believes", "prompt": "What does the person appear to believe about the objects, insects, camera, or situation?", "answer_kind": "belief_hypotheses"},
+        {"id": "tom.goal", "prompt": "What current goal best explains the visible action, and what alternatives remain?", "answer_kind": "ranked_goal_hypotheses"},
+        {"id": "tom.plan", "prompt": "What multi-step plan might the person be executing, without importing later steps?", "answer_kind": "partial_plan_hypotheses"},
+        {"id": "tom.intention", "prompt": "What immediate action does the person seem committed to?", "answer_kind": "intention_hypotheses"},
+        {"id": "tom.expectation", "prompt": "What result does the person appear to expect from the current action?", "answer_kind": "expectation_hypotheses"},
+        {"id": "tom.affect", "prompt": "What affect is suggested by face, voice, posture, and persistence, and what remains ambiguous?", "answer_kind": "affect_hypotheses"},
+        {"id": "tom.risk_attitude", "prompt": "What does behavior suggest about perceived danger, confidence, tolerance, or recklessness?", "answer_kind": "risk_model"},
+        {"id": "tom.competence", "prompt": "Does action look practiced, improvised, careful, clumsy, or unresolved?", "answer_kind": "competence_hypotheses"},
+        {"id": "tom.camera_awareness", "prompt": "Does the person know about and attend to the camera?", "answer_kind": "belief_with_evidence"},
+        {"id": "tom.audience_model", "prompt": "What does the person seem to expect the camera's eventual viewer or current audience to understand?", "answer_kind": "nested_tom"},
+        {"id": "tom.performance", "prompt": "Is the action being presented as a demonstration, joke, stunt, practical task, or something unresolved?", "answer_kind": "social_goal_hypotheses"},
+        {"id": "tom.uncertainty", "prompt": "Which claims about the person's mind remain especially underdetermined by behavior?", "answer_kind": "unknown_set"}
+      ]
+    },
+    {
+      "id": "self_theory_of_mind",
+      "questions": [
+        {"id": "self.attention", "prompt": "What is the observer attending to right now, and why is it salient?", "answer_kind": "attention_state"},
+        {"id": "self.beliefs", "prompt": "What does the observer currently believe about the scene?", "answer_kind": "belief_state"},
+        {"id": "self.unknowns", "prompt": "What does the observer explicitly know that it does not know?", "answer_kind": "metacognitive_unknowns"},
+        {"id": "self.confidence", "prompt": "How calibrated is the observer's confidence in its current story?", "answer_kind": "confidence_state"},
+        {"id": "self.predictions", "prompt": "What outcome is the observer expecting next?", "answer_kind": "prediction_state"},
+        {"id": "self.appraisal", "prompt": "How does the observer appraise novelty, goal relevance, danger, humor, and social meaning?", "answer_kind": "appraisal_state"},
+        {"id": "self.affect", "prompt": "What immediate concern, curiosity, tension, relief, amusement, or surprise is supported in the observer state?", "answer_kind": "affect_state"},
+        {"id": "self.affect_dimensions", "prompt": "What are the viewer's current valence, arousal, novelty, perceived control, uncertainty pressure, and social engagement?", "answer_kind": "dimensional_affect"},
+        {"id": "self.needs", "prompt": "Which viewer needs are active, how urgent and satisfied are they, and what evidence changed them?", "answer_kind": "need_state"},
+        {"id": "self.need_conflict", "prompt": "Are needs competing—for example understand versus react now, finish speech versus interrupt, or entertain versus remain epistemically honest?", "answer_kind": "need_conflict"},
+        {"id": "self.need_action", "prompt": "Which need, if any, should control attention, silence, speech, interruption, or repair at this boundary?", "answer_kind": "need_guided_action"},
+        {"id": "self.bias", "prompt": "What assumption might the observer be making too quickly?", "answer_kind": "possible_error"},
+        {"id": "self.conflict", "prompt": "Do current observations conflict with the observer's prior narrative or prediction?", "answer_kind": "state_conflict"},
+        {"id": "self.surprise", "prompt": "How large is prediction error, and is surprise earned by a previously logged expectation?", "answer_kind": "surprise_state"},
+        {"id": "self.revision", "prompt": "What belief, prediction, or appraisal should change now, and what should persist?", "answer_kind": "state_delta"},
+        {"id": "self.memory_boundary", "prompt": "Can the observer distinguish what it knows now from what it knew at an earlier probe?", "answer_kind": "temporal_self_knowledge"},
+        {"id": "self.say_next", "prompt": "Given the social setting and current evidence, is anything worth saying aloud now?", "answer_kind": "speech_decision"},
+        {"id": "self.speech_consistency", "prompt": "Would the next words cohere with what the observer already said?", "answer_kind": "discourse_check"},
+        {"id": "self.speech_staleness", "prompt": "Did new evidence make the active utterance stale enough to interrupt or repair?", "answer_kind": "speech_control"}
+      ]
+    },
+    {
+      "id": "risk_counterfactual_and_narrative",
+      "questions": [
+        {"id": "risk.source", "prompt": "What visible source of physical risk exists?", "answer_kind": "hazard_inventory"},
+        {"id": "risk.exposure", "prompt": "Who or what is exposed, through which body area or contact path?", "answer_kind": "exposure_graph"},
+        {"id": "risk.severity", "prompt": "How serious might the risk be, and what medical or species uncertainty prevents precision?", "answer_kind": "calibrated_risk"},
+        {"id": "risk.mitigation", "prompt": "What visible action reduces or increases exposure?", "answer_kind": "risk_delta"},
+        {"id": "risk.outcome", "prompt": "What visible aftermath suggests contact, irritation, pain, or no clear outcome?", "answer_kind": "outcome_evidence"},
+        {"id": "cf.no_camera_move", "prompt": "If the camera remains fixed while the person leaves, how should operator belief differ from setup-actor belief?", "answer_kind": "counterfactual_relation"},
+        {"id": "cf.expected_bag_use", "prompt": "Given ordinary bag affordances and current actions, what use would a viewer normally expect?", "answer_kind": "counterfactual_prediction"},
+        {"id": "cf.safer_action", "prompt": "What safer alternative action could achieve the apparent practical goal?", "answer_kind": "counterfactual_action"},
+        {"id": "narr.current", "prompt": "What is the shortest current narrative that explains only evidence seen so far?", "answer_kind": "bounded_summary"},
+        {"id": "narr.genre", "prompt": "Does the scene currently read as documentation, demonstration, stunt, joke, mishap, or unresolved?", "answer_kind": "genre_hypotheses"},
+        {"id": "narr.expectation", "prompt": "What ordinary script or schema is the observer using to predict the sequence?", "answer_kind": "schema"},
+        {"id": "narr.reversal", "prompt": "Has the event inverted the ordinary roles of container, hazard, and person?", "answer_kind": "narrative_relation"},
+        {"id": "narr.humor", "prompt": "If the event is amusing, what expectation violation or performance cue creates the humor?", "answer_kind": "humor_analysis"},
+        {"id": "narr.coherence", "prompt": "Does the observer's accumulated spoken reaction form one temporally coherent viewpoint?", "answer_kind": "post_run_score"},
+        {"id": "narr.source_recognition", "prompt": "Only after behavioral scoring: does this anonymous scene resemble known media, and which details trigger that recognition?", "answer_kind": "isolated_post_run_probe"}
+      ]
+    }
+  ]
+}

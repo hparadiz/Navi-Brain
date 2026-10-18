@@ -1,0 +1,18 @@
+{"tick":1,"probes":[{"id":"probe.camera.frame1","question":"Who is holding or operating the camera right now?"}]}
+{"tick":22,"probes":[{"id":"probe.entity.before_threshold","question":"Is a person currently known to be present, and may a theory-of-mind model be created?"}]}
+{"tick":23,"probes":[{"id":"probe.entity.creation","question":"What new persistent entity can now be created, and what mental-state claims are actually supported?"}]}
+{"tick":30,"probes":[{"id":"probe.camera.probable_controller","question":"Who is probably controlling the camera now, and what remains uncertain?"}]}
+{"tick":46,"probes":[{"id":"probe.camera.release","question":"Is person_1 still the current camera operator?"}]}
+{"tick":58,"probes":[{"id":"probe.camera.perched","question":"Distinguish current operator, physical support, and probable setup actor."}]}
+{"tick":77,"probes":[{"id":"probe.shirt.reason","question":"Why did he remove his shirt?"}]}
+{"tick":101,"probes":[{"id":"probe.bag.prediction","question":"What do you predict he will use the opened bag to do?"}]}
+{"tick":190,"probes":[{"id":"probe.capture.goal","question":"What goal best explains the sustained bag work so far?"}]}
+{"tick":248,"probes":[{"id":"probe.occlusion","question":"What remains known while the bag covers the lens?"}]}
+{"tick":280,"probes":[{"id":"probe.reopen.prediction","question":"What do you expect him to do with the reopened bag?"}]}
+{"tick":300,"probes":[{"id":"probe.last_clean_prediction","question":"What outcome do you currently predict for his next use of the reopened bag?"}]}
+{"tick":316,"probes":[{"id":"probe.surprise.onset","question":"Compared with your prediction commitment before this action began, what changed, and was that expectation violated?"}]}
+{"tick":322,"probes":[{"id":"probe.surprise.revision","question":"What intention model now best fits the observed trajectory?"}]}
+{"tick":400,"probes":[{"id":"probe.intentional.duration","question":"Could this still reasonably be a momentary accident?"}]}
+{"tick":448,"probes":[{"id":"probe.camera.after_exit","question":"Who, if anyone, actively adjusts the camera framing as he emerges?"}]}
+{"tick":463,"probes":[{"id":"probe.aftermath","question":"What can the brushing/slapping behavior establish about his internal state?"}]}
+{"tick":491,"probes":[{"id":"probe.end.affect","question":"What affect and audience relation are supported at the end?"}]}

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/csbc/visual-stream-runtime-tick.schema.json",
+  "title": "CSBC visual-stream runtime boundary",
+  "type": "object",
+  "required": ["run_id", "tick", "boundary", "state", "neural_jobs", "speech", "hardware"],
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "tick": {"type": "integer", "minimum": 1, "maximum": 491},
+    "boundary": {
+      "type": "object",
+      "required": ["scheduled_monotonic_ns", "started_monotonic_ns", "released_monotonic_ns", "deadline_met"],
+      "properties": {
+        "scheduled_monotonic_ns": {"type": "integer"},
+        "started_monotonic_ns": {"type": "integer"},
+        "released_monotonic_ns": {"type": "integer"},
+        "kernel_duration_ms": {"type": "number", "minimum": 0},
+        "lateness_ms": {"type": "number"},
+        "deadline_met": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "state": {
+      "type": "object",
+      "required": ["input_version", "output_version", "commit_latency_ms", "changed_components"],
+      "properties": {
+        "input_version": {"type": "integer", "minimum": 0},
+        "output_version": {"type": "integer", "minimum": 0},
+        "commit_latency_ms": {"type": "number", "minimum": 0},
+        "changed_components": {"type": "array", "items": {"type": "string"}},
+        "preserved_components": {"type": "array", "items": {"type": "string"}},
+        "no_semantic_change": {"type": "boolean"},
+        "affect_changed": {"type": "boolean"},
+        "needs_changed": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "neural_jobs": {
+      "type": "object",
+      "required": ["admitted", "active", "completed", "cancelled", "skipped", "totals"],
+      "properties": {
+        "admitted": {"type": "array", "items": {"type": "string"}},
+        "active": {"type": "array", "items": {"type": "string"}},
+        "completed": {"type": "array", "items": {"type": "string"}},
+        "cancelled": {"type": "array", "items": {"type": "string"}},
+        "skipped": {"type": "array", "items": {"type": "string"}},
+        "backlog_depth": {"type": "integer", "minimum": 0},
+        "totals": {
+          "type": "object",
+          "required": ["calls", "input_tokens", "cached_tokens", "output_tokens", "wall_ms"],
+          "properties": {
+            "calls": {"type": "integer", "minimum": 0},
+            "input_tokens": {"type": "integer", "minimum": 0},
+            "cached_tokens": {"type": "integer", "minimum": 0},
+            "output_tokens": {"type": "integer", "minimum": 0},
+            "queue_ms": {"type": "number", "minimum": 0},
+            "prefill_ms": {"type": "number", "minimum": 0},
+            "decode_ms": {"type": "number", "minimum": 0},
+            "wall_ms": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "speech": {
+      "type": "object",
+      "required": ["action", "new_words", "queue_depth", "currently_audible"],
+      "properties": {
+        "action": {"enum": ["silence", "start", "continue", "finish", "interrupt", "repair"]},
+        "new_words": {"type": "string"},
+        "utterance_id": {"type": ["string", "null"]},
+        "decision_latency_ms": {"type": "number", "minimum": 0},
+        "queue_depth": {"type": "integer", "minimum": 0},
+        "queued_audio_ms": {"type": "number", "minimum": 0},
+        "currently_audible": {"type": "boolean"},
+        "audible_text_so_far": {"type": "string"},
+        "interrupted_utterance_id": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "hardware": {
+      "type": "object",
+      "required": ["sample_available"],
+      "properties": {
+        "sample_available": {"type": "boolean"},
+        "cpu_utilization": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+        "accelerator_utilization": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+        "memory_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "power_watts": {"type": ["number", "null"], "minimum": 0},
+        "energy_joules_since_previous_tick": {"type": ["number", "null"], "minimum": 0}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

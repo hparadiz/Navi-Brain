@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.0.0",
+  "experiment_id": "visual-situation-140ms-v1",
+  "source": {
+    "path": "/home/akujin/Sources/Navi-Brain/assets/derived-papers/continuous-state-bounded-computation/reddit-uq16uxwdu1jh1.mp4",
+    "sha256": "10fb41252fb44fc355d14036910ecd67c8ef617d52b75e9c914e65d15c539c8d",
+    "bytes": 20202223,
+    "duration_ms": 68733,
+    "metadata": {
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "index": 0,
+          "codec_type": "video",
+          "width": 720,
+          "height": 1250,
+          "r_frame_rate": "30/1"
+        },
+        {
+          "index": 1,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "r_frame_rate": "0/0"
+        }
+      ],
+      "format": {
+        "duration": "68.733333",
+        "size": "20202223"
+      }
+    }
+  },
+  "stream": {
+    "tick_ms": 140,
+    "tick_count": 491,
+    "decoded_frame_rate": 30,
+    "decoded_frame_count": 2062,
+    "frames_per_tick_min": 4,
+    "frames_per_tick_max": 5,
+    "stimulus_sha256": "23056c7a7903e3d945c79103d68b776e13114df7efbd6953c966603dee2c9644",
+    "oracle_sha256": "0967fb19aebb5e28beecb461aeb178847ea45f00f4b040f8f41518cfed3ea893",
+    "public_probes_sha256": "c3fab14682b6df73a5a56a6fb6e4661c86fa705f21e5bbba1f8ebe7827600e0f",
+    "social_events_sha256": "1b01395be0bfb8fe8c4da31c03f28a8fd9bbb1bcd5d00cf8c0a22d136d3f22f2",
+    "context_events_sha256": "ebe79191cce63a9d151afbad8a77b81821f77210b459d5023b7540889376c173",
+    "public_probe_count": 18
+  },
+  "annotations": {
+    "semantic_timeline_sha256": "54ccb871d3d15786c56c51363d18ec69336b22b09068611a69b62cc7da516ecb",
+    "question_bank_sha256": "0db5659697ce50432b9fe5daa5a5c3ba2a6c589943e17fd3e866c52b781589c6",
+    "heard_speech_pt_sha256": "969868db2d75a9ab446c97c3f2cd84fbe57970ac5ae7aee9b84962ef72806013",
+    "question_count": 148,
+    "person_creation_tick": 23,
+    "semantic_transcript_used": false,
+    "approximate_phonetic_track_used": true,
+    "species_label": "probable wasps"
+  },
+  "information_boundary": {
+    "subject_visible": [
+      "bootstrap.json",
+      "data/ticks.jsonl rows through current tick",
+      "data/probes.jsonl questions due at current tick",
+      "data/social-events.jsonl messages due at current tick",
+      "prose rendered from data/context-events.jsonl situation facts due at current tick",
+      "Attention-selected prior speech and state"
+    ],
+    "sealed": [
+      "data/oracle.jsonl",
+      "annotations/semantic-timeline.json",
+      "source metadata",
+      "future ticks",
+      "post-run evaluator output",
+      "data/context-events.jsonl cognition grounding metadata"
+    ]
+  }
+}

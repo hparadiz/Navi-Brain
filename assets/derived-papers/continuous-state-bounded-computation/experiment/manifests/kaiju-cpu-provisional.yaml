@@ -1,0 +1,45 @@
+manifest_id: kaiju-cpu-provisional-2026-08-13
+captured_at_utc: 2026-08-13
+hostname: kaiju
+purpose: primary
+status: provisional
+evidence: user-supplied inventory, existing Kaiju benchmark notes, and read-only SSH checks
+
+os: Nobara Linux 43 KDE
+kernel: 6.19.8-200.nobara.fc43.x86_64
+cpu_model: 2x Intel Xeon E5-2687W v4
+microarchitecture: Broadwell
+physical_cores: 24
+logical_cpus: 48
+numa_layout: 2 nodes, approximately 128 GiB each
+cpu_isa:
+  - AVX2
+  - FMA
+  - F16C
+cpu_isa_absent:
+  - AVX-512
+  - VNNI
+  - BF16
+system_ram: approximately 256 GiB
+
+gpu_model: not required for primary CPU experiment
+gpu_count: pending inventory
+
+model_storage: /mnt/kaiju/Models
+model_storage_stack: XFS over LVM over NVMe RAID10
+experiment_workspace: /home/akujin/Sources/csbc-sparse-belief-ledger
+
+inference_engine: ik_llama.cpp
+inference_engine_version: commit 3f40e73c, build 4551
+engine_build_flags: CMake Release, GGML_NATIVE=ON, GGML_OPENMP=ON, LLAMA_CURL=OFF
+compiler: GCC 15.2.1
+
+thread_affinity_policy: 24 threads; no explicit physical pinning
+numa_memory_policy: numactl --interleave=all
+smt_policy: one thread per physical core for selected control
+power_management: CPU governor performance
+kernel_numa_balancing: disabled
+memlock: unlimited for akujin
+background_workloads: pending
+thermal_notes: pending
+development_model_service: csbc-qwen.service, llama-server on 127.0.0.1:8081

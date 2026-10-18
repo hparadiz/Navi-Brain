@@ -33,6 +33,7 @@ use NaviBrain\Core\PersonalityCompiler;
 use NaviBrain\Storage\TokenMemoryDaemon;
 use NaviBrain\Support\CompilerText;
 use NaviBrain\Support\PlainText;
+use NaviBrain\Support\MemoryProse;
 use Throwable;
 
 class Application
@@ -49,8 +50,8 @@ class Application
         try {
             $options = $this->parseOptions($argv);
             unset($options['debug-json']);
-            $nativeCommand = in_array($command, ['help', '--help', '-h', 'recall:init', 'recall', 'memory:search'], true)
-                || ($command === 'status' && !$debugJson);
+            $nativeCommand = in_array($command, ['help', '--help', '-h', 'recall:init', 'recall', 'memory:search', 'memory:add'], true)
+                || $command === 'status';
             if ($command === 'memory:search' && ($this->integer($options, 'limit', 20) < 1
                 || $this->integer($options, 'limit', 20) > 100)) {
                 throw new InvalidArgumentException('limit must be between 1 and 100.');
@@ -112,7 +113,7 @@ class Application
                 'other:replay' => $this->core->otherModel()->replay($this->integer($options, 'limit', 500)),
                 'memory:add' => $this->saveMemory($options),
                 'recall' => TokenMemoryDaemon::activate($this->string($options, 'query'), $this->integer($options, 'token-budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS)),
-                'memory:search' => TokenMemoryDaemon::recall($this->string($options, 'query'), $this->integer($options, 'limit', 20)),
+                'memory:search' => MemoryProse::recalled(TokenMemoryDaemon::recall($this->string($options, 'query'), $this->integer($options, 'limit', 20))),
                 'personality:compile' => (new PersonalityCompiler($this->core))->compile($this->string($options, 'context')),
                 'motivation:compile' => (new MotivationCompiler($this->core))->compile($this->string($options, 'context')),
                 'intention:compile' => (new IntentionCompiler())->compile(),
@@ -222,9 +223,7 @@ class Application
                 ], true, true)),
                 'appraise' => $this->appraise($options),
                 'checkpoint' => $this->core->checkpoint($this->string($options, 'reason')),
-                'status' => $debugJson
-                    ? array_merge(['primary_intention' => $this->optionalString($options, 'active-intention')], $this->core->status())
-                    : TokenMemoryDaemon::activate($this->string($options, 'active-intention'), $this->integer( $options, 'token-budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS )),
+                'status' => TokenMemoryDaemon::activate($this->string($options, 'active-intention'), $this->integer( $options, 'token-budget', TokenMemoryDaemon::DEFAULT_CONTEXT_TOKENS )),
                 default => throw new InvalidArgumentException(sprintf('Unknown command: %s', $command)),
             };
 
@@ -272,24 +271,13 @@ class Application
         return $this->core->startAction($action, $execution);
     }
 
-    private function saveMemory(array $options): array
+    private function saveMemory(array $options): string
     {
-        $tier = $this->string($options, 'tier');
-        if ($tier === 'procedural' && !$this->flag($options, 'allow-procedural-write')) {
-            throw new \RuntimeException('Procedural memory writes require --allow-procedural-write.');
+        if (array_diff(array_keys($options), ['content']) !== []) {
+            throw new InvalidArgumentException('memory:add accepts only --content; storage metadata is managed internally.');
         }
-        $memory = new Memory([
-            'tier' => $tier, 'content' => $this->string($options, 'content'),
-            'confidence' => $this->number($options, 'confidence'),
-            'operation_key' => TokenMemoryDaemon::operationKey('memory-add', $this->string($options, 'idempotency-key')),
-            'source_event_id' => $this->optionalInteger($options, 'source-event'),
-            'source_memory_id' => $this->optionalInteger($options, 'source-memory'),
-            'supersedes_id' => $this->optionalInteger($options, 'supersedes'),
-            'expires_at' => $this->optionalString($options, 'expires'),
-            'source_event_kind' => $this->optionalString($options, 'source-event-kind') ?? 'event',
-        ], true, true);
-        $memory->save();
-        return ['memory' => $memory->getData(), 'event' => $memory->storedEvent->getData()];
+        TokenMemoryDaemon::remember($this->string($options, 'content'));
+        return '';
     }
 
     /** @param array<string, string|bool> $options */
@@ -533,7 +521,7 @@ class Application
                 'other:cycles [--status=running|waiting|completed|abstained|failed] [--limit=20]',
                 'other:correct --hypothesis --correction',
                 'other:replay [--limit=500]',
-                'memory:add --tier --content --confidence --idempotency-key [--source-event] [--source-event-kind=event|sense_event] [--source-memory] [--supersedes] [--expires] [--allow-procedural-write]',
+                'memory:add --content (one-way prose stream; no response)',
                 'recall:init (idempotent daemon startup; no executive migration)',
                 'recall --query [--token-budget=1024] (native recall; no executive bootstrap)',
                 'memory:search --query [--limit=20]',
@@ -620,8 +608,14 @@ class Application
     /** @param resource $stream */
     private function writeOutput(array $payload, $stream, bool $debugJson): void
     {
+        $command = (string) ($payload['command'] ?? '');
+        if (($payload['ok'] ?? false) === true
+            && in_array($command, ['memory:add', 'memory:search', 'recall', 'status'], true)) {
+            $prose = $payload['result'] ?? '';
+            fwrite($stream, is_string($prose) ? $prose : '');
+            return;
+        }
         if (!$debugJson) {
-            $command = (string) ($payload['command'] ?? '');
             if (($payload['ok'] ?? false) && $command === 'intention:agent:context') {
                 fwrite($stream, $payload['result']['context'] . PHP_EOL);
                 return;
@@ -631,11 +625,6 @@ class Application
             ) {
                 $result = $payload['result'] ?? [];
                 fwrite($stream, CompilerText::render($command, is_array($result) ? $result : []) . PHP_EOL);
-                return;
-            }
-            if (($payload['ok'] ?? false) === true && in_array($command, ['status', 'recall'], true)) {
-                $result = $payload['result'] ?? [];
-                fwrite($stream, is_string($result) ? $result : '');
                 return;
             }
             if (($payload['ok'] ?? false) === true && $command === 'checkpoint') {

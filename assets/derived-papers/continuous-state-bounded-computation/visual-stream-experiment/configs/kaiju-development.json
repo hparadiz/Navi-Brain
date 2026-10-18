@@ -1,0 +1,47 @@
+{
+  "status": "exploratory-development",
+  "run_id": "visual-stream-every-tick-qwen35-9b-seed7-dev",
+  "execution_host": "kaiju",
+  "seed": 7,
+  "condition": "every_tick_sparse_patch",
+  "input": {
+    "bootstrap": "bootstrap.json",
+    "ticks": "data/ticks.jsonl",
+    "probes": "data/probes.jsonl"
+  },
+  "cognition_prompt": "prompts/structured-control-system.txt",
+  "output_root": "results/raw",
+  "model": {
+    "base_url": "http://127.0.0.1:8081",
+    "name": "qwen3.5-9b-heretic",
+    "quantization": "Q4_K_S",
+    "reasoning": false,
+    "temperature": 0.2,
+    "top_k": 20,
+    "max_output_tokens": 896,
+    "request_timeout_seconds": 180
+  },
+  "evaluator_model": {
+    "base_url": "http://127.0.0.1:8081",
+    "name": "qwen3.5-9b-heretic",
+    "temperature": 0,
+    "top_k": 1,
+    "request_timeout_seconds": 180
+  },
+  "runtime": {
+    "mode": "offline",
+    "scheduler": "every_tick",
+    "max_ticks": 491,
+    "tick_ms": 140,
+    "speech_words_per_minute": 165,
+    "max_pending_speech_fragments": 1,
+    "max_consecutive_model_failures": 3,
+    "max_state_bytes": 32768
+  },
+  "notes": [
+    "Development condition; do not relabel as preregistered or confirmatory.",
+    "The live runner never opens data/oracle.jsonl.",
+    "Run neural inference and timing measurement only on Kaiju.",
+    "Offline mode measures per-boundary budget misses without pretending sequential CPU inference is paced playback."
+  ]
+}

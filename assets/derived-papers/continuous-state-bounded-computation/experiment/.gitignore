@@ -1,0 +1,25 @@
+# Generated event tapes and oracle dumps
+data/tapes/*
+!data/tapes/.gitkeep
+data/oracles/*
+!data/oracles/.gitkeep
+
+# Raw profiler and run output
+profiles/raw/*
+!profiles/raw/.gitkeep
+results/raw/*
+!results/raw/.gitkeep
+
+# Local caches, databases, and model artifacts
+cache/
+models/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.gguf
+
+# Language/tool caches; refine after the implementation language is selected
+__pycache__/
+.pytest_cache/
+target/
+build/
